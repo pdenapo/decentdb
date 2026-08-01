@@ -117,7 +117,7 @@ pub(crate) fn commit_pages(
         .inner
         .write_lock
         .lock()
-        .expect("wal write lock should not be poisoned");
+        .map_err(|_| DbError::internal("wal write lock poisoned"))?;
 
     let mut offset = wal.latest_snapshot();
     if offset == 0 {
@@ -193,17 +193,22 @@ pub(crate) fn commit_pages(
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
         // Check inside the index lock so begin_reader() cannot register
         // between the count check and the version clear (TOCTOU fix).
         let retain_history = retain_history_hint
             || wal.inner.reader_registry.active_reader_count()? > 0
             || wal.retained_snapshot_lsn().is_some();
-        let mut sidecar = wal.inner.index_sidecar.as_ref().map(|sidecar| {
-            sidecar
-                .lock()
-                .expect("wal index sidecar lock should not be poisoned")
-        });
+        let mut sidecar = wal
+            .inner
+            .index_sidecar
+            .as_ref()
+            .map(|sidecar| {
+                sidecar
+                    .lock()
+                    .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))
+            })
+            .transpose()?;
         let mut version_lsn = commit_start_lsn;
         let prepared_count = prepared_pages.len();
         for (page_id, payload, encoded_len, encoding, frame_offset) in prepared_pages.drain(..) {
@@ -272,7 +277,7 @@ pub(crate) fn commit_pages_if_latest(
         .inner
         .write_lock
         .lock()
-        .expect("wal write lock should not be poisoned");
+        .map_err(|_| DbError::internal("wal write lock poisoned"))?;
 
     let latest = wal.latest_snapshot();
     if latest != expected_latest_lsn {
@@ -362,17 +367,22 @@ pub(crate) fn commit_pages_if_latest(
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
         // Check inside the index lock so begin_reader() cannot register
         // between the count check and the version clear (TOCTOU fix).
         let retain_history = retain_history_hint
             || wal.inner.reader_registry.active_reader_count()? > 0
             || wal.retained_snapshot_lsn().is_some();
-        let mut sidecar = wal.inner.index_sidecar.as_ref().map(|sidecar| {
-            sidecar
-                .lock()
-                .expect("wal index sidecar lock should not be poisoned")
-        });
+        let mut sidecar = wal
+            .inner
+            .index_sidecar
+            .as_ref()
+            .map(|sidecar| {
+                sidecar
+                    .lock()
+                    .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))
+            })
+            .transpose()?;
         let mut version_lsn = commit_start_lsn;
         let prepared_count = prepared_pages.len();
         for (page_id, payload, encoded_len, encoding, frame_offset) in prepared_pages.drain(..) {
@@ -581,7 +591,7 @@ fn lookup_base_pages_batch(
         .inner
         .index
         .lock()
-        .expect("wal index lock should not be poisoned");
+        .map_err(|_| DbError::internal("wal index lock poisoned"))?;
     let retain_history_hint = wal.inner.reader_registry.active_reader_count()? > 0
         || wal.retained_snapshot_lsn().is_some();
     output.clear();
@@ -626,13 +636,13 @@ fn demote_cold_versions(wal: &WalHandle) -> Result<()> {
         .inner
         .index
         .lock()
-        .expect("wal index lock should not be poisoned");
+        .map_err(|_| DbError::internal("wal index lock poisoned"))?;
     index.demote_cold(min_reader_snapshot, retain_recent);
     if min_reader_snapshot.is_none() {
         if let Some(sidecar) = &wal.inner.index_sidecar {
             let mut sidecar = sidecar
                 .lock()
-                .expect("wal index sidecar lock should not be poisoned");
+                .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))?;
             wal.spill_excess_hot_pages_locked(&mut index, &mut sidecar)?;
         }
     }
@@ -679,13 +689,19 @@ fn maybe_auto_checkpoint(wal: &WalHandle, pager: &PagerHandle) -> Result<()> {
     // on the first real threshold hit so ordinary opens do not pay thread
     // creation cost.
     if wal.inner.background_checkpoint_worker {
-        let bg = wal.inner.bg_checkpointer.get_or_init(|| {
-            super::background::BgCheckpointer::start(
+        if wal.inner.bg_checkpointer.get().is_none() {
+            let bg = super::background::BgCheckpointer::start(
                 std::sync::Arc::downgrade(&wal.inner),
                 pager.clone(),
-            )
-        });
-        bg.wake();
+            )?;
+            // A racing commit may have installed a worker first; dropping the
+            // loser shuts its thread down cleanly, matching the previous
+            // `OnceLock::get_or_init` behavior.
+            let _ = wal.inner.bg_checkpointer.set(bg);
+        }
+        if let Some(bg) = wal.inner.bg_checkpointer.get() {
+            bg.wake();
+        }
         return Ok(());
     }
 

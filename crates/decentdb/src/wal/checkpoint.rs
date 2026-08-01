@@ -6,7 +6,7 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::error::Result;
+use crate::error::{DbError, Result};
 use crate::storage::PagerHandle;
 
 use super::writer;
@@ -30,7 +30,7 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         .inner
         .write_lock
         .lock()
-        .expect("wal write lock should not be poisoned");
+        .map_err(|_| DbError::internal("wal write lock poisoned"))?;
     wal.inner.checkpoint_pending.store(true, Ordering::SeqCst);
     let _pending_reset = PendingReset(wal);
     {
@@ -43,7 +43,7 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
     }
 
     let current_lsn = wal.latest_snapshot();
@@ -73,19 +73,19 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         .inner
         .checkpoint_scratch
         .lock()
-        .expect("checkpoint scratch lock should not be poisoned");
+        .map_err(|_| DbError::internal("checkpoint scratch lock poisoned"))?;
     {
         let index = wal
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
         index.populate_latest_versions_at_or_before(safe_lsn, &mut latest_versions);
     }
     if let Some(sidecar) = &wal.inner.index_sidecar {
         sidecar
             .lock()
-            .expect("wal index sidecar lock should not be poisoned")
+            .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))?
             .populate_latest_versions_at_or_before(safe_lsn, &mut latest_versions)?;
         latest_versions.sort_by_key(|(page_id, _)| *page_id);
     }
@@ -106,6 +106,12 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         wal.reset_max_page_count(pager.on_disk_page_count()?);
     }
     pager.set_last_checkpoint_lsn(safe_lsn)?;
+    // Durability invariant (ADR 0004): the main database file must be durable
+    // before the WAL — the only other copy of the committed pages — is
+    // truncated below. Copyback may have extended (`write_page_direct`) or
+    // shrunk (`truncate_freelist_tail`) the file, so this is a full metadata
+    // sync rather than `sync_data`.
+    pager.sync_metadata()?;
 
     let _checkpoint_end = writer::append_checkpoint_frame(wal, safe_lsn)?;
 
@@ -114,7 +120,7 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
         // Check inside the index lock to avoid racing with begin_reader().
         // Only truncate WAL when safe_lsn covers all committed data
         // (i.e. no readers were active when we started, so we wrote
@@ -126,7 +132,7 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
             if let Some(sidecar) = &wal.inner.index_sidecar {
                 sidecar
                     .lock()
-                    .expect("wal index sidecar lock should not be poisoned")
+                    .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))?
                     .clear()?;
             }
             drop(index);

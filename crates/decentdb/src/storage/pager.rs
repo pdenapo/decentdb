@@ -108,6 +108,15 @@ impl PagerHandle {
         self.inner.cache.insert_clean_page(page_id, data.to_vec())
     }
 
+    /// Syncs the database file (data + metadata) to stable storage.
+    ///
+    /// Checkpoint copyback must call this after all main-file writes and
+    /// before the WAL is truncated: once the WAL is discarded, the main file
+    /// is the only remaining copy of the committed pages. See ADR 0004.
+    pub(crate) fn sync_metadata(&self) -> Result<()> {
+        self.inner.file.sync_metadata()
+    }
+
     pub(crate) fn on_disk_page_count(&self) -> Result<PageId> {
         self.inner
             .file

@@ -178,14 +178,14 @@ ddb_status_t ddb_db_open(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
 /*
  * Option-aware open variants. `options` is a UTF-8 key=value list separated
- * by whitespace, commas, or semicolons. Supported keys include cache_size,
- * retain_paged_row_sources_after_commit, paged_row_storage,
+ * by whitespace, commas, or semicolons. Supported keys include profile,
+ * cache_size, retain_paged_row_sources_after_commit, paged_row_storage,
  * persistent_pk_index, wal_autocheckpoint, wal_checkpoint_threshold_pages,
  * wal_checkpoint_threshold_bytes, process_coordination,
  * process_coordination_timeout_ms, write_queue_enabled, write_queue_capacity,
  * write_queue_default_timeout_ms, write_queue_strict_group_commit,
- * write_queue_max_batch, write_queue_max_group_delay_us, encryption_key, and
- * encryption_key_hex.
+ * write_queue_max_batch, write_queue_max_group_delay_us, plan_cache_enabled,
+ * plan_cache_max_bytes, encryption_key, and encryption_key_hex.
  */
 ddb_status_t ddb_db_create_with_options(const char *path, const char *options, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_with_options(const char *path, const char *options, ddb_db_t **out_db);
@@ -224,6 +224,27 @@ ddb_status_t ddb_db_set_audit_context_text(
     size_t value_len
 );
 ddb_status_t ddb_db_clear_audit_context(ddb_db_t *db, const char *key);
+
+/* Plan cache diagnostics (F023 / ADR 0193). */
+
+typedef struct ddb_plan_cache_summary {
+    /* Static engine-owned string. Do not pass this pointer to ddb_string_free. */
+    const char *scope;
+    uint64_t total_entries;
+    uint64_t total_hits;
+    uint64_t total_misses;
+    uint64_t total_evictions;
+    uint64_t total_size_bytes;
+    uint64_t max_size_bytes;
+    uint64_t total_oversized_refusals;
+    double hit_rate;
+} ddb_plan_cache_summary_t;
+
+ddb_status_t ddb_plan_cache_summary(
+    ddb_db_t *db,
+    ddb_plan_cache_summary_t *out_summary
+);
+ddb_status_t ddb_plan_cache_flush(ddb_db_t *db);
 
 /*
  * On success, ownership of the returned statement handle transfers to the caller.
@@ -464,6 +485,42 @@ ddb_status_t ddb_db_get_tooling_metadata_json(ddb_db_t *db, char **out_json);
 ddb_status_t ddb_db_describe_query_json(ddb_db_t *db, const char *sql, char **out_json);
 ddb_status_t ddb_db_inspect_storage_state_json(ddb_db_t *db, char **out_json);
 
+/*
+ * Lua extension package lifecycle JSON APIs.
+ *
+ * Returned JSON strings are owned by the caller and must be released with
+ * ddb_string_free.
+ */
+ddb_status_t ddb_extension_validate_json(const char *request_json, char **out_json);
+ddb_status_t ddb_extension_install_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_enable_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_disable_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_list_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_dependencies_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_rebuild_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_purge_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+
 ddb_status_t ddb_evict_shared_wal(const char *path);
 
 /*
@@ -494,6 +551,30 @@ ddb_status_t ddb_result_value_copy(
     size_t row_index,
     size_t column_index,
     ddb_value_t *out_value);
+
+/**
+ * Runtime tracing snapshot.
+ *
+ * `kind` selects the trace view:
+ *   "slow_queries", "lock_waits", "sessions",
+ *   "index_usage", "doctor_findings", "fix_plan"
+ *
+ * On success, `out_json` receives an owned JSON string.
+ * The caller must free it with `ddb_string_free`.
+ */
+ddb_status_t ddb_runtime_tracing_snapshot(
+    ddb_db_t *db,
+    const char *kind,
+    char **out_json);
+
+/**
+ * Reset a specific runtime trace ring buffer.
+ *
+ * `kind` may be "slow_queries", "lock_waits", or "index_usage".
+ */
+ddb_status_t ddb_runtime_tracing_reset(
+    ddb_db_t *db,
+    const char *kind);
 
 #ifdef __cplusplus
 } /* extern "C" */

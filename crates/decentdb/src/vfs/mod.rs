@@ -11,7 +11,7 @@ pub(crate) mod mem;
 pub(crate) mod opfs;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod os;
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
 pub(crate) mod stats;
 
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ use self::faulty::FaultyVfs;
 use self::mem::MemVfs;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use self::os::OsVfs;
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
 use self::stats::StatsVfs;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,7 +128,7 @@ impl VfsHandle {
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             {
                 let os_vfs: Arc<dyn Vfs> = Arc::new(OsVfs);
-                #[cfg(feature = "bench-internals")]
+                #[cfg(any(test, feature = "bench-internals"))]
                 let os_vfs: Arc<dyn Vfs> = Arc::new(StatsVfs::wrap(os_vfs));
                 Self {
                     inner: Arc::new(FaultyVfs::wrap(os_vfs)),

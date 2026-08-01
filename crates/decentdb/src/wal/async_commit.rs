@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::error::Result;
+use crate::error::{DbError, Result};
 use crate::vfs::VfsFile;
 
 /// Shared state between the WAL writer, foreground sync barriers, and the
@@ -54,7 +54,7 @@ struct AsyncCommitInner {
 }
 
 impl AsyncCommitState {
-    pub(crate) fn new(file: Arc<dyn VfsFile>, initial_lsn: u64, interval_ms: u32) -> Self {
+    pub(crate) fn new(file: Arc<dyn VfsFile>, initial_lsn: u64, interval_ms: u32) -> Result<Self> {
         let interval_ms = interval_ms.max(1);
         let inner = Arc::new(AsyncCommitInner {
             dirty_lsn: AtomicU64::new(initial_lsn),
@@ -70,12 +70,12 @@ impl AsyncCommitState {
         let handle = thread::Builder::new()
             .name("decentdb-wal-flusher".to_string())
             .spawn(move || flusher_loop(flusher_inner))
-            .expect("spawn wal flusher thread");
+            .map_err(|source| DbError::io("spawn wal flusher thread", source))?;
 
-        Self {
+        Ok(Self {
             inner,
             flusher: Mutex::new(Some(handle)),
-        }
+        })
     }
 
     /// Records that the WAL has been extended to `new_end_lsn` and (optionally)
@@ -106,7 +106,7 @@ impl AsyncCommitState {
         let (lock, cvar) = &self.inner.wake;
         let mut guard = lock
             .lock()
-            .expect("async-commit wake lock should not be poisoned");
+            .map_err(|_| DbError::internal("async-commit wake lock poisoned"))?;
         while self.inner.durable_lsn.load(Ordering::Acquire) < target {
             if self.inner.shutdown.load(Ordering::Acquire) {
                 // On shutdown the Drop path will perform a final flush; we do
@@ -118,7 +118,7 @@ impl AsyncCommitState {
                     guard,
                     Duration::from_millis(self.inner.interval_ms as u64 * 2),
                 )
-                .expect("async-commit wake cvar should not be poisoned")
+                .map_err(|_| DbError::internal("async-commit wake cvar poisoned"))?
                 .0;
         }
         Ok(())
@@ -207,7 +207,7 @@ fn perform_flush(inner: &AsyncCommitInner) -> Result<()> {
     let (lock, cvar) = &inner.wake;
     let _guard = lock
         .lock()
-        .expect("async-commit wake lock should not be poisoned");
+        .map_err(|_| DbError::internal("async-commit wake lock poisoned"))?;
     cvar.notify_all();
     Ok(())
 }

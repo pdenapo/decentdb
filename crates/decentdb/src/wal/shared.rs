@@ -36,7 +36,7 @@ pub(crate) fn acquire(
     {
         let registry_guard = registry
             .lock()
-            .expect("shared wal registry lock should not be poisoned");
+            .map_err(|_| DbError::internal("shared wal registry lock poisoned"))?;
         if let Some(existing) = registry_guard.get(&canonical_path).and_then(Weak::upgrade) {
             while existing.checkpoint_pending.load(Ordering::SeqCst) {
                 thread::yield_now();
@@ -60,7 +60,7 @@ pub(crate) fn acquire(
     )?;
     registry
         .lock()
-        .expect("shared wal registry lock should not be poisoned")
+        .map_err(|_| DbError::internal("shared wal registry lock poisoned"))?
         .insert(canonical_path, Arc::downgrade(&handle.inner));
     Ok(handle)
 }
@@ -96,7 +96,7 @@ fn build_handle(
 
     let async_commit = match config.wal_sync_mode {
         crate::config::WalSyncMode::AsyncCommit { interval_ms } => Some(
-            super::async_commit::AsyncCommitState::new(Arc::clone(&file), end_lsn, interval_ms),
+            super::async_commit::AsyncCommitState::new(Arc::clone(&file), end_lsn, interval_ms)?,
         ),
         _ => None,
     };
@@ -149,10 +149,10 @@ fn build_handle(
         let mut index = inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
         let mut sidecar = sidecar
             .lock()
-            .expect("wal index sidecar lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))?;
         let wal = WalHandle {
             inner: Arc::clone(&inner),
         };
@@ -217,7 +217,7 @@ pub(crate) fn evict(vfs: &VfsHandle, db_path: &Path) -> Result<()> {
     let canonical_path = vfs.canonicalize_path(db_path)?;
     let mut registry = registry()
         .lock()
-        .expect("shared wal registry lock should not be poisoned");
+        .map_err(|_| DbError::internal("shared wal registry lock poisoned"))?;
     registry.remove(&canonical_path);
     if registry.is_empty() {
         registry.shrink_to_fit();

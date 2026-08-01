@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## UNRELEASED
 
+### Added
+
+- Added ADR 0202 (`design/adr/0202-wal-frame-integrity-without-checksums.md`)
+  reconciling the WAL frame-integrity decision: it reaffirms ADR 0064's removal
+  of per-frame checksums without a format change, explicitly supersedes the
+  stale portions of that ADR's rationale (the "LSN sanity checks" and
+  "payload-size validation" it cited were removed by ADRs 0065/0066), catalogs
+  the integrity mechanisms that exist today, and records the accepted residual
+  risks and the triggers that would force a revisit.
+- Added a `wal-fuzz` job to the memory-safety nightly workflow so the 90-case
+  WAL corruption matrix (6 corruption strategies x 5 row counts x 3 variants)
+  runs in CI instead of only manually; a local release run completes in ~2
+  seconds.
+- Added `scripts/check_vendored_headers.py` and a `Vendored Header Drift Check`
+  step in the CI lint job that fail when the Go/Dart vendored `decentdb.h`
+  copies drift from the canonical `include/decentdb.h`.
+- Added a `checkpoint_syncs_db_file_before_wal_truncation` unit test proving
+  (via the stats VFS) that checkpoint syncs the database file before
+  truncating the WAL, and widened the stats-VFS cfg gate to `cfg(test)` builds
+  so in-crate tests can instrument sync counts. Release builds are unchanged.
+
+### Changed
+
+- Converted 39 poisoned-lock `.expect(...)` panics across the WAL writer,
+  checkpoint, async-commit, background-checkpoint, shared-registry, and
+  snapshot-reader paths into typed `DbError::internal` propagation, and mapped
+  WAL flusher / checkpoint worker thread-spawn failures to `DbError::io`, so
+  lock poisoning or thread-spawn failure surfaces as a typed error instead of
+  panicking the host process (including across the C FFI). Success-path
+  behavior, lock ordering, and public signatures are unchanged; Drop impls and
+  other non-`Result` contexts intentionally keep their documented invariant
+  panics.
+- Refreshed the stale vendored C ABI headers in `bindings/go` and
+  `bindings/dart` so they match `include/decentdb.h` again, restoring
+  declarations for the plan-cache, runtime-tracing, and Lua extension JSON
+  entry points added after ABI 7.
+
+### Fixed
+
+- Closed a checkpoint durability gap: `wal::checkpoint()` copied committed
+  pages into the main database file and then truncated the WAL without ever
+  syncing the main file, so a power loss or kernel panic after the
+  post-truncation WAL fsync could lose acknowledged commits (PRD pillar #1).
+  Checkpoint now fsyncs the database file (data + metadata, via a new
+  `PagerHandle::sync_metadata`) after copyback and before WAL truncation, per
+  the ADR 0004 durability invariant. This adds exactly one fsync per
+  successful copyback checkpoint; rust-baseline causality-isolation runs
+  (3x smoke + 3x medium against a reversed-patch build) show
+  `checkpoint_after_seed` +6 ms (smoke) / +19 ms (medium) with all seed and
+  query steps at parity and identical database/WAL sizes.
+- Fixed two clippy errors on stable rustc 1.97 (`question_mark` in
+  `db/query_api.rs`, `for_kv_map` in `exec/mod.rs`) so
+  `cargo clippy --all-targets --all-features -- -D warnings` is green again.
+
 ## [2.16.1] - [2026-07-01]
 
 ### Changed

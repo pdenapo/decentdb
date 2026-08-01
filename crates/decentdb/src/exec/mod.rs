@@ -5399,7 +5399,7 @@ impl EngineRuntime {
         store: &S,
         _config: &crate::config::DbConfig,
     ) -> Result<bool> {
-        for (_table_name, state) in self.persisted_tables.iter() {
+        for state in self.persisted_tables.values() {
             if state.pointer.head_page_id == 0 {
                 continue;
             }

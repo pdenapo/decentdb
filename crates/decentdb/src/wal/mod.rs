@@ -3,6 +3,8 @@
 pub(crate) mod async_commit;
 pub(crate) mod background;
 pub(crate) mod checkpoint;
+#[cfg(test)]
+mod checkpoint_tests;
 pub(crate) mod coordination;
 pub(crate) mod delta;
 #[cfg(test)]
@@ -229,7 +231,7 @@ impl WalHandle {
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
         if index.latest_visible(page_id, snapshot_lsn).is_none() {
             self.promote_spilled_latest_locked(&mut index, page_id, snapshot_lsn)?;
         }
@@ -249,7 +251,7 @@ impl WalHandle {
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
         self.materialize_version_locked(&index, pager, page_id, version)
     }
 
@@ -322,7 +324,7 @@ impl WalHandle {
                 .inner
                 .index
                 .lock()
-                .expect("wal index lock should not be poisoned");
+                .map_err(|_| DbError::internal("wal index lock poisoned"))?;
             if self.inner.checkpoint_pending.load(Ordering::Acquire) {
                 drop(_index);
                 thread::yield_now();
@@ -414,16 +416,21 @@ impl WalHandle {
                 .inner
                 .write_lock
                 .lock()
-                .expect("wal write lock should not be poisoned");
+                .map_err(|_| DbError::internal("wal write lock poisoned"))?;
             if snapshot.checkpoint_generation != observed_checkpoint {
                 let header = pager.header_from_disk()?;
                 pager.refresh_from_disk(header)?;
             }
-            let mut sidecar = self.inner.index_sidecar.as_ref().map(|sidecar| {
-                sidecar
-                    .lock()
-                    .expect("wal index sidecar lock should not be poisoned")
-            });
+            let mut sidecar = self
+                .inner
+                .index_sidecar
+                .as_ref()
+                .map(|sidecar| {
+                    sidecar
+                        .lock()
+                        .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))
+                })
+                .transpose()?;
             if let Some(sidecar) = sidecar.as_mut() {
                 sidecar.clear()?;
             }
@@ -440,7 +447,7 @@ impl WalHandle {
                     .inner
                     .index
                     .lock()
-                    .expect("wal index lock should not be poisoned");
+                    .map_err(|_| DbError::internal("wal index lock poisoned"))?;
                 *current = index;
             }
             self.inner.wal_end_lsn.store(end_lsn, Ordering::Release);
@@ -562,18 +569,14 @@ impl WalHandle {
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
-        let sidecar_count = self
-            .inner
-            .index_sidecar
-            .as_ref()
-            .map(|sidecar| {
-                sidecar
-                    .lock()
-                    .expect("wal index sidecar lock should not be poisoned")
-                    .version_count()
-            })
-            .unwrap_or(0);
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
+        let sidecar_count = match self.inner.index_sidecar.as_ref() {
+            Some(sidecar) => sidecar
+                .lock()
+                .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))?
+                .version_count(),
+            None => 0,
+        };
         Ok(index.version_count() + sidecar_count)
     }
 
@@ -582,19 +585,15 @@ impl WalHandle {
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
         let (resident, on_disk) = index.version_counts_by_payload();
-        let (sidecar_resident, sidecar_on_disk) = self
-            .inner
-            .index_sidecar
-            .as_ref()
-            .map(|sidecar| {
-                sidecar
-                    .lock()
-                    .expect("wal index sidecar lock should not be poisoned")
-                    .version_counts_by_payload()
-            })
-            .unwrap_or((0, 0));
+        let (sidecar_resident, sidecar_on_disk) = match self.inner.index_sidecar.as_ref() {
+            Some(sidecar) => sidecar
+                .lock()
+                .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))?
+                .version_counts_by_payload(),
+            None => (0, 0),
+        };
         Ok((resident + sidecar_resident, on_disk + sidecar_on_disk))
     }
 
@@ -611,7 +610,7 @@ impl WalHandle {
             .inner
             .index
             .lock()
-            .expect("wal index lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index lock poisoned"))?;
         Ok(index.demote_high_page_ids_resident_bytes(target_bytes))
     }
 
@@ -643,7 +642,7 @@ impl WalHandle {
         }
         let mut sidecar = sidecar
             .lock()
-            .expect("wal index sidecar lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal index sidecar lock poisoned"))?;
         let Some(version) = sidecar.read_latest(page_id)? else {
             return Ok(());
         };
@@ -769,7 +768,7 @@ impl WalHandle {
             .inner
             .materialize_scratch
             .lock()
-            .expect("wal materialization scratch lock should not be poisoned");
+            .map_err(|_| DbError::internal("wal materialization scratch lock poisoned"))?;
         let scratch_capacity = scratch.capacity();
         if scratch_capacity < page_size {
             #[cfg(feature = "bench-internals")]
