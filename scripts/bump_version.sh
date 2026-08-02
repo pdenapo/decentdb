@@ -206,6 +206,10 @@ updates = {
             rf"\g<1>{version}\g<2>",
         ),
         (
+            r"(planning release bucket in this repository is `)[^`]+(`)",
+            rf"\g<1>{version}\g<2>",
+        ),
+        (
             r"(bucket after `)[^`]+(` only when scope is explicitly accepted)",
             rf"\g<1>{version}\g<2>",
         ),
