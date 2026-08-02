@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use crate::error::{DbError, Result};
 
-use super::{FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
+use super::{BootstrapSyncReservation, FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
 
 #[derive(Debug, Default)]
 pub(crate) struct OsVfs;
@@ -68,6 +68,12 @@ impl Vfs for OsVfs {
 
     fn supports_file_locks(&self) -> bool {
         true
+    }
+
+    fn concurrent_bootstrap_sync_reservation(
+        &self,
+    ) -> Option<Box<dyn BootstrapSyncReservation + '_>> {
+        Some(Box::new(()))
     }
 }
 

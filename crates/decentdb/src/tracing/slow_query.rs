@@ -112,7 +112,12 @@ pub(crate) struct SlowQueryStore {
 
 impl SlowQueryStore {
     pub(crate) fn new(config: &RuntimeTracingConfig) -> Self {
-        let capacity = config.slow_query.max_events.clamp(1, 16384);
+        let capacity =
+            if config.enabled && config.slow_query.enabled && config.slow_query.threshold_us > 0 {
+                config.slow_query.max_events.clamp(1, 16_384)
+            } else {
+                0
+            };
         Self {
             config: config.clone(),
             buffer: BoundedRingBuffer::with_capacity(capacity),
@@ -185,6 +190,11 @@ impl SlowQueryStore {
     pub(crate) fn reset(&mut self) {
         self.buffer.reset();
     }
+
+    #[cfg(test)]
+    pub(crate) fn allocated_capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
 }
 
 #[cfg(test)]
@@ -193,7 +203,16 @@ mod tests {
 
     #[test]
     fn disabled_store_does_not_allocate() {
-        let mut store = SlowQueryStore::new(&RuntimeTracingConfig::default());
+        let config = RuntimeTracingConfig {
+            enabled: true,
+            slow_query: SlowQueryTraceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut store = SlowQueryStore::new(&config);
+        assert_eq!(store.allocated_capacity(), 0);
         store.maybe_record(
             Duration::from_secs(1),
             0,
@@ -208,6 +227,37 @@ mod tests {
             "hash",
         );
         assert!(store.snapshot().items.is_empty());
+    }
+
+    #[test]
+    fn enabled_store_reserves_configured_capacity() {
+        let config = RuntimeTracingConfig {
+            enabled: true,
+            slow_query: SlowQueryTraceConfig {
+                enabled: true,
+                threshold_us: 1,
+                max_events: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let store = SlowQueryStore::new(&config);
+        assert_eq!(store.allocated_capacity(), 7);
+    }
+
+    #[test]
+    fn zero_threshold_store_does_not_allocate() {
+        let config = RuntimeTracingConfig {
+            enabled: true,
+            slow_query: SlowQueryTraceConfig {
+                enabled: true,
+                threshold_us: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let store = SlowQueryStore::new(&config);
+        assert_eq!(store.allocated_capacity(), 0);
     }
 
     #[test]

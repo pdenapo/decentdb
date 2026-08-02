@@ -11,7 +11,7 @@ pub(crate) mod mem;
 pub(crate) mod opfs;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod os;
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
 pub(crate) mod stats;
 
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ use self::faulty::FaultyVfs;
 use self::mem::MemVfs;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use self::os::OsVfs;
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
 use self::stats::StatsVfs;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +59,27 @@ pub(crate) trait Vfs: Send + Sync + std::fmt::Debug {
     fn supports_file_locks(&self) -> bool {
         false
     }
+
+    /// Whether a fresh database bootstrap's `sync_data` call may run on a
+    /// short-lived worker while the caller constructs database state that
+    /// does not access the new main-database file.
+    ///
+    /// This capability is deliberately opt-in. Custom and browser VFS
+    /// implementations retain the conservative inline durability barrier
+    /// unless they explicitly establish the same cross-thread contract.
+    fn concurrent_bootstrap_sync_reservation(
+        &self,
+    ) -> Option<Box<dyn BootstrapSyncReservation + '_>> {
+        None
+    }
 }
+
+/// Scoped proof that a VFS permits fresh-bootstrap `sync_data` on a worker.
+/// Wrappers may retain synchronization guards inside the reservation so the
+/// capability cannot be invalidated between selection and worker completion.
+pub(crate) trait BootstrapSyncReservation {}
+
+impl<T> BootstrapSyncReservation for T {}
 
 pub(crate) trait VfsFileLock: Send + Sync + std::fmt::Debug {}
 
@@ -90,7 +110,14 @@ pub(crate) trait VfsFile: Send + Sync + std::fmt::Debug {
         Ok(())
     }
     fn advise_sequential(&self) -> Result<()>;
+    /// Makes all preceding file-content writes durable, including any file
+    /// length change required to address those writes. Implementations need
+    /// not persist unrelated metadata such as timestamps or ownership.
+    ///
+    /// The WAL checkpoint protocol relies on this barrier before it truncates
+    /// the only other durable copy of checkpointed pages.
     fn sync_data(&self) -> Result<()>;
+    /// Makes preceding file-content writes and associated metadata durable.
     fn sync_metadata(&self) -> Result<()>;
     fn file_size(&self) -> Result<u64>;
     fn set_len(&self, len: u64) -> Result<()>;
@@ -110,6 +137,7 @@ pub(crate) trait VfsFile: Send + Sync + std::fmt::Debug {
 #[derive(Clone, Debug)]
 pub(crate) struct VfsHandle {
     inner: Arc<dyn Vfs>,
+    canonical_path_hint: Option<Arc<(PathBuf, PathBuf)>>,
 }
 
 impl VfsHandle {
@@ -117,21 +145,24 @@ impl VfsHandle {
         if is_memory_path(path) {
             Self {
                 inner: Arc::new(MemVfs::default()),
+                canonical_path_hint: None,
             }
         } else {
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             {
                 Self {
                     inner: Arc::new(MemVfs::default()),
+                    canonical_path_hint: None,
                 }
             }
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             {
                 let os_vfs: Arc<dyn Vfs> = Arc::new(OsVfs);
-                #[cfg(feature = "bench-internals")]
+                #[cfg(any(test, feature = "bench-internals"))]
                 let os_vfs: Arc<dyn Vfs> = Arc::new(StatsVfs::wrap(os_vfs));
                 Self {
                     inner: Arc::new(FaultyVfs::wrap(os_vfs)),
+                    canonical_path_hint: None,
                 }
             }
         }
@@ -141,6 +172,7 @@ impl VfsHandle {
         if let Some(encryption) = &config.encryption {
             Self {
                 inner: Arc::new(EncryptedVfs::wrap(self.inner, encryption.clone())),
+                canonical_path_hint: self.canonical_path_hint,
             }
         } else {
             self
@@ -149,7 +181,15 @@ impl VfsHandle {
 
     #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn from_vfs(inner: Arc<dyn Vfs>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            canonical_path_hint: None,
+        }
+    }
+
+    pub(crate) fn with_canonical_path_hint(mut self, source: PathBuf, canonical: PathBuf) -> Self {
+        self.canonical_path_hint = Some(Arc::new((source, canonical)));
+        self
     }
 
     pub(crate) fn open(
@@ -166,6 +206,11 @@ impl VfsHandle {
     }
 
     pub(crate) fn canonicalize_path(&self, path: &Path) -> Result<PathBuf> {
+        if let Some(hint) = &self.canonical_path_hint {
+            if path == hint.0 {
+                return Ok(hint.1.clone());
+            }
+        }
         self.inner.canonicalize_path(path)
     }
 
@@ -175,6 +220,12 @@ impl VfsHandle {
 
     pub(crate) fn supports_file_locks(&self) -> bool {
         self.inner.supports_file_locks()
+    }
+
+    pub(crate) fn concurrent_bootstrap_sync_reservation(
+        &self,
+    ) -> Option<Box<dyn BootstrapSyncReservation + '_>> {
+        self.inner.concurrent_bootstrap_sync_reservation()
     }
 }
 

@@ -4,6 +4,7 @@ use crate::catalog::{
     identifiers_equal, ColumnSchema, ColumnType, IndexKind, IndexSchema, TableSchema,
 };
 use crate::error::{DbError, Result};
+use crate::record::key::RuntimeEncodedKey;
 use crate::record::row::Row;
 use crate::record::value::Value;
 use crate::spatial::types::{CoordinateDimensions, SpatialGeometry, SpatialKind, SpatialValue};
@@ -703,9 +704,9 @@ fn parent_exists_via_single_or_composite_index(
     let matched_row_ids = if child_values.len() == 1 {
         keys.row_ids_for_value(child_values[0])?
     } else {
-        keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+        keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(RuntimeEncodedKey::from_vec(
             Row::new(child_values.iter().map(|value| (*value).clone()).collect()).encode()?,
-        ))
+        )))
     };
     if matched_row_ids.is_empty() {
         return Ok(Some(false));
@@ -954,7 +955,8 @@ mod tests {
         entries.insert(
             crate::record::row::Row::new(vec![Value::Int64(42), Value::Int64(7)])
                 .encode()
-                .expect("encode composite parent key"),
+                .expect("encode composite parent key")
+                .into(),
             1,
         );
         runtime.indexes_mut().insert(

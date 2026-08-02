@@ -4,19 +4,21 @@
 
 ### Decision
 
-After a successful checkpoint, when running on Linux with the GNU C library,
-call `malloc_trim(0)` to return freed heap arenas to the operating system.
-The behavior is gated by `DbConfig::release_freed_memory_after_checkpoint:
-bool` and by `cfg(all(target_os = "linux", target_env = "gnu"))`. The
-default value of the config field is `true` on Linux/glibc and `false`
-elsewhere; the field exists on every platform so embedders have a uniform
-knob.
+When running on Linux with the GNU C library, call `malloc_trim(0)` to return
+freed heap arenas to the operating system after successful configured
+checkpoints and after thresholded row-source, runtime-compaction, or
+WAL-demotion releases. The behavior is gated by
+`DbConfig::release_freed_memory_after_checkpoint: bool` and by
+`cfg(all(target_os = "linux", target_env = "gnu"))`. Despite the legacy field
+name, `false` is the global opt-out for DecentDB's proactive heap-release
+calls. The default is `true` on Linux/glibc and `false` elsewhere; the field
+exists on every platform so embedders have a uniform knob.
 
-The call is invoked from `wal::checkpoint::checkpoint()` after the WAL
-index is cleared/pruned and after every WAL lock is released. It is
-best-effort: the return value is ignored. It is performed via direct
-`extern "C"` declaration to avoid pulling in `libc` if it is not already
-in the dependency graph.
+The checkpoint call is invoked from `wal::checkpoint::checkpoint()` after the
+WAL index is cleared/pruned. Non-checkpoint calls require a measured release
+to cross their applicable threshold. Every call is best-effort: the return
+value is ignored. The helper uses a direct `extern "C"` declaration to avoid
+pulling in `libc` if it is not already in the dependency graph.
 
 On non-Linux/non-glibc targets (musl, macOS, Windows, BSD) the helper
 compiles to an inline no-op regardless of the config field's value.
@@ -39,10 +41,10 @@ A post-checkpoint trim is the right hook because:
 
 - it runs at the natural high-water mark (immediately after the engine
   has freed the largest single block, the WAL index pages);
-- it runs at most once per checkpoint (bounded frequency);
-- it runs on the writer thread with no engine locks held (no contention);
-- its cost (`O(arena_count)` walk over freelists) is negligible compared
-  to the fsync work the checkpoint just performed.
+- it runs at most once per large checkpoint (bounded frequency);
+- its cost (`O(arena_count)` walk over freelists) is usually small compared
+  to the fsync work the checkpoint just performed, and even small checkpoints
+  can otherwise retain enough allocator memory to become the later RSS peak.
 
 ### Alternatives Considered
 
@@ -70,9 +72,8 @@ A post-checkpoint trim is the right hook because:
   *immediately* re-allocate after a checkpoint (rare), the OS may
   re-page the same memory back in. The latter case is bounded by the
   page-cache capacity (`cache_size_mb`).
-- **Safety:** `malloc_trim` is documented as safe to call from any
-  thread; DecentDB's single-writer model means we never call it
-  concurrently from multiple threads.
+- **Safety:** `malloc_trim` is documented as safe to call from any thread,
+  including when maintenance and writer-side release points overlap.
 
 ### Implementation Notes
 
@@ -93,8 +94,10 @@ A post-checkpoint trim is the right hook because:
   }
   ```
 
-- Call site is the very last statement in `checkpoint::checkpoint()`,
-  guarded by `if cfg.release_freed_memory_after_checkpoint`.
+- The checkpoint call site is the final maintenance step in
+  `checkpoint::checkpoint()`. Database-side post-commit row-source drops,
+  runtime compaction, and WAL demotion share the same config gate and apply
+  their own minimum-release thresholds before calling the helper.
 
 ### References
 

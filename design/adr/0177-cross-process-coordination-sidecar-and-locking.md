@@ -14,6 +14,11 @@ The sidecar path is:
 <database path>.coord
 ```
 
+ADR 0208 refines this to the canonical database path before appending
+`.coord`, so symlink and canonical spellings share one physical sidecar.
+Concurrent opens through distinct hard-link names are not supported because
+portable pathname canonicalization cannot prove their inode identity.
+
 The sidecar is separate from the database file and WAL file. It contains
 coordination metadata only, not user data. It has its own magic, version,
 the ADR 0180 database identity/fingerprint, generation counters,
@@ -33,6 +38,7 @@ V1 uses byte-range locks on the coordination sidecar for:
 - coordinator initialization/repair;
 - writer ownership;
 - checkpoint ownership, aliased to the writer lock in v1;
+- the shared-reader/exclusive-checkpoint admission gate defined by ADR 0208;
 - reader slot ownership/liveness;
 - metadata publication if not already protected by the writer/checkpoint lock.
 
@@ -41,6 +47,17 @@ cross-process writer/checkpoint deadlock classes and keeps the first release
 conservative: checkpoint copyback/truncation and write transactions are mutually
 exclusive across processes. A later ADR may split these locks only with a
 complete lock ordering and deadlock-avoidance protocol.
+
+As required by ADR 0208, same-process coordinators for a canonical database
+share one coordination-file descriptor and process-local arbiters for writer
+ownership and reader admission. This preserves OS exclusion on classic POSIX
+`fcntl` implementations, where locks coalesce by process and closing any
+descriptor for the inode can release the process's locks.
+Each arbiter publishes at most one pending OS-lock attempt and releases its
+state mutex during that attempt, so local waiters continue to enforce their
+own busy-timeout deadlines. Same-process reader-slot liveness probes likewise
+reserve a slot locally before probing its OS range and retain that reservation
+through stale-record clearing and explicit unlock.
 
 The VFS layer must grow a process-locking capability abstraction. Native local
 filesystem VFS implementations for Linux, macOS, and Windows must implement that

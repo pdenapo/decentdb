@@ -75,7 +75,11 @@ pub(crate) struct IndexUsageStore {
 
 impl IndexUsageStore {
     pub(crate) fn new(config: &RuntimeTracingConfig) -> Self {
-        let capacity = config.index_usage.max_rows.clamp(1, 65_536);
+        let capacity = if config.enabled && config.index_usage.enabled {
+            config.index_usage.max_rows.clamp(1, 65_536)
+        } else {
+            0
+        };
         Self {
             config: config.clone(),
             rows: HashMap::with_capacity(capacity),
@@ -135,5 +139,46 @@ impl IndexUsageStore {
     pub(crate) fn reset(&mut self) {
         self.rows.clear();
         self.order.reset();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocated_capacities(&self) -> (usize, usize) {
+        (self.rows.capacity(), self.order.capacity())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracing::config::IndexUsageTraceConfig;
+
+    #[test]
+    fn disabled_store_does_not_allocate() {
+        let config = RuntimeTracingConfig {
+            enabled: true,
+            index_usage: IndexUsageTraceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let store = IndexUsageStore::new(&config);
+        assert_eq!(store.allocated_capacities(), (0, 0));
+    }
+
+    #[test]
+    fn enabled_store_reserves_configured_capacity() {
+        let config = RuntimeTracingConfig {
+            enabled: true,
+            index_usage: IndexUsageTraceConfig {
+                enabled: true,
+                max_rows: 7,
+            },
+            ..Default::default()
+        };
+        let store = IndexUsageStore::new(&config);
+        let (rows_capacity, order_capacity) = store.allocated_capacities();
+        assert!(rows_capacity >= 7);
+        assert_eq!(order_capacity, 7);
     }
 }

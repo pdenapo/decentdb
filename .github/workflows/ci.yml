@@ -43,6 +43,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Vendored Header Drift Check
+        run: python3 scripts/check_vendored_headers.py
+
   test:
     if: github.event_name != 'push' || !endsWith(github.actor, '[bot]')
     runs-on: ubuntu-latest

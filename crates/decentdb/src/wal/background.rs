@@ -22,6 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::error::{DbError, Result};
 use crate::storage::PagerHandle;
 
 use super::format::WAL_HEADER_SIZE;
@@ -58,17 +59,17 @@ pub(crate) struct BgCheckpointer {
 impl BgCheckpointer {
     /// Spawn the worker. The worker runs until either the shutdown flag is
     /// set or the `Weak<SharedWalInner>` can no longer be upgraded.
-    pub(crate) fn start(weak: Weak<SharedWalInner>, pager: PagerHandle) -> Self {
+    pub(crate) fn start(weak: Weak<SharedWalInner>, pager: PagerHandle) -> Result<Self> {
         let ctrl = Arc::new(BgCtrl::default());
         let ctrl_for_thread = Arc::clone(&ctrl);
         let join = thread::Builder::new()
             .name("decentdb-checkpoint".into())
             .spawn(move || worker_loop(ctrl_for_thread, weak, pager))
-            .expect("spawn checkpoint worker thread");
-        Self {
+            .map_err(|source| DbError::io("spawn checkpoint worker thread", source))?;
+        Ok(Self {
             ctrl,
             join: Mutex::new(Some(join)),
-        }
+        })
     }
 
     /// Signal the worker to evaluate thresholds. Cheap: takes the ctrl
@@ -172,7 +173,7 @@ fn worker_loop(ctrl: Arc<BgCtrl>, weak: Weak<SharedWalInner>, pager: PagerHandle
 /// the writer's helper directly) to avoid bouncing through code that has
 /// `pub(super)` visibility in a sibling module and to keep the BG worker
 /// self-contained.
-fn run_checkpoint_if_needed(wal: &WalHandle, pager: &PagerHandle) -> crate::error::Result<()> {
+fn run_checkpoint_if_needed(wal: &WalHandle, pager: &PagerHandle) -> Result<()> {
     let cfg = wal.inner.auto_checkpoint;
     let pages_threshold = cfg.threshold_pages;
     let bytes_threshold = cfg.threshold_bytes;

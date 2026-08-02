@@ -13,9 +13,9 @@ that decouples commit acknowledgement from WAL durability. Under AsyncCommit:
    a configurable interval (`interval_ms`, default `10`) and calls
    `sync_data` whenever the most-recently-written WAL LSN exceeds the
    most-recently-fsynced LSN.
-3. A new public `Db::sync()` method blocks until all currently-committed LSNs
-   are durable on disk. It is a barrier, not a fence: it does not prevent
-   subsequent commits from being deferred.
+3. A new public `Db::sync()` method makes all currently-committed LSNs durable
+   on disk. It is a barrier, not a fence: it does not prevent subsequent commits
+   from being deferred.
 4. On `SharedWalInner::drop` the flusher thread is signaled to shut down, the
    thread is joined, and a final synchronous `sync_data` is performed before
    the file handle is released.
@@ -75,8 +75,11 @@ strictly opt-in via `DbConfig::wal_sync_mode`.
   open's `wal_sync_mode` wins. This is documented as a known limitation and
   matches the existing behavior for sync-mode reuse (no change).
 - The flusher thread reads `dirty_lsn` and `durable_lsn` (both
-  `AtomicU64`) and calls `file.sync_data()` outside any `Mutex`. It does not
-  contend with writers on the index lock.
+  `AtomicU64`) and calls `file.sync_data()` outside writer/index locks. The
+  built-in VFS contract includes durable file-length changes, so allocation
+  growth requires no stronger recovery barrier. Foreground barriers share a
+  flush mutex with the background flusher so sync errors can be surfaced and
+  each dirty range is covered exactly once.
 - Shutdown uses an `AtomicBool` flag plus a `Condvar` to allow timely wakeup
   on Drop without polling.
 
@@ -121,9 +124,12 @@ strictly opt-in via `DbConfig::wal_sync_mode`.
   with the mode.
 - `SharedWalInner` gains an `Option<AsyncCommitState>` and the flusher is
   spawned in `build_handle` when the variant matches.
-- `Db::sync()` calls into `WalHandle::flush_to_durable()` which busy-waits on
-  `durable_lsn >= dirty_lsn` (with `Condvar` notify-on-flush). For
-  non-AsyncCommit modes it is a no-op (commits are already durable).
+- `Db::sync()` calls into `WalHandle::flush_to_durable()` which performs a
+  foreground flush until `durable_lsn >= dirty_lsn`. For non-AsyncCommit modes
+  it is a no-op (commits are already durable).
+- Reader-free destructive checkpoint also calls `WalHandle::flush_to_durable()`
+  after the checkpoint locks and no-reader decision make the WAL tail stable,
+  but before the first main-database copyback write. See ADR 0209.
 
 ### References
 

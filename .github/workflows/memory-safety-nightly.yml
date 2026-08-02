@@ -75,6 +75,26 @@ jobs:
         # minimal pager/snapshot/transaction path within the 30-minute budget.
         run: cargo miri run -p decentdb --release --bin miri_smoke
 
+  wal-fuzz:
+    name: WAL Corruption Fuzz
+    runs-on: ubuntu-latest
+    # The fuzz run itself takes seconds; the budget covers a cold release
+    # build of the engine plus the fixed 90-case corruption matrix.
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build WAL fuzz binary
+        run: cargo build --release -p decentdb --bin wal_fuzz --quiet
+
+      - name: Run WAL corruption fuzz
+        run: ./target/release/wal_fuzz
+
   python-leak-regressions:
     name: Python Leak Regressions
     runs-on: ubuntu-latest

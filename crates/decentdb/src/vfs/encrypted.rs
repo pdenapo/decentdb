@@ -14,7 +14,9 @@ use zeroize::Zeroize;
 use crate::config::DbEncryptionConfig;
 use crate::error::{DbError, Result};
 
-use super::{write_all_at, FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
+use super::{
+    write_all_at, BootstrapSyncReservation, FileKind, OpenMode, Vfs, VfsFile, VfsFileLock,
+};
 
 pub(crate) const TDE_MAGIC: &[u8; 8] = b"DDBTDE1\0";
 const TDE_VERSION: u32 = 1;
@@ -89,6 +91,12 @@ impl Vfs for EncryptedVfs {
 
     fn supports_file_locks(&self) -> bool {
         self.inner.supports_file_locks()
+    }
+
+    fn concurrent_bootstrap_sync_reservation(
+        &self,
+    ) -> Option<Box<dyn BootstrapSyncReservation + '_>> {
+        self.inner.concurrent_bootstrap_sync_reservation()
     }
 }
 

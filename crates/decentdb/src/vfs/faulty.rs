@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
 
 use crate::error::{DbError, Result};
@@ -12,7 +12,7 @@ use crate::storage::page::SUPPORTED_PAGE_SIZES;
 use crate::wal::delta::DELTA_FRAME_PAYLOAD_SIZE;
 use crate::wal::format::{FrameType, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
 
-use super::{FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
+use super::{BootstrapSyncReservation, FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FailAction {
@@ -78,6 +78,21 @@ impl Vfs for FaultyVfs {
 
     fn supports_file_locks(&self) -> bool {
         self.inner.supports_file_locks()
+    }
+
+    fn concurrent_bootstrap_sync_reservation(
+        &self,
+    ) -> Option<Box<dyn BootstrapSyncReservation + '_>> {
+        // Failpoint decisions are intentionally made only on the thread that
+        // installed them. The shared gate closes the check/use race: install
+        // and clear take its exclusive side, so no failpoint can become active
+        // after this reservation is granted and before worker sync completes.
+        let failpoint_gate = self.state.bootstrap_sync_gate.read().ok()?;
+        if self.state.has_active_failpoints() {
+            return None;
+        }
+        let inner = self.inner.concurrent_bootstrap_sync_reservation()?;
+        Some(Box::new((failpoint_gate, inner)))
     }
 }
 
@@ -283,6 +298,7 @@ impl VfsFile for FaultyVfsFile {
 
 #[derive(Debug, Default)]
 struct FaultState {
+    bootstrap_sync_gate: RwLock<()>,
     active_failpoints: AtomicUsize,
     failpoints: Mutex<HashMap<String, Vec<Failpoint>>>,
     hits: Mutex<HashMap<String, u64>>,
@@ -381,6 +397,10 @@ enum FaultDecision {
 
 pub(crate) fn install_failpoint(failpoint: Failpoint) -> Result<()> {
     let state = global_fault_state();
+    let _bootstrap_sync_gate = state
+        .bootstrap_sync_gate
+        .write()
+        .map_err(|_| DbError::internal("bootstrap sync failpoint gate poisoned"))?;
     let mut owner = state
         .owner_thread
         .lock()
@@ -401,6 +421,10 @@ pub(crate) fn install_failpoint(failpoint: Failpoint) -> Result<()> {
 
 pub(crate) fn clear_failpoints() -> Result<()> {
     let state = global_fault_state();
+    let _bootstrap_sync_gate = state
+        .bootstrap_sync_gate
+        .write()
+        .map_err(|_| DbError::internal("bootstrap sync failpoint gate poisoned"))?;
     state
         .failpoints
         .lock()

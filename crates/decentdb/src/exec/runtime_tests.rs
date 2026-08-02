@@ -9,6 +9,7 @@ mod tests {
         splice_updated_rows_payload_in_place, split_table_payload_row_len,
         tombstone_deleted_rows_payload_in_place, EngineRuntime, Int64IdentityHasher, Int64Map,
         PendingIndexInsert, PersistedTableState, RuntimeBtreeKey, RuntimeBtreeKeys,
+        RuntimeEncodedPostings, RuntimeEncodedRowIds, RuntimeIndex, RuntimeInt64RowIds,
         RuntimeRowIdSet, StoredRow, TableData, TABLE_PAYLOAD_ROW_TOMBSTONE_FLAG,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +19,7 @@ mod tests {
     use crate::catalog::{
         ColumnSchema, ColumnType, IndexColumn, IndexKind, IndexSchema, TableSchema,
     };
+    use crate::record::key::RuntimeEncodedKey;
     use crate::record::value::Value;
 
     #[test]
@@ -108,10 +110,10 @@ mod tests {
     #[test]
     fn runtime_btree_keys_basic() {
         // UniqueEncoded
-        let mut map = BTreeMap::<Vec<u8>, i64>::new();
-        map.insert(vec![1, 2, 3], 7);
+        let mut map = BTreeMap::<RuntimeEncodedKey, i64>::new();
+        map.insert(vec![1, 2, 3].into(), 7);
         let keys = RuntimeBtreeKeys::UniqueEncoded(Arc::new(map), BTreeSet::new());
-        let key = RuntimeBtreeKey::Encoded(vec![1, 2, 3]);
+        let key = RuntimeBtreeKey::Encoded(vec![1, 2, 3].into());
         match keys.row_id_set_for_key(&key) {
             RuntimeRowIdSet::Single(v) => assert_eq!(v, 7),
             other => panic!("unexpected: {:?}", other),
@@ -122,17 +124,20 @@ mod tests {
         // insert duplicate into unique should error
         let mut keys2 = RuntimeBtreeKeys::UniqueEncoded(Arc::new(BTreeMap::new()), BTreeSet::new());
         assert!(keys2
-            .insert_row_id(RuntimeBtreeKey::Encoded(vec![9, 9]), 1)
+            .insert_row_id(RuntimeBtreeKey::Encoded(vec![9, 9].into()), 1)
             .is_ok());
         assert!(keys2
-            .insert_row_id(RuntimeBtreeKey::Encoded(vec![9, 9]), 2)
+            .insert_row_id(RuntimeBtreeKey::Encoded(vec![9, 9].into()), 2)
             .is_err());
 
         // NonUniqueEncoded
-        let mut ne = BTreeMap::<Vec<u8>, Vec<i64>>::new();
-        ne.insert(vec![4], vec![1, 2]);
-        let keys3 = RuntimeBtreeKeys::NonUniqueEncoded(Arc::new(ne), BTreeSet::new());
-        let key4 = RuntimeBtreeKey::Encoded(vec![4]);
+        let mut ne = BTreeMap::<RuntimeEncodedKey, RuntimeEncodedRowIds>::new();
+        ne.insert(vec![4].into(), RuntimeEncodedRowIds::many(vec![1, 2]));
+        let keys3 = RuntimeBtreeKeys::NonUniqueEncoded(
+            Arc::new(RuntimeEncodedPostings::new(ne)),
+            BTreeSet::new(),
+        );
+        let key4 = RuntimeBtreeKey::Encoded(vec![4].into());
         match keys3.row_id_set_for_key(&key4) {
             RuntimeRowIdSet::Many(s) => assert_eq!(s, &[1, 2]),
             other => panic!("unexpected: {:?}", other),
@@ -145,14 +150,14 @@ mod tests {
         // UniqueInt64
         let mut ui: Int64Map<i64> = Int64Map::default();
         ui.insert(5, 33);
-        let keys4 = RuntimeBtreeKeys::UniqueInt64(Arc::new(ui), BTreeSet::new());
+        let keys4 = RuntimeBtreeKeys::UniqueInt64(Arc::new(ui.into()), BTreeSet::new());
         let keyi = RuntimeBtreeKey::Int64(5);
         assert_eq!(keys4.row_ids_for_key(&keyi), vec![33]);
 
         // NonUniqueInt64
         let mut nui: Int64Map<Vec<i64>> = Int64Map::default();
         nui.insert(7, vec![100, 101]);
-        let keys5 = RuntimeBtreeKeys::NonUniqueInt64(Arc::new(nui), BTreeSet::new());
+        let keys5 = RuntimeBtreeKeys::NonUniqueInt64(Arc::new(nui.into()), BTreeSet::new());
         let keyi2 = RuntimeBtreeKey::Int64(7);
         assert_eq!(keys5.row_ids_for_key(&keyi2), vec![100, 101]);
 
@@ -167,9 +172,9 @@ mod tests {
     #[test]
     fn row_ids_for_value_set_encodes() {
         // UniqueEncoded representation
-        let mut map = BTreeMap::<Vec<u8>, i64>::new();
+        let mut map = BTreeMap::<RuntimeEncodedKey, i64>::new();
         map.insert(
-            crate::record::key::encode_index_key(&Value::Int64(123)).unwrap(),
+            crate::record::key::encode_runtime_index_key(&Value::Int64(123)).unwrap(),
             55,
         );
         let ke = RuntimeBtreeKeys::UniqueEncoded(Arc::new(map), BTreeSet::new());
@@ -179,7 +184,7 @@ mod tests {
         // UniqueInt64 representation
         let mut map2: Int64Map<i64> = Int64Map::default();
         map2.insert(123, 66);
-        let keysii = RuntimeBtreeKeys::UniqueInt64(Arc::new(map2), BTreeSet::new());
+        let keysii = RuntimeBtreeKeys::UniqueInt64(Arc::new(map2.into()), BTreeSet::new());
         assert_eq!(keysii.row_ids_for_value(&v).unwrap(), vec![66]);
     }
 
@@ -287,25 +292,201 @@ mod tests {
     fn runtime_btree_remove_mismatch_errors() {
         let mut ui: Int64Map<i64> = Int64Map::default();
         ui.insert(10, 99);
-        let mut keys = RuntimeBtreeKeys::UniqueInt64(Arc::new(ui), BTreeSet::new());
+        let mut keys = RuntimeBtreeKeys::UniqueInt64(Arc::new(ui.into()), BTreeSet::new());
         assert!(keys.remove_row_id(&RuntimeBtreeKey::Int64(10), 98).is_err());
     }
 
     #[test]
     fn total_row_id_count_and_distinct_key_count_test() {
         // UniqueEncoded
-        let mut map = BTreeMap::<Vec<u8>, i64>::new();
-        map.insert(vec![1], 1);
+        let mut map = BTreeMap::<RuntimeEncodedKey, i64>::new();
+        map.insert(vec![1].into(), 1);
         let keys = RuntimeBtreeKeys::UniqueEncoded(Arc::new(map), BTreeSet::new());
         assert_eq!(keys.total_row_id_count(), 1);
         assert_eq!(keys.distinct_key_count(), 1);
 
         // NonUniqueEncoded
-        let mut ne = BTreeMap::<Vec<u8>, Vec<i64>>::new();
-        ne.insert(vec![2], vec![1, 2, 3]);
-        let kn = RuntimeBtreeKeys::NonUniqueEncoded(Arc::new(ne), BTreeSet::new());
+        let mut ne = BTreeMap::<RuntimeEncodedKey, RuntimeEncodedRowIds>::new();
+        ne.insert(vec![2].into(), RuntimeEncodedRowIds::many(vec![1, 2, 3]));
+        let kn = RuntimeBtreeKeys::NonUniqueEncoded(
+            Arc::new(RuntimeEncodedPostings::new(ne)),
+            BTreeSet::new(),
+        );
         assert_eq!(kn.total_row_id_count(), 3);
         assert_eq!(kn.distinct_key_count(), 1);
+    }
+
+    #[test]
+    fn rebuild_nonunique_indexes_use_compact_encoded_and_int64_postings() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = TableSchema {
+            name: "items".to_string(),
+            temporary: false,
+            columns: vec![
+                ColumnSchema {
+                    name: "label".to_string(),
+                    column_type: ColumnType::Text,
+                    spatial_type: None,
+                    enum_type: None,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: Vec::new(),
+                    foreign_key: None,
+                },
+                ColumnSchema {
+                    name: "group_id".to_string(),
+                    column_type: ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: Vec::new(),
+                    foreign_key: None,
+                },
+            ],
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            primary_key_columns: Vec::new(),
+            next_row_id: 4,
+            pk_index_root: None,
+        };
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(table.name.clone(), table);
+        runtime.tables_mut().insert(
+            "items".to_string(),
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Text("alpha".to_string()), Value::Int64(7)],
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: vec![Value::Text("alpha".to_string()), Value::Int64(7)],
+                },
+                StoredRow {
+                    row_id: 3,
+                    values: vec![Value::Text("beta".to_string()), Value::Int64(8)],
+                },
+            ])
+            .into(),
+        );
+        let index = IndexSchema {
+            name: "items_label_idx".to_string(),
+            table_name: "items".to_string(),
+            kind: IndexKind::Btree,
+            unique: false,
+            columns: vec![IndexColumn {
+                column_name: Some("label".to_string()),
+                expression_sql: None,
+            }],
+            include_columns: Vec::new(),
+            predicate_sql: None,
+            full_text: None,
+            fresh: true,
+        };
+        runtime
+            .catalog_mut()
+            .indexes
+            .insert(index.name.clone(), index);
+        let int_index = IndexSchema {
+            name: "items_group_idx".to_string(),
+            table_name: "items".to_string(),
+            kind: IndexKind::Btree,
+            unique: false,
+            columns: vec![IndexColumn {
+                column_name: Some("group_id".to_string()),
+                expression_sql: None,
+            }],
+            include_columns: Vec::new(),
+            predicate_sql: None,
+            full_text: None,
+            fresh: true,
+        };
+        runtime
+            .catalog_mut()
+            .indexes
+            .insert(int_index.name.clone(), int_index);
+
+        runtime.rebuild_indexes(4096).unwrap();
+        let Some(RuntimeIndex::Btree {
+            keys: RuntimeBtreeKeys::NonUniqueEncoded(entries, _),
+            ..
+        }) = runtime.index("items_label_idx")
+        else {
+            panic!("expected rebuilt encoded BTREE index");
+        };
+        let alpha =
+            crate::record::key::encode_index_key(&Value::Text("alpha".to_string())).unwrap();
+        let beta = crate::record::key::encode_index_key(&Value::Text("beta".to_string())).unwrap();
+        assert_eq!(
+            entries
+                .get(alpha.as_slice())
+                .map(|row_ids| row_ids.as_slice()),
+            Some(&[1, 2][..])
+        );
+        assert_eq!(
+            entries
+                .get(beta.as_slice())
+                .map(|row_ids| row_ids.as_slice()),
+            Some(&[3][..])
+        );
+
+        let Some(RuntimeIndex::Btree {
+            keys: RuntimeBtreeKeys::NonUniqueInt64(entries, _),
+            ..
+        }) = runtime.index("items_group_idx")
+        else {
+            panic!("expected rebuilt typed INT64 BTREE index");
+        };
+        assert!(entries.is_dense());
+        assert_eq!(
+            entries.get(&7),
+            Some(&RuntimeInt64RowIds::Contiguous { start: 1, len: 2 })
+        );
+        assert_eq!(entries.get(&8), Some(&RuntimeInt64RowIds::One(3)));
+
+        let grouped = crate::sql::parser::parse_sql_statement(
+            "SELECT group_id, COUNT(*) FROM items GROUP BY group_id ORDER BY group_id",
+        )
+        .unwrap();
+        let grouped = runtime.execute_read_statement(&grouped, &[], 4096).unwrap();
+        assert_eq!(
+            grouped
+                .rows()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![Value::Int64(7), Value::Int64(2)],
+                vec![Value::Int64(8), Value::Int64(1)],
+            ]
+        );
+
+        let ordered = crate::sql::parser::parse_sql_statement(
+            "SELECT group_id FROM items ORDER BY group_id DESC",
+        )
+        .unwrap();
+        let ordered = runtime.execute_read_statement(&ordered, &[], 4096).unwrap();
+        assert_eq!(
+            ordered
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![Value::Int64(8), Value::Int64(7), Value::Int64(7)]
+        );
     }
 
     #[test]

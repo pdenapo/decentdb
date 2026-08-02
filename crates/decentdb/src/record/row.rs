@@ -46,6 +46,19 @@ pub(crate) struct RowOverflowOptions {
     pub(crate) compression: CompressionMode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastInt64Decode {
+    Hit(Option<i64>),
+    Miss,
+}
+
+#[inline]
+fn checked_payload_end(offset: usize, payload_len: usize) -> Result<usize> {
+    offset
+        .checked_add(payload_len)
+        .ok_or_else(|| DbError::corruption("field payload length exceeds address space"))
+}
+
 impl Default for RowOverflowOptions {
     fn default() -> Self {
         Self {
@@ -78,7 +91,88 @@ impl Row {
         Self::decode_with_overflow::<crate::storage::page::InMemoryPageStore>(bytes, None)
     }
 
+    #[inline(always)]
     pub(crate) fn decode_int64_at(bytes: &[u8], column_index: usize) -> Result<Option<i64>> {
+        match Self::try_decode_int64_at_fast(bytes, column_index) {
+            FastInt64Decode::Hit(value) => Ok(value),
+            FastInt64Decode::Miss => Self::decode_int64_at_slow(bytes, column_index),
+        }
+    }
+
+    #[inline(always)]
+    fn try_decode_int64_at_fast(bytes: &[u8], column_index: usize) -> FastInt64Decode {
+        let Some(&field_count) = bytes.first() else {
+            return FastInt64Decode::Miss;
+        };
+        if field_count & 0x80 != 0 || column_index >= usize::from(field_count) {
+            return FastInt64Decode::Miss;
+        }
+
+        let mut offset = 1_usize;
+        for field_index in 0..=column_index {
+            let Some(&tag) = bytes.get(offset) else {
+                return FastInt64Decode::Miss;
+            };
+            let Some(payload_len_offset) = offset.checked_add(1) else {
+                return FastInt64Decode::Miss;
+            };
+            let Some(&payload_len) = bytes.get(payload_len_offset) else {
+                return FastInt64Decode::Miss;
+            };
+            if payload_len & 0x80 != 0 {
+                return FastInt64Decode::Miss;
+            }
+
+            let Some(payload_offset) = payload_len_offset.checked_add(1) else {
+                return FastInt64Decode::Miss;
+            };
+            let Some(payload_end) = payload_offset.checked_add(usize::from(payload_len)) else {
+                return FastInt64Decode::Miss;
+            };
+            let Some(payload) = bytes.get(payload_offset..payload_end) else {
+                return FastInt64Decode::Miss;
+            };
+            offset = payload_end;
+
+            if field_index != column_index {
+                continue;
+            }
+
+            return match tag {
+                TAG_NULL if payload.is_empty() => FastInt64Decode::Hit(None),
+                TAG_INT64 => Self::try_decode_short_int64(payload)
+                    .map_or(FastInt64Decode::Miss, |value| {
+                        FastInt64Decode::Hit(Some(value))
+                    }),
+                _ => FastInt64Decode::Miss,
+            };
+        }
+
+        FastInt64Decode::Miss
+    }
+
+    #[inline(always)]
+    fn try_decode_short_int64(payload: &[u8]) -> Option<i64> {
+        let encoded = match payload {
+            [first] if first & 0x80 == 0 => u64::from(*first),
+            [first, second] if first & 0x80 != 0 && second & 0x80 == 0 => {
+                u64::from(first & 0x7f) | (u64::from(*second) << 7)
+            }
+            [first, second, third]
+                if first & 0x80 != 0 && second & 0x80 != 0 && third & 0x80 == 0 =>
+            {
+                u64::from(first & 0x7f)
+                    | (u64::from(second & 0x7f) << 7)
+                    | (u64::from(*third) << 14)
+            }
+            _ => return None,
+        };
+        Some(zigzag_decode_u64(encoded))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn decode_int64_at_slow(bytes: &[u8], column_index: usize) -> Result<Option<i64>> {
         let (field_count, mut offset) = decode_varint_u64(bytes)?;
         let field_count = usize::try_from(field_count)
             .map_err(|_| DbError::corruption("row field count exceeds usize"))?;
@@ -96,7 +190,7 @@ impl Row {
             offset += len_bytes;
             let payload_len = usize::try_from(payload_len)
                 .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
-            let payload_end = offset + payload_len;
+            let payload_end = checked_payload_end(offset, payload_len)?;
             let payload = bytes
                 .get(offset..payload_end)
                 .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
@@ -147,7 +241,7 @@ impl Row {
             offset += len_bytes;
             let payload_len = usize::try_from(payload_len)
                 .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
-            let payload_end = offset + payload_len;
+            let payload_end = checked_payload_end(offset, payload_len)?;
             let payload = bytes
                 .get(offset..payload_end)
                 .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
@@ -209,7 +303,7 @@ impl Row {
             offset += len_bytes;
             let payload_len = usize::try_from(payload_len)
                 .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
-            let payload_end = offset + payload_len;
+            let payload_end = checked_payload_end(offset, payload_len)?;
             let payload = bytes
                 .get(offset..payload_end)
                 .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
@@ -285,7 +379,7 @@ impl Row {
             offset += len_bytes;
             let payload_len = usize::try_from(payload_len)
                 .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
-            let payload_end = offset + payload_len;
+            let payload_end = checked_payload_end(offset, payload_len)?;
             let payload = bytes
                 .get(offset..payload_end)
                 .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
@@ -327,7 +421,7 @@ impl Row {
             offset += len_bytes;
             let payload_len = usize::try_from(payload_len)
                 .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
-            let payload_end = offset + payload_len;
+            let payload_end = checked_payload_end(offset, payload_len)?;
             let payload = bytes
                 .get(offset..payload_end)
                 .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
@@ -579,7 +673,7 @@ impl Row {
             offset += len_bytes;
             let payload_len = usize::try_from(payload_len)
                 .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
-            let payload_end = offset + payload_len;
+            let payload_end = checked_payload_end(offset, payload_len)?;
             let payload = bytes
                 .get(offset..payload_end)
                 .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
@@ -933,7 +1027,17 @@ mod tests {
     use crate::record::value::Value;
     use crate::storage::page::InMemoryPageStore;
 
-    use super::{Row, RowOverflowOptions};
+    use super::{FastInt64Decode, Row, RowOverflowOptions, TAG_INT64, TAG_NULL, TAG_TEXT};
+
+    fn assert_int64_decoder_parity(bytes: &[u8], column_index: usize) {
+        let decoded = Row::decode_int64_at(bytes, column_index);
+        let slow = Row::decode_int64_at_slow(bytes, column_index);
+        match (decoded, slow) {
+            (Ok(decoded), Ok(slow)) => assert_eq!(decoded, slow),
+            (Err(decoded), Err(slow)) => assert_eq!(decoded.to_string(), slow.to_string()),
+            (decoded, slow) => panic!("decoder mismatch: fast={decoded:?}, slow={slow:?}"),
+        }
+    }
 
     fn value_strategy() -> impl Strategy<Value = Value> {
         prop_oneof![
@@ -1016,6 +1120,176 @@ mod tests {
         assert_eq!(Row::decode_int64_at(&encoded, 1).expect("decode"), Some(42));
         assert_eq!(Row::decode_int64_at(&encoded, 2).expect("decode"), None);
         assert!(Row::decode_int64_at(&encoded, 0).is_err());
+    }
+
+    #[test]
+    fn decode_int64_at_fast_path_reads_benchmark_shaped_row() {
+        let row = Row::new(vec![
+            Value::Int64(17),
+            Value::Int64(5),
+            Value::Int64(2),
+            Value::Text("Song 17".to_string()),
+            Value::Int64(240_000),
+        ]);
+        let encoded = row.encode().expect("encode");
+
+        assert_eq!(
+            Row::try_decode_int64_at_fast(&encoded, 4),
+            FastInt64Decode::Hit(Some(240_000))
+        );
+        assert_int64_decoder_parity(&encoded, 4);
+    }
+
+    #[test]
+    fn decode_int64_at_fast_path_handles_short_values_and_falls_back_for_long_values() {
+        let cases = [
+            (0_i64, true),
+            (64_i64, true),
+            (8_192_i64, true),
+            (1_i64 << 20, false),
+            (i64::MIN, false),
+        ];
+
+        for (value, should_hit_fast_path) in cases {
+            let encoded = Row::new(vec![Value::Text("prefix".to_string()), Value::Int64(value)])
+                .encode()
+                .expect("encode");
+            let fast = Row::try_decode_int64_at_fast(&encoded, 1);
+            if should_hit_fast_path {
+                assert_eq!(fast, FastInt64Decode::Hit(Some(value)));
+            } else {
+                assert_eq!(fast, FastInt64Decode::Miss);
+            }
+            assert_int64_decoder_parity(&encoded, 1);
+        }
+    }
+
+    #[test]
+    fn decode_int64_at_fast_path_preserves_null_and_metadata_fallbacks() {
+        let encoded = Row::new(vec![Value::Text("prefix".to_string()), Value::Null])
+            .encode()
+            .expect("encode");
+        assert_eq!(
+            Row::try_decode_int64_at_fast(&encoded, 1),
+            FastInt64Decode::Hit(None)
+        );
+        assert_int64_decoder_parity(&encoded, 1);
+
+        for (text_len, should_hit_fast_path) in [(127_usize, true), (128_usize, false)] {
+            let encoded = Row::new(vec![
+                Value::Text("x".repeat(text_len)),
+                Value::Int64(240_000),
+            ])
+            .encode()
+            .expect("encode");
+            let fast = Row::try_decode_int64_at_fast(&encoded, 1);
+            if should_hit_fast_path {
+                assert_eq!(fast, FastInt64Decode::Hit(Some(240_000)));
+            } else {
+                assert_eq!(fast, FastInt64Decode::Miss);
+            }
+            assert_int64_decoder_parity(&encoded, 1);
+        }
+
+        let mut values = vec![Value::Null; 127];
+        values.push(Value::Int64(240_000));
+        let encoded = Row::new(values).encode().expect("encode");
+        assert_eq!(
+            Row::try_decode_int64_at_fast(&encoded, 127),
+            FastInt64Decode::Miss
+        );
+        assert_int64_decoder_parity(&encoded, 127);
+    }
+
+    #[test]
+    fn decode_int64_at_fast_path_replays_ambiguous_and_corrupt_rows_through_slow_path() {
+        let corrupt_rows: &[(&[u8], usize)] = &[
+            (&[], 0),
+            (&[1], 0),
+            (&[1, TAG_INT64], 0),
+            (&[1, TAG_INT64, 1], 0),
+            (&[1, TAG_NULL, 1, 0], 0),
+            (&[1, TAG_TEXT, 0], 0),
+            (&[1, TAG_INT64, 2, 0, 0], 0),
+            (&[1, TAG_INT64, 1, 0x80], 0),
+            (
+                &[
+                    1, TAG_INT64, 10, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                ],
+                0,
+            ),
+            (&[1, TAG_INT64, 1, 0], 1),
+        ];
+
+        for (bytes, column_index) in corrupt_rows {
+            assert_eq!(
+                Row::try_decode_int64_at_fast(bytes, *column_index),
+                FastInt64Decode::Miss
+            );
+            assert_int64_decoder_parity(bytes, *column_index);
+            assert!(Row::decode_int64_at(bytes, *column_index).is_err());
+        }
+
+        let accepted_ambiguous_rows: &[&[u8]] =
+            &[&[0x81, 0, TAG_INT64, 1, 0], &[1, TAG_INT64, 0x81, 0, 0]];
+        for bytes in accepted_ambiguous_rows {
+            assert_eq!(
+                Row::try_decode_int64_at_fast(bytes, 0),
+                FastInt64Decode::Miss
+            );
+            assert_int64_decoder_parity(bytes, 0);
+            assert_eq!(Row::decode_int64_at(bytes, 0).expect("decode"), Some(0));
+        }
+    }
+
+    #[test]
+    fn row_decoders_reject_payload_length_address_overflow_without_panicking() {
+        let encoded = [
+            1, TAG_INT64, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+        ];
+        let expected = "database corruption: field payload length exceeds address space";
+
+        assert_eq!(
+            Row::decode_int64_at(&encoded, 0)
+                .expect_err("INT64 decoder must reject overflowing payload end")
+                .to_string(),
+            expected
+        );
+        assert_int64_decoder_parity(&encoded, 0);
+        assert_eq!(
+            Row::decode_float64_at(&encoded, 0)
+                .expect_err("FLOAT64 decoder must reject overflowing payload end")
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            Row::decode_projection_with_overflow::<InMemoryPageStore>(&encoded, None, &[0])
+                .expect_err("projection decoder must reject overflowing payload end")
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            Row::decode_projection_sorted_unique_with_overflow::<InMemoryPageStore>(
+                &encoded,
+                None,
+                &[0],
+            )
+            .expect_err("sorted projection decoder must reject overflowing payload end")
+            .to_string(),
+            expected
+        );
+        assert_eq!(
+            Row::encoded_prefix_matches(&encoded, &[Value::Int64(0)])
+                .expect_err("prefix decoder must reject overflowing payload end")
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            Row::decode(&encoded)
+                .expect_err("full row decoder must reject overflowing payload end")
+                .to_string(),
+            expected
+        );
     }
 
     #[test]

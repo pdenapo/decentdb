@@ -5,7 +5,173 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## UNRELEASED
+## [2.17.0] - [2026-08-02]
+
+### Added
+
+- Added ADRs 0202 through 0211 covering the current WAL integrity contract,
+  dense runtime integer indexes, bounded WAL commit preparation, compact paged
+  row directories, on-disk full-page WAL publication, inline runtime encoded
+  keys, cross-process reader admission gating, and checkpoint-tail async
+  durability barriers, bounded pipelined checkpoint copyback, and the
+  capability-gated fresh-create bootstrap sync overlap with atomic fresh-WAL
+  acquisition and post-barrier orphan-WAL recovery.
+- Added a `wal-fuzz` job to the memory-safety nightly workflow so the 90-case
+  WAL corruption matrix (6 corruption strategies x 5 row counts x 3 variants)
+  runs in CI instead of only manually; a local release run completes in ~2
+  seconds.
+- Added `scripts/check_vendored_headers.py` and a `Vendored Header Drift Check`
+  step in the CI lint job that fail when the Go/Dart vendored `decentdb.h`
+  copies drift from the canonical `include/decentdb.h`.
+- Added a frozen rust-baseline history manifest, strict aggregation gate, and
+  provenance-capture helper for repeatable default-profile DecentDB record
+  evaluation. The gate validates the canonical 13-step workload, empty optional
+  benchmark features, checkpoint durability marker, fixed seed/query counts,
+  storage-size equality, trial layout, binary/source/platform evidence, and
+  candidate/history disjointness.
+
+### Changed
+
+- Converted 39 poisoned-lock `.expect(...)` panics across the WAL writer,
+  checkpoint, async-commit, background-checkpoint, shared-registry, and
+  snapshot-reader paths into typed `DbError::internal` propagation, and mapped
+  WAL flusher / checkpoint worker thread-spawn failures to `DbError::io`, so
+  lock poisoning or thread-spawn failure surfaces as a typed error instead of
+  panicking the host process (including across the C FFI). Success-path
+  behavior, lock ordering, and public signatures are unchanged; Drop impls and
+  other non-`Result` contexts intentionally keep their documented invariant
+  panics.
+- Refreshed the stale vendored C ABI headers in `bindings/go` and
+  `bindings/dart` so they match `include/decentdb.h` again, restoring
+  declarations for the plan-cache, runtime-tracing, and Lua extension JSON
+  entry points added after ABI 7.
+- Reworked the rust-baseline runner so the default build is DecentDB-only.
+  SQLite, DuckDB, report generation, plan-cache, latency, concurrency, write,
+  and cold/recovery suites are now opt-in Cargo features and are reported in
+  `compiled_optional_features` instead of being linked into canonical
+  DecentDB RSS evidence.
+- Made historical rust-baseline HTML reports manifest-driven when a frozen
+  `history-manifest.json` is present. Report generation now verifies every
+  manifested SHA-256 and ignores adjacent provisional JSON files; ad-hoc
+  directories without a manifest retain ambient result discovery.
+- Reduced large durable seed memory and CPU costs by compacting sequential
+  `INTEGER PRIMARY KEY` runtime indexes into dense identity ranges, storing
+  contiguous paged-row directories as compact locator vectors, reusing prepared
+  insert candidate and row-encoding scratch buffers, and reusing aggregate
+  overflow scratch.
+- Bounded WAL commit preparation by streaming page frames through 4 MiB groups,
+  using transaction-wide duplicate-page tracking, folding the Commit marker
+  into the final publication batch, and publishing reader-free self-contained
+  full Page frames as on-disk WAL versions when snapshot history does not need
+  resident payloads. Encoded-frame scratch now retains at most 256 KiB while
+  idle, releasing larger bulk-commit allocations after their bytes are written
+  or preparation fails without changing durability or publication ordering.
+- Reduced runtime encoded-index allocation by storing short sortable encoded
+  keys inline, borrowing single-column source/probe values during encoding, and
+  using singleton-aware non-unique encoded postings plus conservative
+  compaction-skip tracking.
+- Reduced checkpoint and cold-read overhead by sorting copyback pages,
+  coalescing contiguous positional writes into 8 MiB batches, skipping
+  immediately-discarded page-cache refresh work, caching the pager's on-disk
+  page count, decoding known-length on-disk WAL frames with one positional
+  read, and retaining post-checkpoint heap release for small as well as large
+  copybacks so later queries do not inherit allocator RSS. WAL commit,
+  async-flush, external-tail, and checkpoint-truncate barriers now use the VFS
+  `sync_data` contract, which durably covers WAL bytes and file-length changes
+  without forcing recovery-irrelevant inode metadata.
+- Made `release_freed_memory_after_checkpoint = false` the global opt-out for
+  proactive heap release; configured checkpoints remain eligible, while
+  row-source, runtime-compaction, and WAL-demotion releases are thresholded.
+- Overlapped WAL page materialization with the preceding 8 MiB database
+  copyback write for large contiguous checkpoints using one per-call worker and
+  two reusable bounded buffers, then reused that worker for the final WAL sync
+  while local index cleanup and allocator trimming proceed. Small or sparse
+  checkpoints remain sequential, worker-spawn failure falls back before
+  copyback, and every worker error or panic is joined and reconciled before
+  publication or return.
+- Improved query and startup hot paths used by the rust-baseline workload,
+  including readerless observed-current count and by-id reads, grouped Top-N
+  aggregate handling, schema-batch splitting reuse, transaction classification
+  shortcuts, fresh-create runtime initialization, stale-WAL schema-cookie
+  recovery, and disabled runtime-tracing buffers that avoid unnecessary map and
+  ring-buffer allocation.
+- Overlapped the native fresh-database `sync_data` barrier with construction of
+  the known-empty pager, coordination/WAL state, runtime, and `Db`. The private
+  VFS capability is opt-in and reservation-based; create still joins and
+  requires durability before returning, uses exact inline fallback for custom,
+  memory, browser, orphan-WAL, active-failpoint, and worker-spawn-failure paths,
+  and avoids all other main-file access during the overlap.
+
+### Fixed
+
+- Closed a checkpoint durability gap: `wal::checkpoint()` copied committed
+  pages into the main database file and then truncated the WAL without ever
+  syncing the main file, so a power loss or kernel panic after the
+  post-truncation WAL fsync could lose acknowledged commits (PRD pillar #1).
+  Checkpoint now syncs the database file (data + size, via
+  `PagerHandle::sync_data`) after copyback and before WAL truncation, per the
+  ADR 0004 durability invariant. The built-in VFS implementations guarantee
+  that this barrier persists both contents and file length: Linux uses
+  `fdatasync`, macOS uses `F_FULLFSYNC`, Windows uses `FlushFileBuffers`, and
+  OPFS uses its synchronous access-handle flush. See the implementation notes
+  added to ADR 0004.
+- Made reader-free destructive checkpoints safe under `WalSyncMode::AsyncCommit`
+  by forcing any dirty stable WAL tail durable before main-database copyback,
+  synchronizing foreground and background WAL flushers, rebasing async
+  dirty/durable watermarks after logical WAL reset, and conservatively syncing
+  externally recovered coordinated WAL tails whose publishing process
+  durability mode is unknown.
+- Closed the cross-process reader-registration/checkpoint race by adding a
+  shared-reader/exclusive-checkpoint admission gate on coordination sidecar
+  byte 3, sharing same-process coordination file descriptors and local arbiters
+  by canonical database path, preserving independent busy-timeout budgets for
+  local lock waiters, and making stale-slot probes reserve same-process slots
+  before lock probing and clearing.
+- Preserved local WAL state after late checkpoint cleanup failures by clearing
+  the in-memory WAL index after logical reset even when sidecar cleanup reports
+  an error, while still returning the late error to the caller.
+- Fixed WAL delta-base lookup with a bounded hot set so a latest version
+  spilled into the sidecar is promoted before main-database fallback. Rewrites
+  of spilled pages now retain on-disk-WAL provenance and emit self-contained
+  frames, preventing recovery from applying a stale-main delta to a newer WAL
+  image.
+- Made WAL-index sidecar cleanup generation-safe across checkpoint reset.
+  Sidecar records become unreadable before any fallible physical clear, the
+  first post-failure spill must establish a fresh empty generation, and reopen
+  clears before recovery. Partial clear failures can no longer leave stale WAL
+  offsets available after the low-offset WAL tail is reused.
+- Made WAL-index sidecar record updates failure-atomic by publishing `EMPTY`,
+  replacing metadata, then publishing `PRESENT`; promotion/spill failures keep
+  or restore the authoritative in-memory version. Sidecar work needed by a
+  commit now precedes logical WAL-header publication, while post-publication
+  spill and auto-checkpoint failures remain retryable maintenance instead of
+  reporting an already-committed transaction as failed. Process-coordinated
+  databases conservatively use the in-memory WAL index until the sidecar has a
+  shared generation and locking protocol.
+- Fixed stale-WAL recovery after a fresh main-database recreation so the runtime
+  schema cookie is derived from the recovered storage snapshot rather than from
+  the fresh header's zero cookie before later DML or DDL.
+- Fixed two clippy errors on stable rustc 1.97 (`question_mark` in
+  `db/query_api.rs`, `for_kv_map` in `exec/mod.rs`) so
+  `cargo clippy --all-targets --all-features -- -D warnings` is green again.
+
+### Validation
+
+- Added targeted tests for dense and sparse runtime index behavior, compact
+  paged-row directories, deferred locator caches, runtime encoded-key and
+  posting transitions, bounded WAL preparation, on-disk WAL page publication,
+  checkpoint copyback and failure ordering, async checkpoint-tail barriers,
+  cross-process admission and stale-slot races, startup schema-cookie recovery,
+  benchmark report provenance fields, canonical runner feature gates, history
+  manifest validation, checksum-verified HTML report selection, and final-gate
+  provenance validation.
+- Added deterministic checkpoint-pipeline overlap, database-write failure,
+  outstanding-materialization failure, spawn fallback, encrypted copyback,
+  final-sync error/panic reconciliation, same-handle retry, and WAL-reopen
+  recovery tests.
+- Final rust-baseline record status and full repository quality-check results
+  are intentionally not claimed here until the final 9x4 record gate and full
+  validation suite have completed.
 
 ## [2.16.1] - [2026-07-01]
 
@@ -743,7 +909,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed .NET `Cache Size` and related native connection options so they are passed through the C ABI at open time instead of being parsed and ignored by the managed binding.
 - Fixed C ABI owned-value disposal for native `GEOMETRY` and `GEOGRAPHY` result values so sanitizer runs no longer report leaked copied spatial cells.
 - Fixed the Node Knex lifecycle tests to always close pools after success or failure and clean up DecentDB WAL sidecar files between tests, avoiding hung nightly binding lifecycle runs after transaction failures.
-  
+
 
 ## [2.5.0] - 2026-05-18
 

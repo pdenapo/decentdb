@@ -216,10 +216,9 @@ pub(super) fn parse_simple_row_id_projection_sql(
     let right = right.trim();
     let (filter_column, param_index) = if let Some(param_index) = parse_positional_param(right) {
         (left, param_index)
-    } else if let Some(param_index) = parse_positional_param(left) {
-        (right, param_index)
     } else {
-        return None;
+        let param_index = parse_positional_param(left)?;
+        (right, param_index)
     };
     if !is_simple_sql_identifier(filter_column) {
         return None;

@@ -4,6 +4,7 @@
 //! - design/adr/0001-page-size.md
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{DbError, Result};
@@ -27,6 +28,17 @@ struct Pager {
     header: Mutex<DatabaseHeader>,
     page_pool: Mutex<Vec<Vec<u8>>>,
     page_pool_max: usize,
+    /// Cached main-database file page count (file length / page size).
+    ///
+    /// `load_page_from_disk` reads this instead of calling `file_size()`
+    /// (`statx`) on every cache miss to decide whether a page is beyond EOF
+    /// (and should yield a zeroed buffer instead of an error). It is updated
+    /// on every write that extends the file and refreshed on
+    /// `refresh_from_disk`, so it stays accurate for the single-process
+    /// writer. Coordinated checkpoint refreshes must call `refresh_from_disk`
+    /// before exposing another handle or process's new main-file length;
+    /// uncoordinated external writers are unsupported.
+    db_page_count: AtomicU32,
     #[cfg(test)]
     page_pool_reuse_count: std::sync::atomic::AtomicUsize,
 }
@@ -51,9 +63,51 @@ impl PagerHandle {
         page_pool_max: usize,
     ) -> Result<Self> {
         let page_size = header.page_size;
+        // Seed the cached page count from the on-disk length once at open so
+        // the read path doesn't pay a `statx` per cache miss just to learn
+        // whether a page is beyond EOF.
+        let db_page_count = page::page_count_for_len(file.file_size()?, page_size);
+        Ok(Self::open_with_known_page_count(
+            file,
+            header,
+            cache_size_mb,
+            page_pool_max,
+            db_page_count,
+        ))
+    }
+
+    /// Opens the pager for a bootstrap written by
+    /// `write_database_bootstrap_vfs`, whose main file is known to contain
+    /// exactly the header page and reserved catalog-root page. This avoids a
+    /// main-file stat while the fresh bootstrap durability barrier is running
+    /// on another thread.
+    pub(crate) fn open_fresh_bootstrap_with_page_pool(
+        file: Arc<dyn VfsFile>,
+        header: DatabaseHeader,
+        cache_size_mb: usize,
+        page_pool_max: usize,
+    ) -> Self {
+        const FRESH_BOOTSTRAP_PAGE_COUNT: PageId = 2;
+        Self::open_with_known_page_count(
+            file,
+            header,
+            cache_size_mb,
+            page_pool_max,
+            FRESH_BOOTSTRAP_PAGE_COUNT,
+        )
+    }
+
+    fn open_with_known_page_count(
+        file: Arc<dyn VfsFile>,
+        header: DatabaseHeader,
+        cache_size_mb: usize,
+        page_pool_max: usize,
+        db_page_count: PageId,
+    ) -> Self {
+        let page_size = header.page_size;
         let bytes = cache_size_mb.saturating_mul(1024 * 1024);
         let capacity_pages = (bytes / page_size as usize).max(1);
-        Ok(Self {
+        Self {
             inner: Arc::new(Pager {
                 file,
                 page_size,
@@ -61,10 +115,11 @@ impl PagerHandle {
                 header: Mutex::new(header),
                 page_pool: Mutex::new(Vec::with_capacity(page_pool_max.min(256))),
                 page_pool_max,
+                db_page_count: AtomicU32::new(db_page_count),
                 #[cfg(test)]
                 page_pool_reuse_count: std::sync::atomic::AtomicUsize::new(0),
             }),
-        })
+        }
     }
 
     pub(crate) fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
@@ -85,6 +140,9 @@ impl PagerHandle {
         self.inner.file.advise_sequential()
     }
 
+    /// Writes a single page directly to the database file and refreshes the
+    /// page cache. Used by WAL tests and the bench-internals WAL fixture.
+    #[cfg(any(test, feature = "bench-internals"))]
     pub(crate) fn write_page_direct(&self, page_id: PageId, data: &[u8]) -> Result<()> {
         page::validate_page_id(page_id)?;
         if data.len() != self.inner.page_size as usize {
@@ -105,14 +163,93 @@ impl PagerHandle {
         if self.inner.file.file_size()? < required_len {
             self.inner.file.set_len(required_len)?;
         }
+        self.inner.bump_db_page_count_from_len(required_len);
         self.inner.cache.insert_clean_page(page_id, data.to_vec())
     }
 
+    /// Writes a contiguous run of `pages.len()` pages starting at
+    /// `start_page_id` in a single `pwrite` without refreshing the page cache.
+    /// Used by checkpoint copyback to coalesce adjacent dirty pages (sorted by
+    /// page id) into one syscall instead of one per page.
+    ///
+    /// The page cache is intentionally not populated: checkpoint clears the
+    /// whole cache immediately after copyback via
+    /// `invalidate_cache_after_local_checkpoint`, so
+    /// inserting each copied page mid-copyback would only throw away one
+    /// allocation + copy per page (~40k pages, ~160 MB of redundant memcpy on
+    /// the full scale).
+    ///
+    /// `pages` must be exactly `page_size * count` bytes laid out as
+    /// `start_page_id, start_page_id + 1, ...` so the byte range is one
+    /// contiguous slice of the database file.
+    pub(crate) fn write_pages_contiguous_no_cache(
+        &self,
+        start_page_id: PageId,
+        pages: &[u8],
+    ) -> Result<()> {
+        page::validate_page_id(start_page_id)?;
+        let page_size = self.inner.page_size as usize;
+        if !pages.len().is_multiple_of(page_size) {
+            return Err(DbError::internal(format!(
+                "contiguous write buffer length {} is not a multiple of page size {page_size}",
+                pages.len()
+            )));
+        }
+        let count = pages.len() / page_size;
+        if count == 0 {
+            return Ok(());
+        }
+        let count = PageId::try_from(count)
+            .map_err(|_| DbError::internal("contiguous database write contains too many pages"))?;
+        start_page_id
+            .checked_add(count.saturating_sub(1))
+            .ok_or_else(|| DbError::internal("contiguous database write page range overflows"))?;
+        let offset = page::page_offset(start_page_id, self.inner.page_size);
+        let required_len = offset
+            .checked_add(pages.len() as u64)
+            .ok_or_else(|| DbError::internal("contiguous database write length overflows"))?;
+        write_all_at(self.inner.file.as_ref(), offset, pages)?;
+        // pwrite beyond EOF extends the file on every supported platform. A
+        // checkpoint holds the cross-process writer/checkpoint gate, so no
+        // supported concurrent truncation can race this copyback.
+        self.inner.bump_db_page_count_from_len(required_len);
+        Ok(())
+    }
+
+    /// Syncs the database file data and size to stable storage.
+    ///
+    /// Checkpoint copyback must call this after all main-file writes and
+    /// before the WAL is truncated: once the WAL is discarded, the main file
+    /// is the only remaining copy of the committed pages. See ADR 0004.
+    ///
+    /// The built-in VFS implementations guarantee that `sync_data` makes both
+    /// file contents and the file length durable. On Linux this maps to
+    /// `fdatasync`, which includes size changes needed to retrieve the data;
+    /// macOS and Windows use the same durable flush as `sync_metadata`, and
+    /// OPFS uses its synchronous access-handle flush. Timestamps and other
+    /// recovery-irrelevant inode metadata need not be persisted on platforms
+    /// that can omit them.
+    pub(crate) fn sync_data(&self) -> Result<()> {
+        self.inner.file.sync_data()
+    }
+
+    /// Reads the current file length exactly.
+    ///
+    /// Keep this for diagnostics, artifact copies, and freelist-tail
+    /// truncation, where an out-of-band coordinated resize must be observed
+    /// rather than inferred from this handle's last refresh.
     pub(crate) fn on_disk_page_count(&self) -> Result<PageId> {
         self.inner
             .file
             .file_size()
             .map(|size| page::page_count_for_len(size, self.inner.page_size))
+    }
+
+    /// Returns the main-file page count last established by pager open,
+    /// pager-owned growth/shrink, or an explicit cross-process refresh.
+    #[must_use]
+    pub(crate) fn cached_page_count(&self) -> PageId {
+        self.inner.db_page_count.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -140,9 +277,10 @@ impl PagerHandle {
             &empty,
         )?;
         self.inner.recycle_page_buffer(empty)?;
-        self.inner.file.set_len(
-            page::page_offset(page_id, self.inner.page_size) + u64::from(self.inner.page_size),
-        )?;
+        let new_len =
+            page::page_offset(page_id, self.inner.page_size) + u64::from(self.inner.page_size);
+        self.inner.file.set_len(new_len)?;
+        self.inner.bump_db_page_count_from_len(new_len);
         Ok(page_id)
     }
 
@@ -212,6 +350,51 @@ impl PagerHandle {
             )));
         }
         self.inner.cache.clear()?;
+        // The on-disk length may have changed (e.g. checkpoint copyback grew
+        // the file, or an external writer extended it); re-sync the cached
+        // page count so the read path's EOF check is accurate.
+        self.inner.refresh_db_page_count()?;
+        *self
+            .inner
+            .header
+            .lock()
+            .map_err(|_| DbError::internal("pager header lock poisoned"))? = header;
+        Ok(())
+    }
+
+    /// Invalidates pages after this handle copied WAL versions into its own
+    /// main database file.
+    ///
+    /// Unlike `refresh_from_disk`, this local checkpoint path does not need to
+    /// stat the file: the checkpoint gate excludes an external writer and every
+    /// positional copyback write already advanced `db_page_count`. The header
+    /// page is WAL-managed, so copyback may have landed a newer committed
+    /// header; `refresh_header_from_disk_after_local_checkpoint` reloads it
+    /// before the freelist tail is truncated.
+    pub(crate) fn invalidate_cache_after_local_checkpoint(&self) -> Result<()> {
+        self.inner.cache.clear()
+    }
+
+    /// Reloads the database header from disk after this handle's checkpoint
+    /// copyback.
+    ///
+    /// The header page is WAL-managed: commits that change the freelist stage
+    /// page 0 through the WAL, so the in-memory header can be stale once
+    /// copyback lands the newest committed header on the main file.
+    /// `truncate_freelist_tail` must observe that committed freelist.
+    ///
+    /// Unlike `refresh_from_disk`, this does not clear the page cache again
+    /// (copyback already invalidated it) and does not re-stat the file: every
+    /// positional copyback write already advanced `db_page_count`, and the
+    /// checkpoint gate excludes a concurrent resize.
+    pub(crate) fn refresh_header_from_disk_after_local_checkpoint(&self) -> Result<()> {
+        let header = self.header_from_disk()?;
+        if header.page_size != self.inner.page_size {
+            return Err(DbError::corruption(format!(
+                "database page size changed from {} to {}",
+                self.inner.page_size, header.page_size
+            )));
+        }
         *self
             .inner
             .header
@@ -273,10 +456,9 @@ impl PagerHandle {
             .page_count
             .saturating_sub(trimmed_pages.len() as u32);
         self.persist_header(&header)?;
-        self.inner.file.set_len(page::page_offset(
-            new_page_count.saturating_add(1),
-            self.inner.page_size,
-        ))?;
+        let new_len = page::page_offset(new_page_count.saturating_add(1), self.inner.page_size);
+        self.inner.file.set_len(new_len)?;
+        self.inner.set_db_page_count_from_len(new_len);
         self.inner.cache.clear()?;
         *self
             .inner
@@ -320,10 +502,11 @@ impl PagerHandle {
 
 impl Pager {
     fn load_page_from_disk(&self, page_id: PageId) -> Result<Vec<u8>> {
-        let page_count = self
-            .file
-            .file_size()
-            .map(|size| page::page_count_for_len(size, self.page_size))?;
+        // Use the cached page count instead of a `file_size()` (`statx`) per
+        // cache miss. The cached count is refreshed on every file-extending
+        // write and on `refresh_from_disk`, so it tracks the on-disk length for
+        // the owning writer.
+        let page_count = self.db_page_count.load(Ordering::Acquire);
         if page_id > page_count {
             return self.take_page_buffer();
         }
@@ -335,6 +518,31 @@ impl Pager {
             &mut data,
         )?;
         Ok(data)
+    }
+
+    /// Bumps the cached main-db page count to cover `file_len` bytes if the
+    /// file grew. Called after writes that may extend the file so the read
+    /// path's EOF check stays accurate without a `statx` per cache miss.
+    fn bump_db_page_count_from_len(&self, file_len: u64) {
+        let new_count = page::page_count_for_len(file_len, self.page_size);
+        self.db_page_count.fetch_max(new_count, Ordering::AcqRel);
+    }
+
+    /// Replaces the cached page count after a successful exact resize.
+    fn set_db_page_count_from_len(&self, file_len: u64) {
+        let new_count = page::page_count_for_len(file_len, self.page_size);
+        self.db_page_count.store(new_count, Ordering::Release);
+    }
+
+    /// Re-reads the on-disk length and caches its page count. Used after
+    /// operations that may have changed the file size out of band of the
+    /// write paths above (e.g. `refresh_from_disk` after checkpoint, or
+    /// `truncate_freelist_tail` shrinking the file).
+    fn refresh_db_page_count(&self) -> Result<()> {
+        let len = self.file.file_size()?;
+        let count = page::page_count_for_len(len, self.page_size);
+        self.db_page_count.store(count, Ordering::Release);
+        Ok(())
     }
 
     fn take_page_buffer(&self) -> Result<Vec<u8>> {
@@ -425,9 +633,12 @@ mod tests {
             .expect("extend file");
 
         let counter = Arc::new(AtomicUsize::new(0));
+        let file_size_counter = Arc::new(AtomicUsize::new(0));
         let file = Arc::new(CountingFile {
             inner,
             read_count: Arc::clone(&counter),
+            file_size_count: Arc::clone(&file_size_counter),
+            fail_file_size: false,
         });
 
         let pager = PagerHandle::open(file, header, 1).expect("open pager");
@@ -436,7 +647,13 @@ mod tests {
 
         assert_eq!(first.to_vec(), payload);
         assert_eq!(second.to_vec(), payload);
+        assert_eq!(pager.cached_page_count(), 3);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            file_size_counter.load(Ordering::Relaxed),
+            1,
+            "pager open should stat once; page reads use the cached count"
+        );
     }
 
     #[test]
@@ -552,6 +769,8 @@ mod tests {
     struct CountingFile {
         inner: Arc<dyn VfsFile>,
         read_count: Arc<AtomicUsize>,
+        file_size_count: Arc<AtomicUsize>,
+        fail_file_size: bool,
     }
 
     impl VfsFile for CountingFile {
@@ -585,12 +804,111 @@ mod tests {
         }
 
         fn file_size(&self) -> crate::Result<u64> {
+            self.file_size_count.fetch_add(1, Ordering::Relaxed);
+            if self.fail_file_size {
+                return Err(crate::DbError::internal("injected file-size failure"));
+            }
             self.inner.file_size()
         }
 
         fn set_len(&self, len: u64) -> crate::Result<()> {
             self.inner.set_len(len)
         }
+    }
+
+    #[test]
+    fn pager_open_propagates_file_size_errors() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("open-file-size-error");
+        let inner = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(inner.as_ref(), &header).expect("bootstrap database");
+        let file = Arc::new(CountingFile {
+            inner,
+            read_count: Arc::new(AtomicUsize::new(0)),
+            file_size_count: Arc::new(AtomicUsize::new(0)),
+            fail_file_size: true,
+        });
+
+        let error = PagerHandle::open(file, header, 1).expect_err("open should fail");
+        assert!(error.to_string().contains("injected file-size failure"));
+    }
+
+    #[test]
+    fn contiguous_write_updates_cached_page_count_and_checks_page_range() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("contiguous-write-page-count");
+        let inner = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(inner.as_ref(), &header).expect("bootstrap database");
+        let file_size_counter = Arc::new(AtomicUsize::new(0));
+        let file = Arc::new(CountingFile {
+            inner,
+            read_count: Arc::new(AtomicUsize::new(0)),
+            file_size_count: Arc::clone(&file_size_counter),
+            fail_file_size: false,
+        });
+        let pager = PagerHandle::open(file, header, 1).expect("open pager");
+        let mut pages = vec![0x33; page::DEFAULT_PAGE_SIZE as usize];
+        pages.extend(vec![0x44; page::DEFAULT_PAGE_SIZE as usize]);
+
+        pager
+            .write_pages_contiguous_no_cache(3, &pages)
+            .expect("write pages 3 and 4");
+        let page_four = pager
+            .read_page_from_disk(4)
+            .expect("cached count includes page 4");
+        assert!(page_four.iter().all(|byte| *byte == 0x44));
+        assert_eq!(pager.cached_page_count(), 4);
+        assert_eq!(
+            file_size_counter.load(Ordering::Relaxed),
+            1,
+            "only open stats the file; the authoritative contiguous write and read do not"
+        );
+
+        let overflow = pager.write_pages_contiguous_no_cache(u32::MAX, &pages);
+        assert!(overflow.is_err(), "page-id range overflow must be rejected");
+    }
+
+    #[test]
+    fn refresh_from_disk_restats_and_replaces_cached_page_count_after_external_shrink() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("refresh-page-count-shrink");
+        let inner = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(inner.as_ref(), &header).expect("bootstrap database");
+        inner
+            .set_len(page::page_offset(6, page::DEFAULT_PAGE_SIZE))
+            .expect("extend database to five pages");
+        let file_size_counter = Arc::new(AtomicUsize::new(0));
+        let file = Arc::new(CountingFile {
+            inner: Arc::clone(&inner),
+            read_count: Arc::new(AtomicUsize::new(0)),
+            file_size_count: Arc::clone(&file_size_counter),
+            fail_file_size: false,
+        });
+        let pager = PagerHandle::open(file, header.clone(), 1).expect("open pager");
+        assert_eq!(pager.cached_page_count(), 5);
+        assert_eq!(file_size_counter.load(Ordering::Relaxed), 1);
+
+        inner
+            .set_len(page::page_offset(4, page::DEFAULT_PAGE_SIZE))
+            .expect("externally shrink database to three pages");
+        pager
+            .refresh_from_disk(header)
+            .expect("refresh externally changed database length");
+        assert_eq!(pager.cached_page_count(), 3);
+        assert_eq!(
+            file_size_counter.load(Ordering::Relaxed),
+            2,
+            "explicit refresh must retain one exact stat for out-of-band changes"
+        );
     }
 
     fn unique_path(label: &str) -> PathBuf {

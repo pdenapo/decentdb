@@ -1819,7 +1819,8 @@ mod tests {
                 crate::record::value::Value::Int64(9),
             ])
             .encode()
-            .expect("encode parent composite key"),
+            .expect("encode parent composite key")
+            .into(),
             1,
         );
         runtime.indexes_mut().insert(

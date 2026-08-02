@@ -33,7 +33,7 @@ pub(crate) fn initialize_or_recover(
     pager: &PagerHandle,
     page_size: u32,
     hot_set_pages: u32,
-    mut sidecar: Option<&mut WalIndexSidecar>,
+    sidecar: Option<&mut WalIndexSidecar>,
 ) -> Result<(WalIndex, u64, u32)> {
     let size = file.file_size()?;
     if size == 0 {
@@ -139,7 +139,6 @@ pub(crate) fn initialize_or_recover(
                         false,
                     );
                 }
-                spill_recovered_latest_versions(&mut index, hot_set_pages, sidecar.as_deref_mut())?;
             }
             FrameType::Checkpoint => {
                 pending.clear();
@@ -148,6 +147,13 @@ pub(crate) fn initialize_or_recover(
         }
         offset = next_offset;
     }
+
+    // Keep every latest recovered page resident until replay is complete.
+    // A later PageDelta may use a page from an earlier committed transaction
+    // as its base; spilling that page mid-replay would make recovery fall back
+    // to a stale main-database image. The sidecar is only a post-replay hot-set
+    // projection, never part of delta reconstruction.
+    spill_recovered_latest_versions(&mut index, hot_set_pages, sidecar)?;
 
     Ok((index, header.wal_end_offset, max_page_id))
 }
@@ -174,11 +180,6 @@ pub(crate) fn persist_header(
 ) -> Result<()> {
     let header = WalHeader::new(page_size, wal_end_offset);
     write_all_at(file.as_ref(), 0, &header.encode())
-}
-
-pub(crate) fn truncate_to_header(file: &Arc<dyn VfsFile>, page_size: u32) -> Result<()> {
-    persist_header(file, page_size, 0)?;
-    file.set_len(WAL_HEADER_SIZE)
 }
 
 fn push_pending_frame(pending: &mut Vec<PageId>, page_id: PageId) -> Result<()> {
@@ -231,17 +232,22 @@ fn recovery_pending_overflow_error() -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
 
+    use crate::config::{DbConfig, ProcessCoordinationMode, WalSyncMode};
     use crate::storage::page;
     use crate::storage::{write_database_bootstrap_vfs, DatabaseHeader, PagerHandle};
-    use crate::vfs::{write_all_at, FileKind, OpenMode, Vfs, VfsHandle};
+    use crate::vfs::{faulty, write_all_at, FileKind, OpenMode, Vfs, VfsHandle};
+    use crate::{Db, DbError, Value};
 
     use super::{initialize_or_recover, persist_header, MAX_PENDING_RECOVERY_FRAMES};
     use crate::wal::format::{WalHeader, WAL_HEADER_SIZE};
+    use crate::wal::WalHandle;
 
     fn test_pager(vfs: &crate::vfs::mem::MemVfs, path: &Path) -> PagerHandle {
         let file = vfs
@@ -250,6 +256,14 @@ mod tests {
         let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
         write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap db");
         PagerHandle::open(Arc::clone(&file), header, 1).expect("open pager")
+    }
+
+    fn wait_for_test_path(path: &Path, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for {label}");
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -287,6 +301,437 @@ mod tests {
         crate::vfs::read_exact_at(file.as_ref(), 0, &mut header_bytes).expect("read header");
         let header = WalHeader::decode(&header_bytes).expect("decode wal header");
         assert_eq!(header.page_size, page::DEFAULT_PAGE_SIZE);
+    }
+
+    struct FailpointCleanup;
+
+    impl Drop for FailpointCleanup {
+        fn drop(&mut self) {
+            let _ = faulty::clear_failpoints();
+        }
+    }
+
+    #[test]
+    fn checkpoint_no_longer_emits_transient_checkpoint_frame() {
+        let _failpoint_guard = faulty::test_failpoint_lock()
+            .lock()
+            .expect("failpoint test lock");
+        faulty::clear_failpoints().expect("clear failpoints");
+        let _cleanup = FailpointCleanup;
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("no-checkpoint-frame.ddb");
+        let config = DbConfig {
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let db = Db::create(&path, config).expect("create db");
+        db.execute("CREATE TABLE t(id INT64, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'durable')")
+            .expect("insert row");
+
+        faulty::install_failpoint(faulty::Failpoint {
+            label: "wal.write_checkpoint".to_string(),
+            trigger_on: 1,
+            action: faulty::FailAction::Error,
+        })
+        .expect("install checkpoint-frame sentinel");
+        db.checkpoint_wal()
+            .expect("checkpoint should not emit a checkpoint WAL frame");
+        let logs = faulty::failpoint_logs().expect("failpoint log");
+        assert!(
+            logs.iter()
+                .all(|entry| entry.label != "wal.write_checkpoint"),
+            "normal destructive checkpoint emitted a legacy checkpoint frame: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_truncate_write_failure_leaves_wal_recoverable() {
+        let _failpoint_guard = faulty::test_failpoint_lock()
+            .lock()
+            .expect("failpoint test lock");
+        faulty::clear_failpoints().expect("clear failpoints");
+        let _cleanup = FailpointCleanup;
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("truncate-write-failure.ddb");
+        let config = DbConfig {
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let db = Db::create(&path, config.clone()).expect("create db");
+        db.execute("CREATE TABLE t(id INT64, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'recoverable')")
+            .expect("insert row");
+
+        faulty::install_failpoint(faulty::Failpoint {
+            label: "wal.write_header".to_string(),
+            trigger_on: 1,
+            action: faulty::FailAction::Error,
+        })
+        .expect("install WAL truncate-header failure");
+        let error = db
+            .checkpoint_wal()
+            .expect_err("truncate header write failure must fail checkpoint");
+        assert!(matches!(error, DbError::Io { .. }));
+
+        faulty::clear_failpoints().expect("clear failpoints before reopen");
+        drop(db);
+        let reopened = Db::open(&path, config).expect("recover from retained WAL");
+        let result = reopened
+            .execute("SELECT val FROM t WHERE id = 1")
+            .expect("read recovered row");
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("recoverable".into())]
+        );
+    }
+
+    #[test]
+    fn checkpoint_truncate_sync_failure_remains_reopenable() {
+        let _failpoint_guard = faulty::test_failpoint_lock()
+            .lock()
+            .expect("failpoint test lock");
+        faulty::clear_failpoints().expect("clear failpoints");
+        let _cleanup = FailpointCleanup;
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("truncate-sync-failure.ddb");
+        let config = DbConfig {
+            wal_sync_mode: WalSyncMode::Full,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let db = Db::create(&path, config.clone()).expect("create db");
+        db.execute("CREATE TABLE t(id INT64, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'main-db-copy')")
+            .expect("insert row");
+
+        faulty::install_failpoint(faulty::Failpoint {
+            label: "wal.fsync".to_string(),
+            trigger_on: 1,
+            action: faulty::FailAction::Error,
+        })
+        .expect("install WAL truncate sync failure");
+        let error = db
+            .checkpoint_wal()
+            .expect_err("truncate data-and-length sync failure must fail checkpoint");
+        assert!(matches!(error, DbError::Io { .. }));
+
+        faulty::clear_failpoints().expect("clear failpoints before reopen");
+        drop(db);
+        let reopened = Db::open(&path, config).expect("database remains reopenable");
+        let result = reopened
+            .execute("SELECT val FROM t WHERE id = 1")
+            .expect("read checkpointed row");
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("main-db-copy".into())]
+        );
+    }
+
+    #[test]
+    fn checkpoint_truncate_sync_failure_same_handle_can_append_after_error() {
+        let _failpoint_guard = faulty::test_failpoint_lock()
+            .lock()
+            .expect("failpoint test lock");
+        faulty::clear_failpoints().expect("clear failpoints");
+        let _cleanup = FailpointCleanup;
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("truncate-sync-same-handle.ddb");
+        let config = DbConfig {
+            wal_sync_mode: WalSyncMode::Full,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let db = Db::create(&path, config.clone()).expect("create db");
+        db.execute("CREATE TABLE t(id INT64, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'checkpointed')")
+            .expect("insert first row");
+
+        faulty::install_failpoint(faulty::Failpoint {
+            label: "wal.fsync".to_string(),
+            trigger_on: 1,
+            action: faulty::FailAction::Error,
+        })
+        .expect("install WAL truncate sync failure");
+        let error = db
+            .checkpoint_wal()
+            .expect_err("late truncate sync failure must be surfaced");
+        assert!(matches!(error, DbError::Io { .. }));
+
+        faulty::clear_failpoints().expect("clear failpoints before append");
+        db.execute("INSERT INTO t VALUES (2, 'post-error')")
+            .expect("same handle appends after reconciled truncate state");
+        let result = db
+            .execute("SELECT COUNT(*) FROM t")
+            .expect("count rows after append");
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
+
+        drop(db);
+        let reopened = Db::open(&path, config).expect("reopen after same-handle append");
+        let result = reopened
+            .execute("SELECT COUNT(*) FROM t")
+            .expect("count reopened rows");
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
+    }
+
+    #[test]
+    fn checkpoint_truncate_sync_failure_refreshes_already_open_independent_handle() {
+        let _failpoint_guard = faulty::test_failpoint_lock()
+            .lock()
+            .expect("failpoint test lock");
+        faulty::clear_failpoints().expect("clear failpoints");
+        let _cleanup = FailpointCleanup;
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("truncate-sync-independent-handle.ddb");
+        let config = DbConfig {
+            wal_sync_mode: WalSyncMode::Full,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let db1 = Db::create(&path, config.clone()).expect("create db1");
+        db1.execute("CREATE TABLE t(id INT64, val TEXT)")
+            .expect("create table");
+        db1.execute("INSERT INTO t VALUES (1, 'checkpointed')")
+            .expect("insert first row");
+
+        crate::evict_shared_wal(&path).expect("evict shared WAL to simulate independent opener");
+        let db2 = Db::open(&path, config.clone()).expect("open independent db2");
+        let result = db2
+            .execute("SELECT COUNT(*) FROM t")
+            .expect("db2 sees pre-checkpoint WAL");
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(1)]);
+
+        faulty::install_failpoint(faulty::Failpoint {
+            label: "wal.fsync".to_string(),
+            trigger_on: 1,
+            action: faulty::FailAction::Error,
+        })
+        .expect("install WAL truncate sync failure");
+        let error = db1
+            .checkpoint_wal()
+            .expect_err("late truncate sync failure must be surfaced");
+        assert!(matches!(error, DbError::Io { .. }));
+
+        faulty::clear_failpoints().expect("clear failpoints before db2 refresh");
+        let result = db2
+            .execute("SELECT val FROM t WHERE id = 1")
+            .expect("db2 refreshes to checkpoint generation");
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("checkpointed".into())]
+        );
+        db2.execute("INSERT INTO t VALUES (2, 'post-error')")
+            .expect("independent handle appends after refresh");
+
+        drop(db1);
+        drop(db2);
+        let reopened = Db::open(&path, config).expect("reopen after independent append");
+        let result = reopened
+            .execute("SELECT COUNT(*) FROM t")
+            .expect("count reopened rows");
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
+    }
+
+    #[test]
+    fn independent_checkpoint_syncs_externally_acknowledged_async_tail_before_copyback() {
+        let _failpoint_guard = faulty::test_failpoint_lock()
+            .lock()
+            .expect("failpoint test lock");
+        faulty::clear_failpoints().expect("clear failpoints");
+        let _cleanup = FailpointCleanup;
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("external-async-tail-checkpoint.ddb");
+        let writer_config = DbConfig {
+            wal_sync_mode: WalSyncMode::AsyncCommit {
+                interval_ms: 60_000,
+            },
+            paged_row_storage: false,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let checkpoint_config = DbConfig {
+            wal_sync_mode: WalSyncMode::Full,
+            process_coordination: ProcessCoordinationMode::Required,
+            paged_row_storage: false,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let writer = Db::create(&path, writer_config).expect("create async writer");
+        writer
+            .execute("CREATE TABLE t(id INT64, val TEXT)")
+            .expect("create table");
+        writer
+            .execute("INSERT INTO t VALUES (1, 'async-tail')")
+            .expect("ack async insert without waiting for flusher");
+
+        crate::evict_shared_wal(&path).expect("evict shared WAL to simulate external opener");
+        let checkpointer = Db::open(&path, checkpoint_config).expect("open independent checkpoint");
+        faulty::install_failpoint(faulty::Failpoint {
+            label: "wal.fsync".to_string(),
+            trigger_on: 1,
+            action: faulty::FailAction::Error,
+        })
+        .expect("install forced external-tail sync failure");
+        faulty::install_failpoint(faulty::Failpoint {
+            label: "db.write_page".to_string(),
+            trigger_on: 1,
+            action: faulty::FailAction::Error,
+        })
+        .expect("install database-copyback sentinel");
+        let error = checkpointer
+            .checkpoint_wal()
+            .expect_err("external async WAL tail must be synced before copyback");
+        assert!(matches!(error, DbError::Io { .. }));
+        let logs = faulty::failpoint_logs().expect("failpoint logs");
+        assert!(
+            logs.iter()
+                .any(|entry| entry.label == "wal.fsync" && entry.outcome == "error"),
+            "checkpoint did not force-sync the externally recovered async WAL tail: {logs:?}"
+        );
+        assert!(
+            logs.iter().all(|entry| entry.label != "db.write_page"),
+            "checkpoint copied database pages before external WAL tail sync completed: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn child_process_checkpoint_syncs_externally_acknowledged_async_tail_before_copyback() {
+        let _failpoint_guard = faulty::test_failpoint_lock()
+            .lock()
+            .expect("failpoint test lock");
+        faulty::clear_failpoints().expect("clear failpoints");
+        let _cleanup = FailpointCleanup;
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("child-external-async-tail.ddb");
+        let ready_path = tempdir.path().join("child-ready");
+        let release_path = tempdir.path().join("child-release");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg("wal::recovery::tests::external_async_writer_child_helper")
+            .arg("--nocapture")
+            .env("DDB_EXTERNAL_ASYNC_CHILD_DB", &path)
+            .env("DDB_EXTERNAL_ASYNC_CHILD_READY", &ready_path)
+            .env("DDB_EXTERNAL_ASYNC_CHILD_RELEASE", &release_path)
+            .spawn()
+            .expect("spawn external async writer child");
+        wait_for_test_path(&ready_path, "external async writer child");
+
+        let checkpoint_config = DbConfig {
+            wal_sync_mode: WalSyncMode::Full,
+            process_coordination: ProcessCoordinationMode::Required,
+            paged_row_storage: false,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let checkpointer = Db::open(&path, checkpoint_config).expect("open parent checkpoint db");
+        let (latest_lsn, has_coordination, needs_tail_sync, locally_synced) =
+            checkpointer.wal_checkpoint_tail_state_for_tests();
+        assert!(
+            latest_lsn > 0,
+            "parent checkpoint handle recovered no WAL tail"
+        );
+        assert!(
+            has_coordination,
+            "parent checkpoint handle opened without process coordination"
+        );
+        assert!(
+            needs_tail_sync,
+            "parent checkpoint handle did not mark recovered WAL tail uncertain: latest_lsn={latest_lsn} has_coordination={has_coordination} needs_tail_sync={needs_tail_sync} locally_synced={locally_synced}"
+        );
+        assert!(
+            !locally_synced,
+            "parent checkpoint handle incorrectly treated recovered WAL tail as locally synced: latest_lsn={latest_lsn} has_coordination={has_coordination} needs_tail_sync={needs_tail_sync} locally_synced={locally_synced}"
+        );
+        faulty::install_failpoint(faulty::Failpoint {
+            label: "wal.fsync".to_string(),
+            trigger_on: 1,
+            action: faulty::FailAction::Error,
+        })
+        .expect("install forced external-tail sync failure");
+        faulty::install_failpoint(faulty::Failpoint {
+            label: "db.write_page".to_string(),
+            trigger_on: 1,
+            action: faulty::FailAction::Error,
+        })
+        .expect("install database-copyback sentinel");
+        let error = checkpointer
+            .checkpoint_wal()
+            .expect_err("child process async WAL tail must be synced before copyback");
+        assert!(matches!(error, DbError::Io { .. }));
+        let logs = faulty::failpoint_logs().expect("failpoint logs");
+        assert!(
+            logs.iter()
+                .any(|entry| entry.label == "wal.fsync" && entry.outcome == "error"),
+            "checkpoint did not force-sync the child process async WAL tail: {logs:?}"
+        );
+        assert!(
+            logs.iter().all(|entry| entry.label != "db.write_page"),
+            "checkpoint copied database pages before child WAL tail sync completed: {logs:?}"
+        );
+
+        std::fs::write(&release_path, []).expect("release external async writer child");
+        let status = child.wait().expect("wait for child");
+        assert!(
+            status.success(),
+            "external async writer child failed: {status}"
+        );
+    }
+
+    #[test]
+    fn external_async_writer_child_helper() {
+        let Some(path) = std::env::var_os("DDB_EXTERNAL_ASYNC_CHILD_DB").map(PathBuf::from) else {
+            return;
+        };
+        let ready_path = PathBuf::from(
+            std::env::var_os("DDB_EXTERNAL_ASYNC_CHILD_READY")
+                .expect("external async child ready path"),
+        );
+        let release_path = PathBuf::from(
+            std::env::var_os("DDB_EXTERNAL_ASYNC_CHILD_RELEASE")
+                .expect("external async child release path"),
+        );
+        let db = Db::create(
+            &path,
+            DbConfig {
+                wal_sync_mode: WalSyncMode::AsyncCommit {
+                    interval_ms: 60_000,
+                },
+                process_coordination: ProcessCoordinationMode::Required,
+                paged_row_storage: false,
+                wal_checkpoint_threshold_pages: 0,
+                wal_checkpoint_threshold_bytes: 0,
+                background_checkpoint_worker: false,
+                ..DbConfig::default()
+            },
+        )
+        .expect("create child async db");
+        db.execute("CREATE TABLE t(id INT64, val TEXT)")
+            .expect("child create table");
+        db.execute("INSERT INTO t VALUES (1, 'child-async-tail')")
+            .expect("child ack async insert");
+        std::fs::write(&ready_path, []).expect("publish child ready");
+        wait_for_test_path(&release_path, "external async child release");
+        drop(db);
     }
 
     #[test]
@@ -545,6 +990,94 @@ mod tests {
     }
 
     #[test]
+    fn recovery_defers_hot_set_spill_until_later_delta_bases_are_applied() {
+        let mem_vfs = Arc::new(crate::vfs::mem::MemVfs::default());
+        let vfs: Arc<dyn Vfs> = mem_vfs.clone();
+        let handle = VfsHandle::from_vfs(vfs);
+        let db_path = Path::new("recovery-late-delta.ddb");
+        let wal_path = Path::new("recovery-late-delta.ddb.wal");
+        let file = mem_vfs
+            .open(wal_path, OpenMode::CreateNew, FileKind::Wal)
+            .expect("create WAL file");
+        let pager = test_pager(&mem_vfs, db_path);
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let page_a = vec![0x31; ps as usize];
+        let page_b = vec![0x42; ps as usize];
+        let mut page_c = page_a.clone();
+        page_c[17] = 0x53;
+        page_c[29] = 0x64;
+        let delta_c = crate::wal::delta::encode_page_delta(&page_a, &page_c)
+            .expect("encode late page-7 delta");
+        let frames = vec![
+            crate::wal::format::WalFrame::page(7, page_a),
+            crate::wal::format::WalFrame::commit(),
+            crate::wal::format::WalFrame::page(8, page_b.clone()),
+            crate::wal::format::WalFrame::commit(),
+            crate::wal::format::WalFrame::page_delta(7, delta_c),
+            crate::wal::format::WalFrame::commit(),
+        ];
+        let mut data = Vec::new();
+        for frame in &frames {
+            data.extend_from_slice(&frame.encode(ps).expect("encode recovery frame"));
+        }
+        let logical_end = WAL_HEADER_SIZE + data.len() as u64;
+        let header = WalHeader::new(ps, logical_end);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write WAL header");
+        write_all_at(file.as_ref(), WAL_HEADER_SIZE, &data).expect("write WAL frames");
+        file.set_len(logical_end).expect("set WAL length");
+
+        let cfg = DbConfig {
+            wal_sync_mode: WalSyncMode::TestingOnlyUnsafeNoSync,
+            wal_index_hot_set_pages: 1,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let wal = WalHandle::acquire(&handle, db_path, &cfg, &pager, None)
+            .expect("recover with one-page hot set");
+        assert_eq!(wal.latest_snapshot(), logical_end);
+        assert_eq!(wal.version_count().expect("recovered versions"), 2);
+        assert_eq!(
+            wal.read_page_at_snapshot(&pager, 7, logical_end)
+                .expect("read recovered late delta")
+                .expect("page 7 recovered")
+                .as_ref(),
+            page_c.as_slice()
+        );
+
+        wal.checkpoint(&pager, 0)
+            .expect("checkpoint recovered late delta");
+        assert_eq!(
+            pager
+                .read_page(7)
+                .expect("read checkpointed late delta")
+                .as_ref(),
+            page_c.as_slice()
+        );
+        assert_eq!(
+            pager
+                .read_page(8)
+                .expect("read checkpointed page 8")
+                .as_ref(),
+            page_b.as_slice()
+        );
+        drop(wal);
+
+        let reopened = WalHandle::acquire(&handle, db_path, &cfg, &pager, None)
+            .expect("reopen checkpointed recovery chain");
+        assert_eq!(reopened.latest_snapshot(), 0);
+        assert_eq!(reopened.version_count().expect("reopened versions"), 0);
+        assert_eq!(
+            pager
+                .read_page(7)
+                .expect("read reopened checkpointed delta")
+                .as_ref(),
+            page_c.as_slice()
+        );
+    }
+
+    #[test]
     fn partial_frames_at_end_are_ignored() {
         let vfs = crate::vfs::mem::MemVfs::default();
         let file = vfs
@@ -608,6 +1141,68 @@ mod tests {
             .latest_visible(3, u64::MAX)
             .expect("recovered page version");
         assert_eq!(version.payload.as_slice(), updated.as_slice());
+    }
+
+    #[test]
+    fn legacy_checkpoint_frame_recovery_still_replays_later_full_and_delta_frames() {
+        let vfs = crate::vfs::mem::MemVfs::default();
+        let file = vfs
+            .open(Path::new(":memory:"), OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+        let pager = test_pager(&vfs, Path::new(":memory-db:"));
+
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let base_page_id = 3;
+        let full_page_id = 4;
+        let base = vec![0x31; ps as usize];
+        pager
+            .write_page_direct(base_page_id, &base)
+            .expect("write delta base page");
+        let mut updated = base.clone();
+        updated[16] = 0x42;
+        updated[97] = 0x53;
+        let delta = crate::wal::delta::encode_page_delta(&base, &updated).expect("encode delta");
+        let full = vec![0x64; ps as usize];
+        let ignored = vec![0xA5; ps as usize];
+
+        let frames = vec![
+            crate::wal::format::WalFrame::page(full_page_id, ignored),
+            crate::wal::format::WalFrame::checkpoint(123),
+            crate::wal::format::WalFrame::page(full_page_id, full.clone()),
+            crate::wal::format::WalFrame::page_delta(base_page_id, delta),
+            crate::wal::format::WalFrame::commit(),
+        ];
+        let mut data = Vec::new();
+        for frame in &frames {
+            data.extend_from_slice(&frame.encode(ps).expect("encode frame"));
+        }
+        let logical_end = WAL_HEADER_SIZE + data.len() as u64;
+        let header = WalHeader::new(ps, logical_end);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
+        write_all_at(file.as_ref(), WAL_HEADER_SIZE, &data).expect("write frames");
+        file.set_len(logical_end).expect("set len");
+
+        let (index, end, max_page_id) =
+            initialize_or_recover(&file, &pager, ps, 0, None).expect("recover legacy WAL");
+        assert_eq!(end, logical_end);
+        assert_eq!(max_page_id, full_page_id);
+        assert_eq!(index.version_count(), 2);
+        assert_eq!(
+            index
+                .latest_visible(full_page_id, u64::MAX)
+                .expect("full page recovered")
+                .payload
+                .as_slice(),
+            full.as_slice()
+        );
+        assert_eq!(
+            index
+                .latest_visible(base_page_id, u64::MAX)
+                .expect("delta page recovered")
+                .payload
+                .as_slice(),
+            updated.as_slice()
+        );
     }
 
     #[test]

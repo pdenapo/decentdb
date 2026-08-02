@@ -20,7 +20,7 @@ pub(crate) const WAL_INDEX_SIDECAR_MAGIC: &[u8; 8] = b"DDB-WIDX";
 /// requires an ADR-tracked migration path (see AGENTS.md §7).
 pub(crate) const WAL_INDEX_SIDECAR_VERSION: u16 = 0;
 
-const WAL_INDEX_SIDECAR_HEADER_LEN: u64 = 16;
+pub(super) const WAL_INDEX_SIDECAR_HEADER_LEN: u64 = 16;
 const WAL_INDEX_SIDECAR_RECORD_LEN: u64 = 32;
 const RECORD_STATE_EMPTY: u8 = 0;
 const RECORD_STATE_PRESENT: u8 = 1;
@@ -39,6 +39,10 @@ use super::index::{WalVersion, WalVersionPayload};
 pub(crate) struct WalIndexSidecar {
     file: Arc<dyn VfsFile>,
     entry_count: usize,
+    /// Whether physical records belong to the current logical WAL generation.
+    /// A failed clear leaves the file contents uncertain, so every read must
+    /// ignore them until a later successful clear establishes a fresh cache.
+    readable: bool,
 }
 
 impl WalIndexSidecar {
@@ -53,6 +57,7 @@ impl WalIndexSidecar {
         let mut sidecar = Self {
             file,
             entry_count: 0,
+            readable: false,
         };
         // The sidecar is a rebuildable cache derived from the WAL. Reset it
         // on every open so stale pre-ADR-0141 files cannot affect recovery.
@@ -61,18 +66,22 @@ impl WalIndexSidecar {
     }
 
     pub(crate) fn clear(&mut self) -> Result<()> {
+        // Invalidate in memory before the first fallible physical operation.
+        // A partial header write or failed truncate must never leave old WAL
+        // offsets consultable after the WAL's logical generation changes.
+        self.invalidate_generation();
         let mut header = [0_u8; WAL_INDEX_SIDECAR_HEADER_LEN as usize];
         header[..WAL_INDEX_SIDECAR_MAGIC.len()].copy_from_slice(WAL_INDEX_SIDECAR_MAGIC);
         header[8..10].copy_from_slice(&WAL_INDEX_SIDECAR_VERSION.to_le_bytes());
         header[10..12].copy_from_slice(&(WAL_INDEX_SIDECAR_RECORD_LEN as u16).to_le_bytes());
         write_all_at(self.file.as_ref(), 0, &header)?;
         self.file.set_len(WAL_INDEX_SIDECAR_HEADER_LEN)?;
-        self.entry_count = 0;
+        self.readable = true;
         Ok(())
     }
 
     pub(crate) fn read_latest(&self, page_id: PageId) -> Result<Option<WalVersion>> {
-        if page_id == 0 {
+        if page_id == 0 || !self.readable {
             return Ok(None);
         }
         let Some(record) = self.read_record(page_id)? else {
@@ -94,6 +103,21 @@ impl WalIndexSidecar {
                 "WAL index sidecar cannot store page id 0",
             ));
         }
+        // A previous partial clear invalidated every physical record. Rebuild
+        // an empty generation before accepting the first post-reset spill.
+        // If this also fails, the commit fails safely without making any stale
+        // record readable.
+        if !self.readable {
+            self.clear()?;
+        }
+        self.write_latest_in_current_generation(page_id, version)
+    }
+
+    fn write_latest_in_current_generation(
+        &mut self,
+        page_id: PageId,
+        version: &WalVersion,
+    ) -> Result<()> {
         let (wal_offset, frame_len, encoding) = version.payload.wal_metadata();
         let offset = record_offset(page_id);
         let existed = self.read_record(page_id)?.is_some();
@@ -101,12 +125,17 @@ impl WalIndexSidecar {
             self.file.set_len(offset + WAL_INDEX_SIDECAR_RECORD_LEN)?;
         }
         let mut record = [0_u8; WAL_INDEX_SIDECAR_RECORD_LEN as usize];
-        record[0] = RECORD_STATE_PRESENT;
         record[1] = encode_encoding(encoding);
         record[4..8].copy_from_slice(&frame_len.to_le_bytes());
         record[8..16].copy_from_slice(&version.lsn.to_le_bytes());
         record[16..24].copy_from_slice(&wal_offset.to_le_bytes());
-        write_all_at(self.file.as_ref(), offset, &record)?;
+        // Publish record state last. Clearing the state byte first makes an
+        // interrupted overwrite invisible; writing all metadata while EMPTY
+        // means an ambiguous final one-byte write exposes either no record or
+        // a complete current record, never PRESENT with partial metadata.
+        write_all_at(self.file.as_ref(), offset, &[RECORD_STATE_EMPTY])?;
+        write_all_at(self.file.as_ref(), offset + 1, &record[1..])?;
+        write_all_at(self.file.as_ref(), offset, &[RECORD_STATE_PRESENT])?;
         if !existed {
             self.entry_count += 1;
         }
@@ -114,7 +143,7 @@ impl WalIndexSidecar {
     }
 
     pub(crate) fn clear_latest(&mut self, page_id: PageId) -> Result<()> {
-        if page_id == 0 {
+        if page_id == 0 || !self.readable {
             return Ok(());
         }
         let offset = record_offset(page_id);
@@ -124,8 +153,10 @@ impl WalIndexSidecar {
         if self.read_record(page_id)?.is_none() {
             return Ok(());
         }
-        let record = [0_u8; WAL_INDEX_SIDECAR_RECORD_LEN as usize];
-        write_all_at(self.file.as_ref(), offset, &record)?;
+        // State is the only publication byte. An interrupted one-byte clear
+        // leaves either the previous complete record or an empty slot; the
+        // caller keeps/restores the authoritative version in memory on error.
+        write_all_at(self.file.as_ref(), offset, &[RECORD_STATE_EMPTY])?;
         self.entry_count = self.entry_count.saturating_sub(1);
         Ok(())
     }
@@ -135,6 +166,9 @@ impl WalIndexSidecar {
         safe_lsn: u64,
         out: &mut Vec<(PageId, WalVersion)>,
     ) -> Result<()> {
+        if !self.readable {
+            return Ok(());
+        }
         let file_size = self.file.file_size()?;
         if file_size <= WAL_INDEX_SIDECAR_HEADER_LEN {
             return Ok(());
@@ -153,15 +187,22 @@ impl WalIndexSidecar {
 
     #[must_use]
     pub(crate) fn version_count(&self) -> usize {
-        self.entry_count
+        if self.readable {
+            self.entry_count
+        } else {
+            0
+        }
     }
 
     #[must_use]
     pub(crate) fn version_counts_by_payload(&self) -> (usize, usize) {
-        (0, self.entry_count)
+        (0, self.version_count())
     }
 
     fn read_record(&self, page_id: PageId) -> Result<Option<SidecarRecord>> {
+        if !self.readable {
+            return Ok(None);
+        }
         let offset = record_offset(page_id);
         if self.file.file_size()? < offset + WAL_INDEX_SIDECAR_RECORD_LEN {
             return Ok(None);
@@ -181,6 +222,11 @@ impl WalIndexSidecar {
                 self.file.path().display()
             ))),
         }
+    }
+
+    fn invalidate_generation(&mut self) {
+        self.readable = false;
+        self.entry_count = 0;
     }
 }
 
@@ -244,6 +290,18 @@ impl WalIndexBackendKind {
             Self::PagedSidecar
         }
     }
+
+    /// The sidecar is a process-local rebuildable cache backed by a shared
+    /// path. Until it has cross-process generation/locking semantics, a
+    /// coordinated database must retain its WAL index in memory so one process
+    /// cannot clear or rewrite records another process is consulting.
+    pub(crate) fn for_runtime(hot_set_pages: u32, process_coordinated: bool) -> Self {
+        if process_coordinated {
+            Self::InMemory
+        } else {
+            Self::for_hot_set_pages(hot_set_pages)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +332,18 @@ mod tests {
     fn nonzero_hot_set_picks_paged_sidecar() {
         assert_eq!(
             WalIndexBackendKind::for_hot_set_pages(4096),
+            WalIndexBackendKind::PagedSidecar
+        );
+    }
+
+    #[test]
+    fn process_coordination_disables_process_local_sidecar() {
+        assert_eq!(
+            WalIndexBackendKind::for_runtime(1, true),
+            WalIndexBackendKind::InMemory
+        );
+        assert_eq!(
+            WalIndexBackendKind::for_runtime(1, false),
             WalIndexBackendKind::PagedSidecar
         );
     }

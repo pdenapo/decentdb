@@ -7,8 +7,8 @@
 /// `malloc_trim(0)`. No-op on other platforms.
 ///
 /// Safe to call from any thread; the writer invokes this at most once per
-/// successful checkpoint, with all WAL locks released. The return value is
-/// ignored — `malloc_trim` is best-effort.
+/// completed local checkpoint cleanup while its checkpoint/writer exclusion
+/// remains held. The return value is ignored — `malloc_trim` is best-effort.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub(crate) fn release_freed_heap() {
     // SAFETY: `malloc_trim` from glibc takes one `size_t` argument, returns

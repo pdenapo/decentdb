@@ -63,6 +63,38 @@ fn encrypted_database_hides_header_and_payload_and_reopens() {
 }
 
 #[test]
+fn encrypted_fresh_wal_overlap_reopens_empty_database() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fresh-overlap.ddb");
+    let config = tde_config();
+
+    let db = Db::create(&path, config.clone()).expect("create encrypted database");
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push(".wal");
+    let wal_bytes = std::fs::read(std::path::Path::new(&wal_path)).expect("read fresh TDE WAL");
+    assert!(
+        wal_bytes.starts_with(b"DDBTDE1\0"),
+        "the WAL atomically created during bootstrap overlap must retain its TDE prefix"
+    );
+    drop(db);
+
+    let reopened = Db::open(&path, config).expect("reopen empty encrypted database");
+    reopened
+        .execute("CREATE TABLE after_reopen (id INTEGER PRIMARY KEY, value TEXT)")
+        .expect("write after encrypted fresh-WAL reopen");
+    reopened
+        .execute("INSERT INTO after_reopen VALUES (1, 'durable')")
+        .expect("insert after reopen");
+    let result = reopened
+        .execute("SELECT value FROM after_reopen WHERE id = 1")
+        .expect("query after reopen");
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("durable".to_string())]
+    );
+}
+
+#[test]
 fn encrypted_database_requires_the_correct_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("secure.ddb");

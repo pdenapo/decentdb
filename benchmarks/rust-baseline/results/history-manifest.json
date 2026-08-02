@@ -1,0 +1,385 @@
+{
+  "schema_version": 1,
+  "files": [
+    {
+      "path": "2026-04-26-2203-rust-baseline-full.json",
+      "sha256": "889fa0addc196728cb002f10a0b7e52a082ed79011c15f4ecf43bfc73de40ba2"
+    },
+    {
+      "path": "2026-04-26-2203-rust-baseline-medium.json",
+      "sha256": "adf980472b6926685570a88f09be12eaf80d6bef44d66e9a4f5ef6419e402f5a"
+    },
+    {
+      "path": "2026-04-26-2203-rust-baseline-smoke.json",
+      "sha256": "32c727ccb4ec3cf70f6b60b6c6c605b692ccfddae10109735f7e864e8217627a"
+    },
+    {
+      "path": "2026-04-27-1116-rust-baseline-full.json",
+      "sha256": "28b4a00eed298b8ebd54445ba77859b3a20380dfe5d87e75d20b605db6dab16e"
+    },
+    {
+      "path": "2026-04-27-1116-rust-baseline-medium.json",
+      "sha256": "5ee1f832905f3adc55d802e61a9268187d7f992541625e769fd2946d556e8ce4"
+    },
+    {
+      "path": "2026-04-27-1407-rust-baseline-medium.json",
+      "sha256": "740c130530f09255e8a5f5e1530eb159979b54c71eb71b721396a306be4b4c17"
+    },
+    {
+      "path": "2026-04-27-1408-rust-baseline-full.json",
+      "sha256": "0285b4d86af5df1c3e86139fea901e78dfac89cd282e6d197ad40b3ff257cc1d"
+    },
+    {
+      "path": "2026-04-27-1416-rust-baseline-full.json",
+      "sha256": "667086e48b0d99b453199cb033028c085881a54a8f56725b118380296c0f6546"
+    },
+    {
+      "path": "2026-04-27-1419-rust-baseline-huge.json",
+      "sha256": "3a04484bb5a02f629d497dc549d9c204aa964e5839a743f4819cbaecc2250ce8"
+    },
+    {
+      "path": "2026-04-27-1420-rust-baseline-full.json",
+      "sha256": "f98eff91cecbb683fe4319b6a414ce19f5aa4f90af4a1b3c3ff57210b66ed9a2"
+    },
+    {
+      "path": "2026-04-28-1156-rust-baseline-full.json",
+      "sha256": "67613cb573e54a40baa2a967ef260812875676c58adbf5a5ad037371d72f6a53"
+    },
+    {
+      "path": "2026-04-28-1156-rust-baseline-medium.json",
+      "sha256": "2564cc2925bec9a99de03c6b69ff735075679f59774b56825d8163ef59ce2376"
+    },
+    {
+      "path": "2026-04-28-1156-rust-baseline-smoke.json",
+      "sha256": "7ffd4ea91eab36befb095b68f01dee4d51c5508641ff14a60737d65508750c10"
+    },
+    {
+      "path": "2026-04-28-1158-rust-baseline-huge.json",
+      "sha256": "f1ec7ade2b72f87b49eb85d5abe5efcd8c7a6acb9dd4cc316ca85f81c0fd4c8f"
+    },
+    {
+      "path": "2026-04-28-1625-rust-baseline-full.json",
+      "sha256": "57c749dbf0ccb5012bc8cd606cd159aba587947e95d825ddff397ee29f8ed496"
+    },
+    {
+      "path": "2026-04-28-1625-rust-baseline-smoke.json",
+      "sha256": "41bffb3ceed23440550cb5ac7298a8e32b1a064305498b9e6c2758302831e007"
+    },
+    {
+      "path": "2026-04-28-1627-rust-baseline-huge.json",
+      "sha256": "9d00eb54a14b209f6dc369b80e38d39265e2609eca29a7b1b1795705879de62f"
+    },
+    {
+      "path": "2026-04-28-2135-rust-baseline-huge.json",
+      "sha256": "7526713cb4d351f6bd43052d3b14f7b65409e5221746132f460da6d7c6a34df3"
+    },
+    {
+      "path": "2026-04-29-0317-rust-baseline-medium.json",
+      "sha256": "34c66a9f115daac125c88effe4aafdd8b4e9cf9a1c7b7526b8c24b19fafbb447"
+    },
+    {
+      "path": "2026-04-29-0317-rust-baseline-smoke.json",
+      "sha256": "613876a66f9ca8f72e95da8dfc5d063dbb142147db50a35c7986b82a9e95f5af"
+    },
+    {
+      "path": "2026-04-29-0318-rust-baseline-full.json",
+      "sha256": "00e59101e311e7739a1ea2481c6ca5cd4d296ee90f55c24799b0cf4682af3cca"
+    },
+    {
+      "path": "2026-04-29-0320-rust-baseline-huge.json",
+      "sha256": "3e7698f2ae08f85c3eb36c2b794f7228638b86b1957e0726dcc6f1aa672f65a6"
+    },
+    {
+      "path": "2026-04-29-1317-rust-baseline-full.json",
+      "sha256": "e30223f7d9e1fdf2e1ea4c82112af1029813d3b99941f7633b12b51216501885"
+    },
+    {
+      "path": "2026-04-29-1332-rust-baseline-huge.json",
+      "sha256": "c1036ed7505bd26bfce1ebcebd563846215b78b745810fc6c1f4bb20a71bbbd9"
+    },
+    {
+      "path": "2026-04-29-1334-rust-baseline-medium.json",
+      "sha256": "67b8d8f1c167c047292d60cfc037faccc77d6cd911c47fc86a116b45865dc7a3"
+    },
+    {
+      "path": "2026-04-29-1334-rust-baseline-smoke.json",
+      "sha256": "4be45162a521c84900305b33ca4b38b586c8289457a278b9bb5cacbcb509f348"
+    },
+    {
+      "path": "2026-04-29-1833-rust-baseline-smoke.json",
+      "sha256": "aa3890d027353f8d901094e9d3466f9d72c0c9363857a229f08093b5c084a1ed"
+    },
+    {
+      "path": "2026-04-29-1834-rust-baseline-full.json",
+      "sha256": "11a09d8c05f34ce47a62f0ed911915c82d4e88eba86b07fa9cc4de7624f49b72"
+    },
+    {
+      "path": "2026-04-29-1834-rust-baseline-medium.json",
+      "sha256": "f5a56f96ae089ff8af79d784f938d7d520610840afa9bd1d786552add7debd0b"
+    },
+    {
+      "path": "2026-04-29-1837-rust-baseline-huge.json",
+      "sha256": "39ac15224cb8c5995e665dca2d061dedfc6fc1ce40a2677335ca85a586b0c75c"
+    },
+    {
+      "path": "2026-04-30-0250-rust-baseline-smoke.json",
+      "sha256": "205d54cfcbde666b2355a0a8afa395ec06463268dde138612140664ee7003777"
+    },
+    {
+      "path": "2026-04-30-0251-rust-baseline-full.json",
+      "sha256": "fb2460c37de4f6754d16b034678dd04980fc246c3397f2c73d391d0cc5a14277"
+    },
+    {
+      "path": "2026-04-30-0251-rust-baseline-medium.json",
+      "sha256": "071c88728c233fdb5179a3006e446b371699f646f298f57f545f69b4070189b9"
+    },
+    {
+      "path": "2026-04-30-0254-rust-baseline-huge.json",
+      "sha256": "d06d60804f6b805e289d070b858e4d7e45ba377f12420c15cf78324708e458a9"
+    },
+    {
+      "path": "2026-05-19-1214-rust-baseline-default-medium.json",
+      "sha256": "ff105b0df45c066a134efee8a3d95a9a0a0bd889f5fc6c371be6ee5d812d99c6"
+    },
+    {
+      "path": "2026-05-19-1215-rust-baseline-default-smoke.json",
+      "sha256": "959566c4de0e9a42332811ee8aee75596401433283805da1ef81ff270e2083d1"
+    },
+    {
+      "path": "2026-05-19-1216-rust-baseline-default-full.json",
+      "sha256": "66b0dd1c3777962b8e47ff93996c0d88f92b818a93ba626f083cb7de76345909"
+    },
+    {
+      "path": "2026-05-19-1217-rust-baseline-default-huge.json",
+      "sha256": "488770efb2a688eff9d8f579b1b95bfb1586f1ca07f6115be5adcc56e957e00a"
+    },
+    {
+      "path": "2026-05-20-0338-rust-baseline-default-medium.json",
+      "sha256": "52d12368a044faefd9e70fac81bd1785078049ecb692f60e8c9ffe51584b1126"
+    },
+    {
+      "path": "2026-05-28-0306-rust-baseline-default-full.json",
+      "sha256": "ed15295f2e7f21e8c2e52d6d58896152a8c5f303bd796708d37c96bf384fda4c"
+    },
+    {
+      "path": "2026-05-28-0306-rust-baseline-default-medium.json",
+      "sha256": "ab2c94e680c4439b8bc16a6ab7e74cfe832f6e7a32b3c6b621a9e9815247f82a"
+    },
+    {
+      "path": "2026-05-28-0306-rust-baseline-default-smoke.json",
+      "sha256": "e602f0346a3545aabe72c266452cc716b54ff4aae981dc9fb868f1a0a823f994"
+    },
+    {
+      "path": "2026-05-28-0307-rust-baseline-default-huge.json",
+      "sha256": "b19e9a287ec25a606933bf9c6e374ad9f384d6bbe43d5c9c2941dc8af06404d2"
+    },
+    {
+      "path": "2026-06-12-1340-rust-baseline-default-full.json",
+      "sha256": "516750c44892be2ea93f49796a847e474d87bbcaaa7016fc20219157d58f5cd5"
+    },
+    {
+      "path": "2026-06-12-1340-rust-baseline-default-medium.json",
+      "sha256": "43fed7ff14fb3b53010313ec7964035bc81c15f50621e32d96c4ed1cd93f196d"
+    },
+    {
+      "path": "2026-06-12-1340-rust-baseline-default-smoke.json",
+      "sha256": "1039af2ce7eb960008226092cfd66b9e5fd856212ad44477ff01f7b4106cce48"
+    },
+    {
+      "path": "2026-06-12-1342-rust-baseline-default-huge.json",
+      "sha256": "b3a7950f72cd4b44dffee8dbdcb77d223d914399b799bc94e46a7e4cb3515ced"
+    },
+    {
+      "path": "2026-06-13-1821-rust-baseline-default-full.json",
+      "sha256": "9bc007b19df3b11c17d834002997ad83bc970e78a6ac37b7c21ca98f239bb77d"
+    },
+    {
+      "path": "2026-06-13-1821-rust-baseline-default-medium.json",
+      "sha256": "5ea7547ab5401df5c571c26dd304205a2df474157a818f66336cb89f2f7b5fe0"
+    },
+    {
+      "path": "2026-06-13-1821-rust-baseline-default-smoke.json",
+      "sha256": "66c2d13bb67dbaea8a63469a2a6c2c61c21a38dea410c8700f051dbfe50214cd"
+    },
+    {
+      "path": "2026-06-13-1825-rust-baseline-default-huge.json",
+      "sha256": "75d385d98f00463ed93fb642d0e0ae8db29566c9aef5ccdfa2ab7bfbda96ef89"
+    },
+    {
+      "path": "2026-06-13-1949-rust-baseline-default-medium.json",
+      "sha256": "879065dbe8b70e85de99e508da1a84856f47a290230006fa9f3b6d9f53cf9d5c"
+    },
+    {
+      "path": "2026-06-13-1949-rust-baseline-default-smoke.json",
+      "sha256": "70632200182f3bd7a90af42ad5e5bd328941a613b3ebbaa84e2ee0fcce6e8689"
+    },
+    {
+      "path": "2026-06-13-1950-rust-baseline-default-full.json",
+      "sha256": "f77f6927cb642d38379c85dd083f5c17e13704742a9c5f2cb65baffdacbdd35e"
+    },
+    {
+      "path": "2026-06-13-1951-rust-baseline-default-huge.json",
+      "sha256": "1639744a42c24515db841a969351b51daf11b97bf710a99061083e17d2c32120"
+    },
+    {
+      "path": "2026-06-14-0143-rust-baseline-default-full.json",
+      "sha256": "cf0b4827e8cd92feae60aa89e4ad91b254c99919202612c95f0a18f44034b929"
+    },
+    {
+      "path": "2026-06-14-0143-rust-baseline-default-huge.json",
+      "sha256": "ee83bd44625997172987ff2cc4bdeb396a182ec1a38017fa973e7c088843076c"
+    },
+    {
+      "path": "2026-06-14-0143-rust-baseline-default-medium.json",
+      "sha256": "a598b452d2008ff2c84c8cdb796ff3551a5b3d85f7097174870a66f3e808acfd"
+    },
+    {
+      "path": "2026-06-14-0143-rust-baseline-default-smoke.json",
+      "sha256": "3c67fcb111266abdaa53137f6342664babcd8601db86d59c4c33d188aba25ac7"
+    },
+    {
+      "path": "2026-06-15-1200-rust-baseline-default-full.json",
+      "sha256": "7fb6b1d264039a16c74b80ce87100fdfd6b7fc673d4283dc4e537ad3e1a48983"
+    },
+    {
+      "path": "2026-06-15-1200-rust-baseline-default-huge.json",
+      "sha256": "b9887bd2674981d9de5bce29d9c972d8199983b80d0aea08110beb40676679d7"
+    },
+    {
+      "path": "2026-06-15-1200-rust-baseline-default-medium.json",
+      "sha256": "fce3bb920cc80ecc5ca9a525aef78025cac18fb924bcf71cf3fa55f35ce7fea7"
+    },
+    {
+      "path": "2026-06-15-1200-rust-baseline-default-smoke.json",
+      "sha256": "49c97e8cc624f9df9346af9382f05e36db4bfc1966512611d36577b5855e4ba3"
+    },
+    {
+      "path": "2026-06-19-2147-rust-baseline-default-full.json",
+      "sha256": "c984ac009e03d7c97aaf8459f456cac556231a953d34621c71f761f77d4c7915"
+    },
+    {
+      "path": "2026-06-19-2147-rust-baseline-default-medium.json",
+      "sha256": "63a33ece954cb2a752abe9e85e553a3500df68f110b12463d23f9f09dc55d1ae"
+    },
+    {
+      "path": "2026-06-19-2147-rust-baseline-default-smoke.json",
+      "sha256": "2e2e3128fe967c6b1d9d9c24e6d90480855c283b567ecb2650548faca4ee91e9"
+    },
+    {
+      "path": "2026-06-19-2148-rust-baseline-default-huge.json",
+      "sha256": "524d689a19401682d39caef6b902e2e19842a31d010e918b14e06ee2960b2803"
+    },
+    {
+      "path": "2026-06-23-1844-rust-baseline-default-full.json",
+      "sha256": "b7c490fb483ed93bf5aafacdb93beb8a00e907ce350cf4f0213044e11dcd209e"
+    },
+    {
+      "path": "2026-06-23-1844-rust-baseline-default-medium.json",
+      "sha256": "1c549f1d188cc5b4854b83603e3a99e35b0baca7d618c8757f28c1c601e3dc9d"
+    },
+    {
+      "path": "2026-06-23-1844-rust-baseline-default-smoke.json",
+      "sha256": "a96c8fea26906988dfac7eff80376ce3ce4e25bd0303f84b10c3e485d8531ddf"
+    },
+    {
+      "path": "2026-06-23-1845-rust-baseline-default-huge.json",
+      "sha256": "1421206b062ceda026d3e9cd3451bfdc9ed8608491103913bf14c4bac26011f2"
+    },
+    {
+      "path": "2026-08-01-1303-rust-baseline-default-full.json",
+      "sha256": "ee3231167e78e978914fadb9cc0d8cf9601be909602b73fccbf6f398a313a546"
+    },
+    {
+      "path": "2026-08-01-1303-rust-baseline-default-medium.json",
+      "sha256": "05c5abfa0b746cba1df448ea8e21c43fcac8874a37e6eda6c9a8f75b57c0415e"
+    },
+    {
+      "path": "2026-08-01-1303-rust-baseline-default-smoke.json",
+      "sha256": "cd8c7fb2cd29eb5c65c3bb6dc2c84f8f81e3a421636b5708c75669ba003bd32a"
+    },
+    {
+      "path": "2026-08-01-1304-rust-baseline-default-huge.json",
+      "sha256": "563da530d89a4fc68ab6c8c783c166481629295a234b3a2732d8c9c9a28303a8"
+    },
+    {
+      "path": "2026-08-01-1956-rust-baseline-default-full.json",
+      "sha256": "c4368471e343aa4844e1944ea8190faa16eee4a670d9e2f2edbb743594487255"
+    },
+    {
+      "path": "2026-08-01-1956-rust-baseline-default-medium.json",
+      "sha256": "4bd93fe974b883dab6818bccef2be3f31cbfaac4332d54adec66d62952c55cf1"
+    },
+    {
+      "path": "2026-08-01-1956-rust-baseline-default-smoke.json",
+      "sha256": "f5738f706689c1a822837f348c552c6026f1bcdf6b37f6558241cf4fc39ee77e"
+    },
+    {
+      "path": "2026-08-01-1957-rust-baseline-default-huge.json",
+      "sha256": "e7e1e93b03af1676f7c41b16ab837e19bd51ef0c967366692efa11b365028902"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-full-opt0.json",
+      "sha256": "625f057403bd3f1adfe4fded516a2ceb2ec6227c4550c41888da6373ce9e4067"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-full-opt1.json",
+      "sha256": "7eb9f9da4cf2894620d8eb0c32f346ce8de3a3dd7f78ccc8d10337a3a1c68186"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-full-opt2.json",
+      "sha256": "82547241c04c6b391aa272f36177f87e2086cf5b0ea991ecb0c8ac0ba3784b16"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-huge-opt0.json",
+      "sha256": "0b0499800a1e388ddc372cbeda9727e08e6431fb3b5c4b416cf252a6cc65695b"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-huge-opt1.json",
+      "sha256": "cd306a9f8ee353629ee26986933e188ee9b7a6fb4057587b6bbea8b108c954da"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-huge-opt2.json",
+      "sha256": "4eb33437e86cad0b16dcfe09c475e06cee92a21ee47f96762284a1efa90031fb"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-medium-opt0.json",
+      "sha256": "01424c5a5f20837651410ce7883c1b521606c60c11320346a6651782fb81e28b"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-medium-opt1.json",
+      "sha256": "7afe756200976686311bdb7903e5148bf8b3ffe6c7f1ce584315c09b2b3f3e32"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-medium-opt2.json",
+      "sha256": "2c6a7ba2538f61c51984d5cb5fe85bdb972f0d77aad4afb6908b41e2ea2cc9fc"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-smoke-opt0.json",
+      "sha256": "a0099413daba40c15543b033890aa37e2f96c1f6f7c8ee890bcfc54b1d919778"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-smoke-opt1.json",
+      "sha256": "f314292cfd1b463a71d876331317c79ccc7508933d07946f21461692d1c89469"
+    },
+    {
+      "path": "2026-08-01-2000-rust-baseline-default-smoke-opt2.json",
+      "sha256": "0fe8369381ede51952c264fb10b42ca48f4f62d75105e1a68190333ca3c7814b"
+    },
+    {
+      "path": "2026-08-01-2116-rust-baseline-default-full.json",
+      "sha256": "6b8746b371466d4ae64da349db4e1d2fb77dc9a536876ba293998429a1ed484f"
+    },
+    {
+      "path": "2026-08-01-2116-rust-baseline-default-medium.json",
+      "sha256": "73b88d5463d37c4de2013cf1f3364ea501ebc8b4cf35273bf71e94d47dc7453b"
+    },
+    {
+      "path": "2026-08-01-2116-rust-baseline-default-smoke.json",
+      "sha256": "3b8aae6af0be9e977670a92ce80e00d7be2a072c3c9ec9c4494bee3e3874d450"
+    },
+    {
+      "path": "2026-08-01-2117-rust-baseline-default-huge.json",
+      "sha256": "175fe691a4f1539d7cee5b04a35227845d90e73161d7d67c6c0b22b81f4faf37"
+    }
+  ]
+}

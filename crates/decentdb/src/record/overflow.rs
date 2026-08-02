@@ -1054,22 +1054,40 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
 }
 
 pub(crate) fn read_overflow<S: PageStore>(store: &S, pointer: OverflowPointer) -> Result<Vec<u8>> {
-    let bytes =
-        read_chain_with_capacity(store, pointer.head_page_id, pointer.logical_len as usize)?;
-    let decoded = if pointer.is_compressed() {
-        decompress(&bytes)?
-    } else {
-        bytes
-    };
+    let mut decoded = Vec::new();
+    read_overflow_into(store, pointer, &mut decoded)?;
+    Ok(decoded)
+}
 
-    if decoded.len() != pointer.logical_len as usize {
+/// Read an overflow payload into caller-owned scratch storage.
+///
+/// Reusing the same buffer across similarly-sized table chunks avoids one
+/// allocation per chunk while preserving [`read_overflow`]'s decompression and
+/// exact logical-length validation.
+pub(crate) fn read_overflow_into<S: PageStore>(
+    store: &S,
+    pointer: OverflowPointer,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    read_chain_into(
+        store,
+        pointer.head_page_id,
+        pointer.logical_len as usize,
+        output,
+    )?;
+    if pointer.is_compressed() {
+        let decoded = decompress(output)?;
+        *output = decoded;
+    }
+
+    if output.len() != pointer.logical_len as usize {
         return Err(DbError::corruption(format!(
             "overflow payload length mismatch: expected {}, decoded {}",
             pointer.logical_len,
-            decoded.len()
+            output.len()
         )));
     }
-    Ok(decoded)
+    Ok(())
 }
 
 pub(crate) fn read_chain<S: PageStore>(store: &S, head_page_id: PageId) -> Result<Vec<u8>> {
@@ -1081,8 +1099,30 @@ fn read_chain_with_capacity<S: PageStore>(
     head_page_id: PageId,
     capacity_hint: usize,
 ) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    read_chain_into(store, head_page_id, capacity_hint, &mut output)?;
+    Ok(output)
+}
+
+fn read_chain_into<S: PageStore>(
+    store: &S,
+    head_page_id: PageId,
+    capacity_hint: usize,
+    output: &mut Vec<u8>,
+) -> Result<()> {
     let mut page_id = head_page_id;
-    let mut output = Vec::with_capacity(capacity_hint);
+    output.clear();
+    if output.capacity() < capacity_hint {
+        // `Vec::reserve` is relative to the current length, not its capacity.
+        // The buffer is empty here, so reserve the complete hint to guarantee
+        // that a larger payload does not grow repeatedly while its pages are
+        // appended.
+        output.try_reserve_exact(capacity_hint).map_err(|error| {
+            DbError::internal(format!(
+                "failed to reserve {capacity_hint} bytes for overflow payload: {error}"
+            ))
+        })?;
+    }
 
     while page_id != 0 {
         let page = store.read_page(page_id)?;
@@ -1097,11 +1137,16 @@ fn read_chain_with_capacity<S: PageStore>(
                 "overflow chunk length exceeds page payload",
             ));
         }
+        if chunk_len == 0 {
+            return Err(DbError::corruption(
+                "overflow chunk made no progress toward logical payload length",
+            ));
+        }
         output.extend_from_slice(&page[OVERFLOW_HEADER_SIZE..chunk_end]);
         page_id = next_page_id;
     }
 
-    Ok(output)
+    Ok(())
 }
 
 pub(crate) fn free_overflow<S: PageStore>(
@@ -1230,7 +1275,7 @@ mod tests {
 
     use super::{
         append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
-        read_overflow, read_overflow_prefix, rewrite_overflow,
+        read_overflow, read_overflow_into, read_overflow_prefix, rewrite_overflow,
         rewrite_overflow_cached_with_dirty_byte_range,
         rewrite_overflow_cached_with_sparse_byte_patches, write_overflow, OverflowBytePatch,
     };
@@ -1250,6 +1295,38 @@ mod tests {
         for page_id in freed {
             assert!(!store.contains_page(page_id));
         }
+    }
+
+    #[test]
+    fn read_overflow_into_reuses_scratch_and_preserves_compression() {
+        let mut store = InMemoryPageStore::new(64);
+        let first_payload = (0_u32..4_000_u32)
+            .map(|value| (value % 251) as u8)
+            .collect::<Vec<_>>();
+        let first_pointer = write_overflow(&mut store, &first_payload, CompressionMode::Never)
+            .expect("write first");
+        let second_payload = b"compressible-payload".repeat(150);
+        let second_pointer = write_overflow(
+            &mut store,
+            &second_payload,
+            CompressionMode::AutoMinBytes(1),
+        )
+        .expect("write compressed second");
+        assert!(second_pointer.is_compressed());
+
+        let mut scratch = Vec::with_capacity(first_payload.len());
+        let allocation = scratch.as_ptr();
+        read_overflow_into(&store, first_pointer, &mut scratch).expect("read first into scratch");
+        assert_eq!(scratch, first_payload);
+        assert_eq!(
+            scratch.as_ptr(),
+            allocation,
+            "first read should reuse capacity"
+        );
+
+        read_overflow_into(&store, second_pointer, &mut scratch)
+            .expect("read compressed second into scratch");
+        assert_eq!(scratch, second_payload);
     }
 
     #[test]

@@ -26,12 +26,13 @@ use crate::exec::dml::{
     PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate, PreparedSimpleValueSource,
 };
 use crate::exec::{
-    read_persisted_table_row_count, read_table_payload_live_row_count_from_bytes,
-    row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
-    QueryRow, ResolvedSimpleJoinProjection, ResolvedSimpleOrderedRowIdProjectionRequest,
-    ResolvedSimpleRowIdJoinProjectionRequest, ResolvedSimpleRowIdProjectionRequest,
-    ResolvedSimpleRowIdRangeProjectionRequest, RuntimeIndex, RuntimeRowIdSet,
-    SimpleJoinProjectionSide, SimpleRangeBoundValue, SimpleRowIdProjectionRequest, TableData,
+    contiguous_row_ids, read_persisted_table_row_count,
+    read_table_payload_live_row_count_from_bytes, row_satisfies_expression, statement_is_read_only,
+    BulkLoadOptions, EngineRuntime, QueryResult, QueryRow, ResolvedSimpleJoinProjection,
+    ResolvedSimpleOrderedRowIdProjectionRequest, ResolvedSimpleRowIdJoinProjectionRequest,
+    ResolvedSimpleRowIdProjectionRequest, ResolvedSimpleRowIdRangeProjectionRequest, RuntimeIndex,
+    RuntimeRowIdSet, SimpleJoinProjectionSide, SimpleRangeBoundValue, SimpleRowIdProjectionRequest,
+    TableData,
 };
 use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
@@ -103,6 +104,53 @@ use sync_api::*;
 
 const APPLICATION_PRAGMA_TABLE: &str = "__decentdb_application_pragmas";
 static AUDIT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+const BOOTSTRAP_SYNC_WORKER_STACK_SIZE: usize = 64 * 1024;
+
+#[cfg(test)]
+std::thread_local! {
+    static EXECUTE_BATCH_DIRECT_SPLIT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static EXECUTE_WRITE_BASE_TEMP_CLASSIFICATION_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static EXPLICIT_SCHEMA_BATCH_FAST_PATH_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PAGED_ROW_SOURCE_HEAP_RELEASE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static FORCE_BOOTSTRAP_SYNC_SPAWN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn reset_schema_batch_fixed_cost_counters() {
+    EXECUTE_BATCH_DIRECT_SPLIT_COUNT.with(|count| count.set(0));
+    EXECUTE_WRITE_BASE_TEMP_CLASSIFICATION_COUNT.with(|count| count.set(0));
+    EXPLICIT_SCHEMA_BATCH_FAST_PATH_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn schema_batch_fixed_cost_counters() -> (u64, u64) {
+    (
+        EXECUTE_BATCH_DIRECT_SPLIT_COUNT.with(std::cell::Cell::get),
+        EXECUTE_WRITE_BASE_TEMP_CLASSIFICATION_COUNT.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(test)]
+fn explicit_schema_batch_fast_path_count() -> u64 {
+    EXPLICIT_SCHEMA_BATCH_FAST_PATH_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_paged_row_source_heap_release_count() {
+    PAGED_ROW_SOURCE_HEAP_RELEASE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn paged_row_source_heap_release_count() -> u64 {
+    PAGED_ROW_SOURCE_HEAP_RELEASE_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+fn force_next_bootstrap_sync_spawn_failure() {
+    FORCE_BOOTSTRAP_SYNC_SPAWN_FAILURE.with(|force| force.set(true));
+}
 
 /// Stable engine owner used across later storage, SQL, and FFI slices.
 #[derive(Clone, Debug)]
@@ -110,11 +158,31 @@ pub struct Db {
     inner: Arc<DbInner>,
 }
 
+enum OpenWithVfsOutcome {
+    Opened(Db),
+    RetryAfterBootstrapSync(Box<FreshWalOpenRetry>),
+}
+
+struct FreshWalOpenRetry {
+    path: PathBuf,
+    config: DbConfig,
+    vfs: VfsHandle,
+    coordination_vfs: VfsHandle,
+    file: Arc<dyn VfsFile>,
+    initialized_header: DatabaseHeader,
+    initialized_open_lock_key: Option<PathBuf>,
+}
+
 const AUTOCOMMIT_PAGED_ROW_SOURCE_MAX_RESIDENT: usize = 4;
 const PREPARED_READ_ROW_SOURCE_MIN_ROWS: usize = 4_096;
 const PREPARED_READ_ROW_SOURCE_MIN_ROW_LIMIT: usize = 131_072;
 const PREPARED_READ_ROW_SOURCE_ROWS_PER_CACHE_MB: usize = 8_192;
+const PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD: usize = 1024 * 1024;
 const RESIDENT_COMMIT_HEAP_RELEASE_THRESHOLD: usize = 4 * 1024 * 1024;
+
+const fn should_release_freed_paged_row_source_heap(freed_bytes: usize) -> bool {
+    freed_bytes >= PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD
+}
 
 #[derive(Debug, Default)]
 struct ReadOnlyPagedRowSourceResidency {
@@ -568,6 +636,7 @@ pub struct PreparedStatementBatch<'txn, 'db> {
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
     direct_positional: bool,
     prepared_insert_candidate: Vec<Value>,
+    prepared_insert_encoded_values: Vec<u8>,
 }
 
 /// Exclusive SQL transaction handle that keeps mutable runtime state reserved.
@@ -753,10 +822,11 @@ impl PreparedStatementBatch<'_, '_> {
             {
                 self.state
                     .runtime
-                    .execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id(
+                    .execute_prepared_simple_insert_positional_params_in_place_with_reusable_buffers(
                         prepared_insert.as_ref(),
                         params,
                         &mut self.prepared_insert_candidate,
+                        &mut self.prepared_insert_encoded_values,
                         cached_next_row_id,
                         self.db.inner.config.page_size,
                     )?
@@ -783,6 +853,19 @@ impl PreparedStatementBatch<'_, '_> {
             self.db
                 .execute_prepared_in_exclusive_state_mut(self.prepared, params, self.state)?;
         Ok(result.affected_rows())
+    }
+
+    #[cfg(test)]
+    fn prepared_insert_buffer_state_for_tests(
+        &self,
+    ) -> (usize, usize, *const Value, usize, *const u8) {
+        (
+            self.prepared_insert_candidate.len(),
+            self.prepared_insert_candidate.capacity(),
+            self.prepared_insert_candidate.as_ptr(),
+            self.prepared_insert_encoded_values.capacity(),
+            self.prepared_insert_encoded_values.as_ptr(),
+        )
     }
 }
 
@@ -1329,9 +1412,158 @@ impl Db {
         let file = vfs.open(path, open_mode, FileKind::Database)?;
         let header = DatabaseHeader::new(config.page_size);
         storage::write_database_bootstrap_vfs(file.as_ref(), &header)?;
-        file.sync_metadata()?;
+        // The bootstrap contract needs the header, catalog root, and the file
+        // length needed to address them to be durable. `VfsFile::sync_data`
+        // explicitly provides that guarantee without forcing unrelated inode
+        // metadata (timestamps/ownership) through the create hot path.
+        Self::open_fresh_with_bootstrap_sync(
+            path.to_path_buf(),
+            config,
+            vfs,
+            coordination_vfs,
+            file,
+            header,
+        )
+    }
 
-        Self::open_with_vfs(path.to_path_buf(), config, vfs, coordination_vfs)
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn open_fresh_with_bootstrap_sync(
+        path: PathBuf,
+        config: DbConfig,
+        vfs: VfsHandle,
+        coordination_vfs: VfsHandle,
+        file: Arc<dyn VfsFile>,
+        header: DatabaseHeader,
+    ) -> Result<Self> {
+        let reservation_vfs = vfs.clone();
+        let Some(bootstrap_sync_reservation) =
+            reservation_vfs.concurrent_bootstrap_sync_reservation()
+        else {
+            file.sync_data()?;
+            return Self::open_with_vfs(
+                path,
+                config,
+                vfs,
+                coordination_vfs,
+                file,
+                Some(header),
+                None,
+            );
+        };
+
+        // Resolve and cache the same-process lock key before starting the
+        // worker. Native canonicalization may inspect the main path; WAL and
+        // coordination initialization reuse this hint during the overlap.
+        let initialized_open_lock_key = if vfs.is_memory() {
+            None
+        } else {
+            match vfs.canonicalize_path(&path) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    file.sync_data()?;
+                    return Err(error);
+                }
+            }
+        };
+        let (vfs, coordination_vfs) = if let Some(canonical_path) = &initialized_open_lock_key {
+            let source_path = path.clone();
+            (
+                vfs.with_canonical_path_hint(source_path.clone(), canonical_path.clone()),
+                coordination_vfs.with_canonical_path_hint(source_path, canonical_path.clone()),
+            )
+        } else {
+            (vfs, coordination_vfs)
+        };
+
+        let result = std::thread::scope(|scope| {
+            #[cfg(test)]
+            let force_spawn_failure =
+                FORCE_BOOTSTRAP_SYNC_SPAWN_FAILURE.with(|force| force.replace(false));
+            #[cfg(not(test))]
+            let force_spawn_failure = false;
+
+            let sync_file = Arc::clone(&file);
+            let sync_worker = if force_spawn_failure {
+                None
+            } else {
+                std::thread::Builder::new()
+                    .name("decentdb-bootstrap-sync".to_string())
+                    .stack_size(BOOTSTRAP_SYNC_WORKER_STACK_SIZE)
+                    .spawn_scoped(scope, move || sync_file.sync_data())
+                    .ok()
+            };
+            let Some(sync_worker) = sync_worker else {
+                // Thread creation is an optimization boundary, not a create
+                // failure. Preserve the original ordering exactly: durable
+                // sync first, then initialize the database handle.
+                file.sync_data()?;
+                return Self::open_with_vfs(
+                    path,
+                    config,
+                    vfs,
+                    coordination_vfs,
+                    file,
+                    Some(header),
+                    initialized_open_lock_key,
+                );
+            };
+
+            let db_result = Self::open_with_vfs_impl(
+                path,
+                config,
+                vfs,
+                coordination_vfs,
+                file,
+                Some(header),
+                initialized_open_lock_key,
+                true,
+            );
+            let sync_result = sync_worker
+                .join()
+                .map_err(|_| DbError::internal("fresh database bootstrap sync worker panicked"))?;
+            // The durability barrier has precedence over any concurrently
+            // observed initialization error, and no Db may escape until the
+            // worker has completed successfully.
+            sync_result?;
+            match db_result? {
+                OpenWithVfsOutcome::Opened(db) => Ok(db),
+                OpenWithVfsOutcome::RetryAfterBootstrapSync(retry) => {
+                    let retry = *retry;
+                    Self::open_with_vfs(
+                        retry.path,
+                        retry.config,
+                        retry.vfs,
+                        retry.coordination_vfs,
+                        retry.file,
+                        Some(retry.initialized_header),
+                        retry.initialized_open_lock_key,
+                    )
+                }
+            }
+        });
+        drop(bootstrap_sync_reservation);
+        result
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    fn open_fresh_with_bootstrap_sync(
+        path: PathBuf,
+        config: DbConfig,
+        vfs: VfsHandle,
+        coordination_vfs: VfsHandle,
+        file: Arc<dyn VfsFile>,
+        header: DatabaseHeader,
+    ) -> Result<Self> {
+        file.sync_data()?;
+        Self::open_with_vfs(
+            path,
+            config,
+            vfs,
+            coordination_vfs,
+            file,
+            Some(header),
+            None,
+        )
     }
 
     /// Opens an existing database file and validates its fixed header.
@@ -1355,12 +1587,23 @@ impl Db {
             OpenMode::OpenExisting
         };
         let file = vfs.open(path, mode, FileKind::Database)?;
-        if vfs.is_memory() && file.file_size()? == 0 {
+        let initialized_header = if vfs.is_memory() && file.file_size()? == 0 {
             let header = DatabaseHeader::new(config.page_size);
             storage::write_database_bootstrap_vfs(file.as_ref(), &header)?;
-            file.sync_metadata()?;
-        }
-        Self::open_with_vfs(path.to_path_buf(), config, vfs, coordination_vfs)
+            file.sync_data()?;
+            Some(header)
+        } else {
+            None
+        };
+        Self::open_with_vfs(
+            path.to_path_buf(),
+            config,
+            vfs,
+            coordination_vfs,
+            file,
+            initialized_header,
+            None,
+        )
     }
 
     /// Opens an existing database or creates a new one when the path does not
@@ -1638,7 +1881,7 @@ impl Db {
             let page = self.read_page(page_id)?;
             write_all_at(file.as_ref(), page::page_offset(page_id, page_size), &page)?;
         }
-        file.set_len(page::page_offset(page_count.saturating_add(1), page_size))?;
+        file.set_len(u64::from(page_count) * u64::from(page_size))?;
         file.sync_metadata()?;
         Ok(())
     }
@@ -1828,14 +2071,22 @@ impl Db {
         // was O(n) per allocation and made this function O(n^2) across a
         // large transaction (e.g. bulk seeding), dominating CPU time for
         // single-transaction multi-million-row inserts.
+        // `begin_write` refreshed coordinated checkpoint changes before this
+        // transaction became active. The pager count therefore covers the
+        // current main-file tail, while the shared/recovered WAL maximum
+        // covers committed pages that have not reached that tail yet.
         let max_staged_page_id = txn.staged_pages.keys().next_back().copied().unwrap_or(0);
-        let next_page_id = self
+        let max_allocated_page_id = self
             .inner
             .pager
-            .on_disk_page_count()?
+            .cached_page_count()
             .max(self.inner.wal.max_page_count())
-            .max(max_staged_page_id)
-            .saturating_add(1);
+            .max(max_staged_page_id);
+        let next_page_id = max_allocated_page_id.checked_add(1).ok_or_else(|| {
+            DbError::constraint(format!(
+                "database page-id space exhausted; maximum page id {max_allocated_page_id} is already allocated"
+            ))
+        })?;
         txn.staged_pages
             .entry(next_page_id)
             .or_insert_with(|| page::zeroed_page(self.inner.config.page_size));
@@ -2075,6 +2326,37 @@ impl Db {
             self.inner
                 .last_explicit_checkpoint_epoch
                 .store(checkpoint_epoch_after, Ordering::Release);
+            self.try_mark_runtime_current_after_explicit_checkpoint(checkpoint_epoch_after)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_checkpoint_tail_state_for_tests(&self) -> (u64, bool, bool, bool) {
+        self.inner.wal.checkpoint_tail_state_for_tests()
+    }
+
+    fn try_mark_runtime_current_after_explicit_checkpoint(
+        &self,
+        checkpoint_epoch: u64,
+    ) -> Result<()> {
+        let latest_lsn = self.inner.wal.latest_snapshot();
+        let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
+        let header = self.inner.pager.header_snapshot()?;
+        if last_runtime_lsn > 0
+            && writer_last_commit_lsn > 0
+            && last_runtime_lsn >= writer_last_commit_lsn
+            && latest_lsn == 0
+            && header.last_checkpoint_lsn == last_runtime_lsn
+            && header.last_checkpoint_lsn >= writer_last_commit_lsn
+        {
+            self.inner
+                .last_seen_checkpoint_epoch
+                .store(checkpoint_epoch, Ordering::Release);
+            self.inner
+                .last_runtime_lsn
+                .store(latest_lsn, Ordering::Release);
         }
         Ok(())
     }
@@ -2707,14 +2989,24 @@ impl Db {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<QueryResult>> {
+        #[cfg(test)]
+        EXECUTE_BATCH_DIRECT_SPLIT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        let statement_sqls = split_sql_batch(sql);
         if params.is_empty() && !self.inner.sql_txn_active.load(Ordering::Acquire) {
-            if let Some(results) = self.try_execute_schema_batch_with_single_commit(sql)? {
+            if let Some(results) =
+                self.try_execute_explicit_schema_batch_with_single_dispatch(&statement_sqls)?
+            {
+                return Ok(results);
+            }
+            if let Some(results) =
+                self.try_execute_schema_batch_with_single_commit(&statement_sqls)?
+            {
                 return Ok(results);
             }
         }
 
         let mut results = Vec::new();
-        for statement_sql in split_sql_batch(sql) {
+        for statement_sql in statement_sqls {
             let trimmed = statement_sql.trim();
             if trimmed.is_empty() {
                 continue;
@@ -2895,12 +3187,119 @@ impl Db {
         Ok(results)
     }
 
+    /// Executes the common `BEGIN; <persistent DDL>...; COMMIT;` shape while
+    /// retaining the public explicit-transaction contract. In particular, a
+    /// statement failure leaves the transaction active so the caller can
+    /// inspect or roll it back, exactly as the ordinary batch dispatcher
+    /// does. The optimization only removes repeated command classification
+    /// and transaction-mutex acquisition after every statement.
+    fn try_execute_explicit_schema_batch_with_single_dispatch(
+        &self,
+        statement_sqls: &[String],
+    ) -> Result<Option<Vec<QueryResult>>> {
+        if self.inner.tracing.any_enabled() || statement_sqls.len() < 3 {
+            return Ok(None);
+        }
+
+        let Some(first) = statement_sqls.first() else {
+            return Ok(None);
+        };
+        let Some(last) = statement_sqls.last() else {
+            return Ok(None);
+        };
+        if parse_transaction_control(first.trim()) != Some(TransactionControl::Begin)
+            || parse_transaction_control(last.trim()) != Some(TransactionControl::Commit)
+        {
+            return Ok(None);
+        }
+
+        let ddl_sqls = &statement_sqls[1..statement_sqls.len() - 1];
+        for statement_sql in ddl_sqls {
+            let trimmed = statement_sql.trim();
+            if trimmed.is_empty() || parse_transaction_control(trimmed).is_some() {
+                return Ok(None);
+            }
+        }
+        let parsed_statements =
+            match crate::sql::parser::parse_plain_sql_batch_single_dispatch(ddl_sqls) {
+                Ok(Some(statements)) => statements,
+                // Let the ordinary dispatcher reproduce its usual error and
+                // explicit-transaction state for malformed or rewritten SQL.
+                Ok(None) | Err(_) => return Ok(None),
+            };
+        if parsed_statements.is_empty() {
+            return Ok(None);
+        }
+        let mut statements = Vec::with_capacity(parsed_statements.len());
+        for statement in parsed_statements {
+            if !matches!(
+                &statement,
+                SqlStatement::CreateTable(_)
+                    | SqlStatement::CreateTableAs(_)
+                    | SqlStatement::CreateSchema { .. }
+                    | SqlStatement::CreateIndex(_)
+                    | SqlStatement::CreateView(_)
+                    | SqlStatement::CreateTrigger(_),
+            ) {
+                return Ok(None);
+            }
+            statements.push(Arc::new(statement));
+        }
+
+        // Temp-schema classification may depend on objects created earlier in
+        // the batch. Any statement that is already known to be temporary is
+        // sufficient to route the whole batch through the general path.
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            if statements
+                .iter()
+                .any(|statement| self.statement_is_temp_only(&runtime, statement.as_ref()))
+            {
+                return Ok(None);
+            }
+        }
+
+        self.begin_transaction()?;
+        self.inner.tracing.mark_in_transaction();
+        let mut results = Vec::with_capacity(statement_sqls.len());
+        results.push(QueryResult::with_affected_rows(0));
+        {
+            let mut txn = self
+                .inner
+                .sql_txn
+                .lock()
+                .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+            let SqlTxnSlot::Shared(state) = &mut *txn else {
+                return Err(DbError::internal(
+                    "explicit schema batch lost its SQL transaction state",
+                ));
+            };
+            for statement in &statements {
+                let result =
+                    self.execute_statement_in_state("", statement.as_ref(), &[], state.as_mut())?;
+                self.dispatch_plan_cache_invalidation(statement);
+                results.push(result);
+            }
+        }
+        self.commit_transaction()?;
+        self.inner.tracing.mark_active();
+        results.push(QueryResult::with_affected_rows(0));
+        #[cfg(test)]
+        EXPLICIT_SCHEMA_BATCH_FAST_PATH_COUNT
+            .with(|count| count.set(count.get().saturating_add(1)));
+        Ok(Some(results))
+    }
+
     fn try_execute_schema_batch_with_single_commit(
         &self,
-        sql: &str,
+        statement_sqls: &[String],
     ) -> Result<Option<Vec<QueryResult>>> {
         let mut statements = Vec::new();
-        for statement_sql in split_sql_batch(sql) {
+        for statement_sql in statement_sqls {
             let trimmed = statement_sql.trim();
             if trimmed.is_empty() {
                 continue;
@@ -3163,6 +3562,9 @@ impl Db {
         let Some(plan) = parse_simple_count_star_sql(sql) else {
             return Ok(None);
         };
+        if let Some(result) = self.try_execute_simple_count_observed_current(plan.table_name)? {
+            return Ok(Some(result));
+        }
 
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
@@ -3238,6 +3640,14 @@ impl Db {
         let Some(Value::Int64(lookup_row_id)) = params.get(plan.param_index) else {
             return Ok(None);
         };
+        if let Some(result) = self.try_execute_simple_row_id_projection_observed_current(
+            plan.table_name,
+            &plan.projection_columns,
+            plan.filter_column,
+            *lookup_row_id,
+        )? {
+            return Ok(Some(result));
+        }
 
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
@@ -3258,6 +3668,79 @@ impl Db {
             })?;
         drop(runtime);
         drop(reader);
+        Ok(result)
+    }
+
+    fn try_execute_simple_count_observed_current(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<QueryResult>> {
+        let Some(snapshot_lsn) = self.observed_current_resident_snapshot_lsn()? else {
+            return Ok(None);
+        };
+        let Some(runtime) =
+            self.runtime_read_for_observed_current_resident_fast_read(snapshot_lsn)?
+        else {
+            return Ok(None);
+        };
+        let Some(table) = runtime.catalog.table(table_name) else {
+            return Ok(None);
+        };
+        if runtime.temp_table_schema(table_name).is_some()
+            || runtime
+                .catalog
+                .views
+                .keys()
+                .any(|view_name| identifiers_equal(view_name, table_name))
+        {
+            return Ok(None);
+        }
+        let Some(row_count) =
+            self.runtime_table_row_count_without_storage(&runtime, &table.name)?
+        else {
+            return Ok(None);
+        };
+        let row_count = i64::try_from(row_count).map_err(|_| {
+            DbError::sql(format!(
+                "table {table_name} exceeds COUNT(*) row-count limits"
+            ))
+        })?;
+        if !self.observed_current_resident_snapshot_still_valid(snapshot_lsn)? {
+            return Ok(None);
+        }
+        Ok(Some(QueryResult::with_rows(
+            vec!["COUNT(*)".to_string()],
+            vec![QueryRow::new(vec![Value::Int64(row_count)])],
+        )))
+    }
+
+    fn try_execute_simple_row_id_projection_observed_current(
+        &self,
+        table_name: &str,
+        projection_columns: &[&str],
+        filter_column: &str,
+        lookup_row_id: i64,
+    ) -> Result<Option<QueryResult>> {
+        let Some(snapshot_lsn) = self.observed_current_resident_snapshot_lsn()? else {
+            return Ok(None);
+        };
+        let Some(runtime) =
+            self.runtime_read_for_observed_current_resident_fast_read(snapshot_lsn)?
+        else {
+            return Ok(None);
+        };
+        let result = runtime.try_execute_resident_simple_row_id_projection(
+            table_name,
+            projection_columns,
+            filter_column,
+            lookup_row_id,
+        )?;
+        if result.is_none() {
+            return Ok(None);
+        }
+        if !self.observed_current_resident_snapshot_still_valid(snapshot_lsn)? {
+            return Ok(None);
+        }
         Ok(result)
     }
 
@@ -3950,8 +4433,42 @@ impl Db {
         config: DbConfig,
         vfs: VfsHandle,
         coordination_vfs: VfsHandle,
+        file: Arc<dyn VfsFile>,
+        initialized_header: Option<DatabaseHeader>,
+        initialized_open_lock_key: Option<PathBuf>,
     ) -> Result<Self> {
-        let open_lock_key = if vfs.is_memory() {
+        match Self::open_with_vfs_impl(
+            path,
+            config,
+            vfs,
+            coordination_vfs,
+            file,
+            initialized_header,
+            initialized_open_lock_key,
+            false,
+        )? {
+            OpenWithVfsOutcome::Opened(db) => Ok(db),
+            OpenWithVfsOutcome::RetryAfterBootstrapSync(_) => Err(DbError::internal(
+                "normal database open unexpectedly requested a fresh-WAL retry",
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_vfs_impl(
+        path: PathBuf,
+        config: DbConfig,
+        vfs: VfsHandle,
+        coordination_vfs: VfsHandle,
+        file: Arc<dyn VfsFile>,
+        initialized_header: Option<DatabaseHeader>,
+        initialized_open_lock_key: Option<PathBuf>,
+        require_fresh_wal: bool,
+    ) -> Result<OpenWithVfsOutcome> {
+        let storage_was_freshly_initialized = initialized_header.is_some();
+        let open_lock_key = if let Some(open_lock_key) = &initialized_open_lock_key {
+            Some(open_lock_key.clone())
+        } else if vfs.is_memory() {
             None
         } else {
             Some(vfs.canonicalize_path(&path)?)
@@ -3969,16 +4486,10 @@ impl Db {
             })
             .transpose()?;
 
-        let file = vfs.open(
-            &path,
-            if vfs.is_memory() {
-                OpenMode::OpenOrCreate
-            } else {
-                OpenMode::OpenExisting
-            },
-            FileKind::Database,
-        )?;
-        let mut header = storage::read_database_header_vfs(file.as_ref())?;
+        let mut header = match &initialized_header {
+            Some(header) => header.clone(),
+            None => storage::read_database_header_vfs(file.as_ref())?,
+        };
         storage::repair_empty_database_id_vfs(file.as_ref(), &mut header)?;
         let mut effective_config = config;
         effective_config.page_size = header.page_size;
@@ -3991,14 +4502,59 @@ impl Db {
             effective_config.process_coordination_timeout_ms,
         )?;
 
-        let pager = PagerHandle::open_with_page_pool(
-            Arc::clone(&file),
-            header,
-            effective_config.cache_size_mb,
-            effective_config.page_pool_max,
-        )?;
-        let wal = WalHandle::acquire(&vfs, &path, &effective_config, &pager, process_coordinator)?;
-        wal.set_max_page_count(pager.on_disk_page_count()?);
+        let fresh_wal_retry_header = require_fresh_wal.then(|| header.clone());
+        let pager = if storage_was_freshly_initialized {
+            PagerHandle::open_fresh_bootstrap_with_page_pool(
+                Arc::clone(&file),
+                header,
+                effective_config.cache_size_mb,
+                effective_config.page_pool_max,
+            )
+        } else {
+            PagerHandle::open_with_page_pool(
+                Arc::clone(&file),
+                header,
+                effective_config.cache_size_mb,
+                effective_config.page_pool_max,
+            )?
+        };
+        let wal = if require_fresh_wal {
+            let Some(wal) = WalHandle::acquire_fresh(
+                &vfs,
+                &path,
+                &effective_config,
+                &pager,
+                process_coordinator,
+            )?
+            else {
+                return Ok(OpenWithVfsOutcome::RetryAfterBootstrapSync(Box::new(
+                    FreshWalOpenRetry {
+                        path,
+                        config: effective_config,
+                        vfs,
+                        coordination_vfs,
+                        file,
+                        initialized_header: fresh_wal_retry_header.ok_or_else(|| {
+                            DbError::internal(
+                                "fresh-WAL acquisition declined without a bootstrap header",
+                            )
+                        })?,
+                        initialized_open_lock_key,
+                    },
+                )));
+            };
+            wal
+        } else {
+            WalHandle::acquire(&vfs, &path, &effective_config, &pager, process_coordinator)?
+        };
+        // Capture this immediately after WAL recovery. A later on-open
+        // checkpoint may empty a recovered non-empty WAL, but that storage
+        // must still take the normal runtime load path.
+        let freshly_initialized_empty_wal =
+            storage_was_freshly_initialized && wal.latest_snapshot() == 0;
+        // Pager open seeded this count from the same configured file handle.
+        // Reuse it instead of immediately repeating the file-size stat.
+        wal.set_max_page_count(pager.cached_page_count());
 
         // ADR 0143 engine-memory plan: drop the in-memory WAL page-version
         // index before loading the runtime when the on-disk WAL is large.
@@ -4027,8 +4583,36 @@ impl Db {
             }
         }
 
-        let (mut runtime, runtime_lsn) =
-            EngineRuntime::load_from_storage(&pager, &wal, schema_cookie, &effective_config)?;
+        let (mut runtime, runtime_lsn) = if freshly_initialized_empty_wal {
+            // `create_with_vfs` just wrote the newly constructed empty catalog
+            // root page. With no recovered WAL frames there is no persisted
+            // runtime to discover, so avoid reader admission and decoding a
+            // page whose contents are already known.
+            (
+                EngineRuntime::from_config(schema_cookie, &effective_config),
+                0,
+            )
+        } else {
+            let reader = wal.begin_reader_with_pager(&pager)?;
+            let snapshot_lsn = reader.snapshot_lsn();
+            let runtime_schema_cookie =
+                Self::schema_cookie_at_storage_snapshot(&pager, &wal, snapshot_lsn)?;
+            let runtime = EngineRuntime::load_from_storage_at_snapshot(
+                &pager,
+                &wal,
+                runtime_schema_cookie,
+                &effective_config,
+                snapshot_lsn,
+            )?;
+            drop(reader);
+            (runtime, snapshot_lsn)
+        };
+        let runtime_schema_cookie = runtime.catalog.schema_cookie;
+        if !freshly_initialized_empty_wal
+            && pager.header_snapshot()?.schema_cookie != runtime_schema_cookie
+        {
+            pager.set_schema_cookie(runtime_schema_cookie)?;
+        }
         let audit_context = Arc::new(Mutex::new(crate::security::AuditContext::default()));
         runtime.set_audit_context_handle(Arc::clone(&audit_context));
 
@@ -4038,7 +4622,9 @@ impl Db {
             crate::error::short_hex_sha256(&path.to_string_lossy()),
         );
         let tracing_arc = Arc::new(tracing_state);
-        runtime.set_tracing(Arc::clone(&tracing_arc));
+        if tracing_arc.any_enabled() {
+            runtime.set_tracing(Arc::clone(&tracing_arc));
+        }
 
         if tracing_arc.config.lock_wait.enabled && tracing_arc.config.enabled {
             let tracing_for_callback = Arc::clone(&tracing_arc);
@@ -4102,14 +4688,16 @@ impl Db {
                 tracing: Arc::clone(&tracing_arc),
             }),
         };
-        db.backfill_paged_row_storage()?;
-        db.refresh_named_snapshot_retention()?;
+        if !freshly_initialized_empty_wal {
+            db.backfill_paged_row_storage()?;
+            db.refresh_named_snapshot_retention()?;
+        }
         drop(open_guard);
         drop(open_lock);
         if let Some(canonical_path) = open_lock_key {
             prune_db_open_lock_registry(&canonical_path);
         }
-        Ok(db)
+        Ok(OpenWithVfsOutcome::Opened(db))
     }
 
     #[must_use]
@@ -5806,6 +6394,19 @@ impl Db {
                             ));
                         }
                     }
+                    RuntimeRowIdSet::Contiguous { start, len } => {
+                        rows.reserve(len);
+                        for row_id in contiguous_row_ids(start, len) {
+                            if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                                rows.push(QueryRow::new(
+                                    plan.projection_indexes
+                                        .iter()
+                                        .map(|index| stored_row.values()[*index].clone())
+                                        .collect(),
+                                ));
+                            }
+                        }
+                    }
                     RuntimeRowIdSet::Many(row_ids) => {
                         rows.reserve(row_ids.len());
                         for row_id in row_ids {
@@ -6351,7 +6952,15 @@ impl Db {
         statement: &crate::sql::ast::Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
+        if let Some(result) =
+            self.try_execute_write_statement_in_active_sql_txn(sql, statement, params)?
+        {
+            return Ok(result);
+        }
         let temp_only = {
+            #[cfg(test)]
+            EXECUTE_WRITE_BASE_TEMP_CLASSIFICATION_COUNT
+                .with(|count| count.set(count.get().saturating_add(1)));
             let runtime = self
                 .inner
                 .engine
@@ -6359,19 +6968,13 @@ impl Db {
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
             self.statement_is_temp_only(&runtime, statement)
         };
-        if self.inner.sql_txn_active.load(Ordering::Acquire) {
-            let mut txn = self
-                .inner
-                .sql_txn
-                .lock()
-                .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-            match &mut *txn {
-                SqlTxnSlot::Shared(state) => {
-                    return self.execute_statement_in_state(sql, statement, params, state);
-                }
-                SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
-                SqlTxnSlot::None => {}
-            }
+        // A transaction may have started while the live runtime was being
+        // classified. Recheck before entering the autocommit path so that
+        // this race retains the existing transaction-local semantics.
+        if let Some(result) =
+            self.try_execute_write_statement_in_active_sql_txn(sql, statement, params)?
+        {
+            return Ok(result);
         }
 
         let lw_start = if self.inner.tracing.config.lock_wait.enabled {
@@ -6464,6 +7067,29 @@ impl Db {
         self.execute_autocommit_in_place(|runtime| {
             runtime.execute_statement(statement, params, self.inner.config.page_size)
         })
+    }
+
+    fn try_execute_write_statement_in_active_sql_txn(
+        &self,
+        sql: &str,
+        statement: &crate::sql::ast::Statement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut txn = self
+            .inner
+            .sql_txn
+            .lock()
+            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+        match &mut *txn {
+            SqlTxnSlot::Shared(state) => self
+                .execute_statement_in_state(sql, statement, params, state)
+                .map(Some),
+            SqlTxnSlot::Exclusive => Err(self.exclusive_sql_txn_error()),
+            SqlTxnSlot::None => Ok(None),
+        }
     }
 
     fn try_execute_cached_autocommit_prepared_dml(
@@ -8619,8 +9245,8 @@ impl Db {
         }
         self.sync_temp_state_from_runtime(&state.runtime)?;
         if self.should_redefer_paged_row_sources_after_write() {
-            state.runtime.redefer_all_persisted_paged_tables();
-            self.release_freed_heap_after_paged_row_source_drop();
+            let freed_bytes = state.runtime.redefer_all_persisted_paged_tables();
+            self.release_freed_heap_after_paged_row_source_drop(freed_bytes);
         }
         self.inner
             .last_runtime_lsn
@@ -8681,8 +9307,8 @@ impl Db {
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         *guard = runtime;
         if self.should_redefer_paged_row_sources_after_write() {
-            guard.redefer_all_persisted_paged_tables();
-            self.release_freed_heap_after_paged_row_source_drop();
+            let freed_bytes = guard.redefer_all_persisted_paged_tables();
+            self.release_freed_heap_after_paged_row_source_drop(freed_bytes);
         }
         self.release_freed_heap_after_runtime_compaction(compacted_bytes);
         self.inner
@@ -8858,7 +9484,7 @@ impl Db {
         snapshot_lsn: Option<u64>,
     ) {
         if snapshot_lsn.is_some() && runtime.persisted_table_state(table_name).is_some() {
-            runtime.redefer_persisted_tables(&[table_name]);
+            let _ = runtime.redefer_persisted_tables(&[table_name]);
         }
     }
 
@@ -8888,42 +9514,85 @@ impl Db {
 
         let state = runtime.persisted_table_state(table_name);
         if let Some(state) = state {
-            if state.pointer.is_table_paged_manifest()
-                && state.pointer.head_page_id != 0
-                && state.pointer.logical_len != 0
-            {
-                let store = if let Some(lsn) = snapshot_lsn {
-                    PagerReadStore::with_snapshot_lsn(self, lsn)
-                } else {
-                    PagerReadStore::new(self)?
-                };
-                return read_persisted_table_row_count(&store, state);
+            // The persisted state belongs to the runtime snapshot selected by
+            // the caller. Writes keep its non-zero live-row count exact even
+            // when a paged row source is re-deferred, so do not fault the
+            // manifest back in merely to recount its chunks.
+            if state.row_count != 0 {
+                return Ok(state.row_count);
+            }
+            // A missing payload is an unambiguously empty table. A zero count
+            // paired with a non-empty legacy/paged pointer remains ambiguous:
+            // older catalogs did not persist the count unless ANALYZE stats
+            // were present, so that case must fall through to storage.
+            if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
+                return Ok(0);
             }
         }
 
         if let Some(table) = runtime.catalog.table(table_name) {
             if let Some(stats) = runtime.catalog.table_stats.get(&table.name) {
-                let row_count = usize::try_from(stats.row_count.max(0)).unwrap_or(usize::MAX);
-                if row_count != 0 {
-                    return Ok(row_count);
-                }
+                // Presence, rather than a non-zero value, distinguishes an
+                // analyzed empty table from a legacy catalog whose row count
+                // is unknown. Mutations invalidate these stats before the
+                // runtime is persisted.
+                return Ok(usize::try_from(stats.row_count.max(0)).unwrap_or(usize::MAX));
             }
         }
 
         let Some(state) = state else {
             return Ok(0);
         };
-        if state.row_count != 0 || state.pointer.head_page_id == 0 {
-            return Ok(state.row_count);
-        }
 
         let store = if let Some(lsn) = snapshot_lsn {
             PagerReadStore::with_snapshot_lsn(self, lsn)
         } else {
             PagerReadStore::new(self)?
         };
+        if state.pointer.is_table_paged_manifest() {
+            return read_persisted_table_row_count(&store, state);
+        }
+
         let payload = read_overflow(&store, state.pointer)?;
         read_table_payload_live_row_count_from_bytes(&payload)
+    }
+
+    fn runtime_table_row_count_without_storage(
+        &self,
+        runtime: &EngineRuntime,
+        table_name: &str,
+    ) -> Result<Option<usize>> {
+        if runtime.temp_table_schema(table_name).is_some() {
+            return Ok(None);
+        }
+
+        if let Some(source) = runtime.table_row_source(table_name) {
+            return Ok(Some(source.row_count()));
+        }
+
+        let state = runtime.persisted_table_state(table_name);
+        if let Some(state) = state {
+            if state.row_count != 0 {
+                return Ok(Some(state.row_count));
+            }
+            if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
+                return Ok(Some(0));
+            }
+        }
+
+        if let Some(table) = runtime.catalog.table(table_name) {
+            if let Some(stats) = runtime.catalog.table_stats.get(&table.name) {
+                return Ok(Some(
+                    usize::try_from(stats.row_count.max(0)).unwrap_or(usize::MAX),
+                ));
+            }
+        }
+
+        if state.is_none() {
+            return Ok(Some(0));
+        }
+
+        Ok(None)
     }
 
     fn runtime_for_prepare(&self) -> Result<EngineRuntime> {
@@ -9078,6 +9747,81 @@ impl Db {
         self.inner
             .last_seen_checkpoint_epoch
             .store(latest_checkpoint_epoch, Ordering::Release);
+        Ok(())
+    }
+
+    fn observed_current_resident_snapshot_lsn(&self) -> Result<Option<u64>> {
+        let Some(snapshot_lsn) = self.inner.wal.observed_current_snapshot_lsn()? else {
+            return Ok(None);
+        };
+        if self.observed_current_runtime_is_current(snapshot_lsn) {
+            return Ok(Some(snapshot_lsn));
+        }
+        self.try_preserve_observed_current_runtime_after_explicit_checkpoint(snapshot_lsn)?;
+        if self.observed_current_runtime_is_current(snapshot_lsn) {
+            return Ok(Some(snapshot_lsn));
+        }
+        Ok(None)
+    }
+
+    fn observed_current_resident_snapshot_still_valid(&self, snapshot_lsn: u64) -> Result<bool> {
+        let Some(current_snapshot_lsn) = self.inner.wal.observed_current_snapshot_lsn()? else {
+            return Ok(false);
+        };
+        Ok(current_snapshot_lsn == snapshot_lsn
+            && self.observed_current_runtime_is_current(snapshot_lsn))
+    }
+
+    fn observed_current_runtime_is_current(&self, snapshot_lsn: u64) -> bool {
+        let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let last_seen_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
+        snapshot_lsn == last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch
+    }
+
+    fn try_preserve_observed_current_runtime_after_explicit_checkpoint(
+        &self,
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let last_seen_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
+        if latest_checkpoint_epoch == last_seen_checkpoint_epoch {
+            return Ok(());
+        }
+
+        let cached_header = self.inner.pager.header_snapshot()?;
+        let on_disk_header = self.inner.pager.header_from_disk()?;
+        if on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn {
+            self.inner.pager.refresh_from_disk(on_disk_header.clone())?;
+        }
+        self.inner
+            .last_seen_checkpoint_epoch
+            .store(latest_checkpoint_epoch, Ordering::Release);
+
+        let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
+        let last_explicit_checkpoint_epoch = self
+            .inner
+            .last_explicit_checkpoint_epoch
+            .load(Ordering::Acquire);
+        if last_runtime_lsn > 0
+            && writer_last_commit_lsn > 0
+            && last_runtime_lsn >= writer_last_commit_lsn
+            && snapshot_lsn == 0
+            && last_explicit_checkpoint_epoch == latest_checkpoint_epoch
+            && on_disk_header.last_checkpoint_lsn == last_runtime_lsn
+            && on_disk_header.last_checkpoint_lsn >= writer_last_commit_lsn
+        {
+            self.inner
+                .last_runtime_lsn
+                .store(snapshot_lsn, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -9306,6 +10050,29 @@ impl Db {
             return Ok(Some(runtime));
         }
         if runtime.security_rules_active()? {
+            return Ok(None);
+        }
+        Ok(Some(runtime))
+    }
+
+    fn runtime_read_for_observed_current_resident_fast_read(
+        &self,
+        snapshot_lsn: u64,
+    ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
+        if !self.observed_current_runtime_is_current(snapshot_lsn) {
+            return Ok(None);
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        if Self::runtime_has_deferred_security_tables(&runtime)
+            || runtime.security_rules_active()?
+        {
+            return Ok(None);
+        }
+        if !self.observed_current_runtime_is_current(snapshot_lsn) {
             return Ok(None);
         }
         Ok(Some(runtime))
@@ -9903,10 +10670,10 @@ impl Db {
             .engine
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        runtime.redefer_persisted_tables(names);
+        let freed_bytes = runtime.redefer_persisted_tables(names);
         drop(runtime);
         if release_heap_after_drop {
-            self.release_freed_heap_after_paged_row_source_drop();
+            self.release_freed_heap_after_paged_row_source_drop(freed_bytes);
         }
         Ok(())
     }
@@ -9943,9 +10710,9 @@ impl Db {
             .engine
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        runtime.redefer_all_persisted_paged_tables();
+        let freed_bytes = runtime.redefer_all_persisted_paged_tables();
         drop(runtime);
-        self.release_freed_heap_after_paged_row_source_drop();
+        self.release_freed_heap_after_paged_row_source_drop(freed_bytes);
         Ok(())
     }
 
@@ -10051,16 +10818,27 @@ impl Db {
         }
     }
 
-    fn release_freed_heap_after_paged_row_source_drop(&self) {
-        if self.inner.config.paged_row_storage {
-            crate::wal::platform::release_freed_heap();
+    fn release_freed_heap_after_paged_row_source_drop(&self, freed_bytes: usize) {
+        if self.inner.config.paged_row_storage
+            && should_release_freed_paged_row_source_heap(freed_bytes)
+        {
+            self.release_freed_heap_if_configured();
         }
     }
 
     fn release_freed_heap_after_runtime_compaction(&self, freed_bytes: usize) {
         if freed_bytes >= RESIDENT_COMMIT_HEAP_RELEASE_THRESHOLD {
-            crate::wal::platform::release_freed_heap();
+            self.release_freed_heap_if_configured();
         }
+    }
+
+    fn release_freed_heap_if_configured(&self) {
+        if !self.inner.config.release_freed_memory_after_checkpoint {
+            return;
+        }
+        #[cfg(test)]
+        PAGED_ROW_SOURCE_HEAP_RELEASE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        crate::wal::platform::release_freed_heap();
     }
 
     fn maybe_demote_wal_after_large_explicit_commit(&self) {
@@ -10081,7 +10859,7 @@ impl Db {
                 .demote_resident_versions_if_reader_free(usize::try_from(target_bytes).unwrap_or(usize::MAX)),
             Ok(demoted) if demoted > 0
         ) {
-            crate::wal::platform::release_freed_heap();
+            self.release_freed_heap_if_configured();
         }
     }
 
@@ -10230,7 +11008,6 @@ impl Db {
         }
         let result = working.execute_read_statement(statement, params, self.inner.config.page_size);
         drop(working);
-        self.release_freed_heap_after_paged_row_source_drop();
         Ok(Some(result?))
     }
 
@@ -10380,7 +11157,6 @@ impl Db {
         )?;
         let result = join_runtime.try_execute_indexed_join_grouped_count_query(query, params);
         drop(join_runtime);
-        self.release_freed_heap_after_paged_row_source_drop();
         result
     }
 
@@ -10411,7 +11187,6 @@ impl Db {
         )?;
         let result = join_runtime.try_execute_simple_indexed_join_projection_query(query, params);
         drop(join_runtime);
-        self.release_freed_heap_after_paged_row_source_drop();
         result
     }
 
@@ -10801,17 +11576,23 @@ impl Db {
     }
 
     fn current_schema_cookie_at_snapshot(&self, snapshot_lsn: u64) -> Result<u32> {
-        let page = if let Some(wal_page) = self.inner.wal.read_page_at_snapshot(
-            &self.inner.pager,
-            page::HEADER_PAGE_ID,
-            snapshot_lsn,
-        )? {
-            wal_page
-        } else {
-            self.inner.pager.read_page(page::HEADER_PAGE_ID)?
-        };
+        Self::schema_cookie_at_storage_snapshot(&self.inner.pager, &self.inner.wal, snapshot_lsn)
+    }
+
+    fn schema_cookie_at_storage_snapshot(
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        snapshot_lsn: u64,
+    ) -> Result<u32> {
         let mut bytes = [0_u8; storage::header::DB_HEADER_SIZE];
-        bytes.copy_from_slice(&page[..storage::header::DB_HEADER_SIZE]);
+        if let Some(wal_page) =
+            wal.read_page_at_snapshot(pager, page::HEADER_PAGE_ID, snapshot_lsn)?
+        {
+            bytes.copy_from_slice(&wal_page[..storage::header::DB_HEADER_SIZE]);
+        } else {
+            let page = pager.read_page(page::HEADER_PAGE_ID)?;
+            bytes.copy_from_slice(&page[..storage::header::DB_HEADER_SIZE]);
+        }
         Ok(DatabaseHeader::decode(&bytes)?.schema_cookie)
     }
 
@@ -11200,7 +11981,6 @@ impl Db {
                 Self::prepared_insert_uses_direct_positional_params(insert, param_count)
             });
         }
-
         Ok(PreparedStatementBatch {
             db: self,
             state,
@@ -11208,6 +11988,7 @@ impl Db {
             prepared_insert,
             direct_positional,
             prepared_insert_candidate: Vec::new(),
+            prepared_insert_encoded_values: Vec::new(),
         })
     }
 

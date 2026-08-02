@@ -1,0 +1,206 @@
+{
+  "binding": "RustRaw",
+  "scale_name": "medium",
+  "benchmark_profile": "default",
+  "result_schema_version": 3,
+  "runner_contract_version": 1,
+  "seed": 42,
+  "invocation_argv": [
+    "./target/release/rust-baseline",
+    "--benchmark"
+  ],
+  "executable_sha256": "429792356dede0dce66828e40f05bd004e08546f5eec3b203b98c5c8033fc198",
+  "compiled_optional_features": [
+    "extended-suites"
+  ],
+  "checkpoint_durability_contract": "main-db-sync-before-wal-truncate-v1",
+  "measurement_family": "music_library_total_runtime",
+  "engine_access_path": "decentdb_native_rust",
+  "durability_profile": "decentdb_durable_wal_default",
+  "workload_class": "bulk_load_then_read_only_music_library",
+  "cache_profile": "decentdb_default_low_memory",
+  "query_repetition_policy": "single_execution_per_query_shape",
+  "cold_state_policy": "same_process_fresh_create_then_query",
+  "target_artists": 5000,
+  "target_albums": 50000,
+  "target_songs_cap": 500000,
+  "started_unix": 1785678452,
+  "finished_unix": 1785678452,
+  "engine_version": "2.16.1",
+  "database_path": "run-rust-medium.ddb",
+  "database_size_bytes": 15314944,
+  "wal_size_bytes": 32,
+  "peak_rss_bytes": 38572032,
+  "steps": [
+    {
+      "name": "connect_open",
+      "duration_seconds": 0.002542445,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 14467072,
+      "rss_anon_kb": 3492,
+      "rss_file_kb": 10636,
+      "extra": {}
+    },
+    {
+      "name": "schema_create",
+      "duration_seconds": 0.003892592,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 14467072,
+      "rss_anon_kb": 3492,
+      "rss_file_kb": 10636,
+      "extra": {}
+    },
+    {
+      "name": "seed_artists",
+      "duration_seconds": 0.00803892,
+      "records": 5000,
+      "records_per_second": 621974.0960228489,
+      "rss_bytes": 14491648,
+      "rss_anon_kb": 3516,
+      "rss_file_kb": 10636,
+      "extra": {}
+    },
+    {
+      "name": "seed_albums",
+      "duration_seconds": 0.045999882,
+      "records": 50000,
+      "records_per_second": 1086959.3100260561,
+      "rss_bytes": 22093824,
+      "rss_anon_kb": 10940,
+      "rss_file_kb": 10636,
+      "extra": {}
+    },
+    {
+      "name": "seed_songs",
+      "duration_seconds": 0.180771002,
+      "records": 276243,
+      "records_per_second": 1528137.792808163,
+      "rss_bytes": 38572032,
+      "rss_anon_kb": 27032,
+      "rss_file_kb": 10636,
+      "extra": {}
+    },
+    {
+      "name": "checkpoint_after_seed",
+      "duration_seconds": 0.04250121,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 32354304,
+      "rss_anon_kb": 20960,
+      "rss_file_kb": 10636,
+      "extra": {
+        "checkpoint_mode": "wal",
+        "database_bytes_after": 15314944,
+        "database_bytes_before": 8192,
+        "wal_bytes_after": 32,
+        "wal_bytes_before": 16777216
+      }
+    },
+    {
+      "name": "query_count_songs",
+      "duration_seconds": 0.000019216,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 32354304,
+      "rss_anon_kb": 20960,
+      "rss_file_kb": 10636,
+      "extra": {
+        "count": 276243,
+        "row_count": 1,
+        "semantic_checksum_sha256": "69ae00c654f01a5773e4b9787670e5bf0e392fb4e86878f36315c02ef1415936"
+      }
+    },
+    {
+      "name": "query_aggregate_durations",
+      "duration_seconds": 0.007887315,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 32436224,
+      "rss_anon_kb": 21040,
+      "rss_file_kb": 10636,
+      "extra": {
+        "duration_average": 239737.33188895285,
+        "duration_maximum": 419997,
+        "duration_minimum": 60000,
+        "duration_sum": 66225759773,
+        "row_count": 1,
+        "semantic_checksum_sha256": "e4cdb7e7738cadb768222194db4613973f8eee3ba514005af7d839970decea65",
+        "song_count": 276243
+      }
+    },
+    {
+      "name": "query_artist_by_id",
+      "duration_seconds": 0.000015028,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 32436224,
+      "rss_anon_kb": 21040,
+      "rss_file_kb": 10636,
+      "extra": {
+        "artist_id": 2501,
+        "artist_name": "Artist 2501",
+        "row_count": 1,
+        "semantic_checksum_sha256": "00a348643527de515c46fde867525ac53bc8080fe57477cad80097edd6331237",
+        "target_artist_id": 2501
+      }
+    },
+    {
+      "name": "query_top10_artists_by_songs",
+      "duration_seconds": 0.001125183,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 32591872,
+      "rss_anon_kb": 21192,
+      "rss_file_kb": 10636,
+      "extra": {
+        "row_count": 10,
+        "semantic_checksum_sha256": "bf6132aa3552d16c76cd290d4ba5effe657ade3e4b8d146cd9796cba1cf9cc22"
+      }
+    },
+    {
+      "name": "query_top10_albums_by_songs",
+      "duration_seconds": 0.008655948,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 34783232,
+      "rss_anon_kb": 23332,
+      "rss_file_kb": 10636,
+      "extra": {
+        "row_count": 10,
+        "semantic_checksum_sha256": "49709a0c1a22f89296e38fad829b9f7100ed4b477065da2ca76e9e0d63dff9bb"
+      }
+    },
+    {
+      "name": "query_view_first_1000",
+      "duration_seconds": 0.00053248,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 34787328,
+      "rss_anon_kb": 23336,
+      "rss_file_kb": 10636,
+      "extra": {
+        "row_count": 1000,
+        "semantic_checksum_sha256": "2453409674bf4cf20fee7c063352f04263cef8758bf7d97554ac7c37e4a7b21a"
+      }
+    },
+    {
+      "name": "query_songs_for_artist_via_view",
+      "duration_seconds": 0.000037962,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 34992128,
+      "rss_anon_kb": 23536,
+      "rss_file_kb": 10636,
+      "extra": {
+        "row_count": 64,
+        "semantic_checksum_sha256": "d9f311f88a4b2de9e5f0a9856350e8397cf9e72e972cdd5ddc99b02bf47e49a0"
+      }
+    }
+  ],
+  "latency_cases": [],
+  "concurrency_cases": [],
+  "write_cases": [],
+  "cold_cases": []
+}
