@@ -30,11 +30,15 @@ thread_local! {
 /// Detects `CREATE VIEW IF NOT EXISTS` and rewrites it to `CREATE VIEW` so pg_query can parse it.
 /// Sets a thread-local flag that `normalize_create_view` reads to populate the AST field.
 /// Only sets the flag to true when the pattern is found; never resets it to false.
+pub(crate) fn create_view_if_not_exists_needs_rewrite(sql: &str) -> bool {
+    const PAT: &str = "CREATE VIEW IF NOT EXISTS";
+    sql.trim_start().to_ascii_uppercase().starts_with(PAT)
+}
+
 pub(crate) fn detect_and_rewrite_create_view_if_not_exists(sql: &str) -> String {
     const PAT: &str = "CREATE VIEW IF NOT EXISTS";
     let trimmed = sql.trim_start();
-    let upper = trimmed.to_ascii_uppercase();
-    if upper.starts_with(PAT) {
+    if create_view_if_not_exists_needs_rewrite(sql) {
         PENDING_VIEW_IF_NOT_EXISTS.with(|c| c.set(true));
         let rest = &trimmed[PAT.len()..].trim_start();
         format!("CREATE VIEW {}", rest)
@@ -69,7 +73,7 @@ pub(crate) fn normalize_statement_text_with_generated_modes(
     normalize_statement_with_generated_modes(raw, sql, generated_column_modes)
 }
 
-fn normalize_statement(node: &NodeEnum, original_sql: &str) -> Result<Statement> {
+pub(crate) fn normalize_statement(node: &NodeEnum, original_sql: &str) -> Result<Statement> {
     normalize_statement_with_generated_modes(node, original_sql, &[])
 }
 

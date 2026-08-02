@@ -19,6 +19,74 @@ pub(crate) fn parse_sql_statement(sql: &str) -> Result<Statement> {
     Ok(statements.remove(0))
 }
 
+/// Parses a batch of plain SQL statements with one parser dispatch.
+///
+/// Syntax that requires DecentDB's per-statement compatibility rewrites is
+/// deliberately declined so callers can retain the existing general path.
+/// The schema bootstrap fast path uses this after it has already split and
+/// classified the statements.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn parse_plain_sql_batch_single_dispatch(
+    statement_sqls: &[String],
+) -> Result<Option<Vec<Statement>>> {
+    if statement_sqls.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut sql = String::with_capacity(
+        statement_sqls
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(statement_sqls.len()),
+    );
+    for statement_sql in statement_sqls {
+        let (generated_modes, generated_rewrite) = rewrite_generated_virtual_columns(statement_sql);
+        if !generated_modes.is_empty() || generated_rewrite.as_ref() != statement_sql {
+            return Ok(None);
+        }
+        if rewrite_legacy_trigger_body(statement_sql).as_ref() != statement_sql
+            || super::normalize::create_view_if_not_exists_needs_rewrite(statement_sql)
+        {
+            return Ok(None);
+        }
+        sql.push_str(statement_sql);
+        sql.push(';');
+    }
+
+    let parsed = libpg_query_sys::parse_statements(&sql)
+        .map_err(|error| DbError::sql(error.message().to_string()))?;
+    if parsed.stmts.len() != statement_sqls.len() {
+        return Err(DbError::sql(format!(
+            "expected {} SQL statements in parser batch, got {}",
+            statement_sqls.len(),
+            parsed.stmts.len()
+        )));
+    }
+
+    parsed
+        .stmts
+        .iter()
+        .zip(statement_sqls)
+        .map(|(parsed_statement, original_sql)| {
+            let raw = parsed_statement
+                .stmt
+                .as_ref()
+                .and_then(|statement| statement.node.as_ref())
+                .ok_or_else(|| DbError::sql("parser returned an empty statement"))?;
+            super::normalize::normalize_statement(raw, original_sql)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) fn parse_plain_sql_batch_single_dispatch(
+    _statement_sqls: &[String],
+) -> Result<Option<Vec<Statement>>> {
+    Ok(None)
+}
+
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
     let (generated_modes, sql_with_generated_rewrite) = rewrite_generated_virtual_columns(sql);

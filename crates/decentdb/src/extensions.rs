@@ -17,9 +17,14 @@ use sha2::{Digest, Sha256};
 use crate::db::Db;
 use crate::error::{DbError, Result};
 use crate::exec::{QueryResult, QueryRow};
+use crate::record::value::Value;
+#[cfg(all(
+    feature = "lua-extensions",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 use crate::record::value::{
     format_date_days, format_timestamp_tz_micros, parse_date_days, parse_decimal_text,
-    parse_timestamp_tz_micros, Value,
+    parse_timestamp_tz_micros,
 };
 
 pub(crate) const PACKAGES_TABLE: &str = "__decentdb_extension_packages";
@@ -212,6 +217,10 @@ impl ExtensionSqlType {
         }
     }
 
+    #[cfg(all(
+        feature = "lua-extensions",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     fn as_str(self) -> &'static str {
         match self {
             Self::Null => "NULL",

@@ -39,6 +39,9 @@ fn cleanup(path: &std::path::Path) {
 fn async_commit_config(interval_ms: u32) -> DbConfig {
     DbConfig {
         wal_sync_mode: WalSyncMode::AsyncCommit { interval_ms },
+        wal_checkpoint_threshold_pages: 0,
+        wal_checkpoint_threshold_bytes: 0,
+        background_checkpoint_worker: false,
         ..DbConfig::default()
     }
 }
@@ -180,6 +183,40 @@ fn async_commit_background_flusher_catches_up() {
     assert!(
         elapsed < Duration::from_millis(100),
         "sync should be fast after background catch-up: {elapsed:?}"
+    );
+    drop(db);
+    cleanup(&path);
+}
+
+#[test]
+fn async_commit_checkpoint_foreground_flushes_long_interval_tail() {
+    let path = unique_db_path("checkpoint-foreground-flush");
+    {
+        let db = Db::create(&path, async_commit_config(60_000)).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t (id, v) VALUES (1, 'checkpointed')")
+            .unwrap();
+
+        let start = Instant::now();
+        db.checkpoint_wal()
+            .expect("checkpoint must force async tail durable");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "checkpoint waited for background interval instead of foreground flushing"
+        );
+        assert_eq!(
+            fs::metadata(wal_path(&path)).unwrap().len(),
+            32,
+            "reader-free checkpoint should truncate the WAL to its header"
+        );
+    }
+
+    let db = Db::open(&path, DbConfig::default()).unwrap();
+    let result = db.execute("SELECT v FROM t WHERE id = 1").unwrap();
+    assert_eq!(
+        row_values(&result),
+        vec![vec![Value::Text("checkpointed".into())]]
     );
     drop(db);
     cleanup(&path);

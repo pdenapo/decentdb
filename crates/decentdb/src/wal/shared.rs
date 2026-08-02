@@ -65,6 +65,62 @@ pub(crate) fn acquire(
     Ok(handle)
 }
 
+/// Acquires a WAL only when its path can be atomically created by this call.
+///
+/// The returned file handle is carried directly into initialization so there
+/// is no check/open gap in which an orphan WAL can appear. A pre-existing
+/// path or live same-process registry entry returns `Ok(None)` without reading
+/// or recovering the WAL against the caller's pager.
+pub(crate) fn acquire_fresh(
+    vfs: &VfsHandle,
+    db_path: &Path,
+    config: &DbConfig,
+    pager: &PagerHandle,
+    process_coordinator: Option<ProcessCoordinator>,
+) -> Result<Option<WalHandle>> {
+    if vfs.is_memory() {
+        return Ok(None);
+    }
+
+    let canonical_path = vfs.canonicalize_path(db_path)?;
+    let registry = registry();
+    {
+        let registry_guard = registry
+            .lock()
+            .map_err(|_| DbError::internal("shared wal registry lock poisoned"))?;
+        if registry_guard
+            .get(&canonical_path)
+            .and_then(Weak::upgrade)
+            .is_some()
+        {
+            return Ok(None);
+        }
+    }
+
+    let wal_path = wal_path_for_db(&canonical_path);
+    let file = match vfs.open(&wal_path, OpenMode::CreateNew, FileKind::Wal) {
+        Ok(file) => file,
+        Err(DbError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let handle = build_handle_from_file(
+        vfs,
+        Some(canonical_path.clone()),
+        &canonical_path,
+        config,
+        pager,
+        process_coordinator,
+        file,
+    )?;
+    registry
+        .lock()
+        .map_err(|_| DbError::internal("shared wal registry lock poisoned"))?
+        .insert(canonical_path, Arc::downgrade(&handle.inner));
+    Ok(Some(handle))
+}
+
 fn build_handle(
     vfs: &VfsHandle,
     canonical_path: Option<PathBuf>,
@@ -80,7 +136,30 @@ fn build_handle(
         OpenMode::OpenOrCreate
     };
     let file = vfs.open(&wal_path, mode, FileKind::Wal)?;
-    let backend_kind = WalIndexBackendKind::for_hot_set_pages(config.wal_index_hot_set_pages);
+    build_handle_from_file(
+        vfs,
+        canonical_path,
+        db_path,
+        config,
+        pager,
+        process_coordinator,
+        file,
+    )
+}
+
+fn build_handle_from_file(
+    vfs: &VfsHandle,
+    canonical_path: Option<PathBuf>,
+    db_path: &Path,
+    config: &DbConfig,
+    pager: &PagerHandle,
+    process_coordinator: Option<ProcessCoordinator>,
+    file: Arc<dyn crate::vfs::VfsFile>,
+) -> Result<WalHandle> {
+    let backend_kind = WalIndexBackendKind::for_runtime(
+        config.wal_index_hot_set_pages,
+        process_coordinator.is_some(),
+    );
     let mut index_sidecar = match backend_kind {
         WalIndexBackendKind::InMemory => None,
         WalIndexBackendKind::PagedSidecar => Some(WalIndexSidecar::open(vfs, db_path)?),
@@ -116,6 +195,8 @@ fn build_handle(
             (0, 0)
         };
 
+    let coordinated_nonempty_tail = process_coordinator.is_some() && end_lsn > 0;
+
     let inner = Arc::new(SharedWalInner {
         canonical_path,
         file,
@@ -131,6 +212,8 @@ fn build_handle(
         reader_registry: ReaderRegistry::default(),
         retained_snapshot_lsn: AtomicU64::new(u64::MAX),
         checkpoint_pending: AtomicBool::new(false),
+        checkpoint_tail_sync_needed: AtomicBool::new(coordinated_nonempty_tail),
+        checkpoint_tail_locally_synced: AtomicBool::new(!coordinated_nonempty_tail),
         checkpoint_epoch: AtomicU64::new(0),
         async_commit,
         resident_versions_per_page: config.wal_resident_versions_per_page,

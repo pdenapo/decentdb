@@ -6,8 +6,8 @@ use crate::search::TrigramQueryResult;
 use crate::sql::ast::{Expr, FromItem};
 use crate::sql::parser::parse_sql_statement;
 use crate::storage::checksum::crc32c_parts;
-use crate::storage::page::InMemoryPageStore;
-use crate::{Db, DbConfig, Value};
+use crate::storage::page::{InMemoryPageStore, PageStore};
+use crate::{Db, DbConfig, QueryResult, Value};
 use tempfile::TempDir;
 
 use super::{
@@ -19,13 +19,172 @@ use super::{
     encode_runtime_payload, encode_table_payload, like_match, persist_paged_table,
     read_deferred_row_by_id_from_table_payload, read_table_page_manifest_from_state,
     rewrite_paged_table_from_manifest, rewrite_paged_table_from_resident, simple_trigram_lookup,
-    try_append_only_paged_table_from_manifest, ColumnBinding, Dataset, DbTxnPageStore,
-    EngineRuntime, OverflowPointer, PersistedTableState, QueryRow, RuntimeBtreeKeys, RuntimeIndex,
-    SimpleOrderByPlan, StoredRow, TableData, TablePageManifest, TablePageManifestChunk,
-    TableRowSource, DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS,
+    try_append_only_paged_table_from_manifest, visit_persisted_table_int64_column,
+    visit_table_payload_int64_column_from_bytes, visit_table_payload_int64_column_from_pointer,
+    ColumnBinding, Dataset, DbTxnPageStore, EngineRuntime, OverflowPointer, PersistedTableState,
+    QueryRow, RuntimeBtreeKeys, RuntimeIndex, SimpleOrderByPlan, StoredRow, TableData,
+    TablePageManifest, TablePageManifestChunk, TableRowSource,
+    DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS, TABLE_PAYLOAD_MAGIC, TABLE_PAYLOAD_ROW_TOMBSTONE_FLAG,
 };
 
 const PAGE_SIZE: u32 = 4096;
+
+fn redefer_runtime_table_with_verified_payload_for_test(
+    runtime: &mut EngineRuntime,
+    table_name: &str,
+    manifest_page_id: u32,
+    first_chunk_page_id: u32,
+) {
+    let rows = runtime
+        .tables
+        .get(table_name)
+        .expect("resident test table")
+        .resident_data()
+        .rows
+        .as_ref()
+        .clone();
+    let mut manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build test manifest");
+    for (chunk_index, chunk) in Arc::make_mut(&mut manifest.chunks).iter_mut().enumerate() {
+        chunk.pointer = OverflowPointer {
+            head_page_id: first_chunk_page_id
+                + u32::try_from(chunk_index).expect("test chunk index"),
+            logical_len: u32::try_from(chunk.payload.len()).expect("test chunk length"),
+            flags: 0,
+        };
+    }
+    let state = PersistedTableState {
+        pointer: OverflowPointer {
+            head_page_id: manifest_page_id,
+            logical_len: 1,
+            flags: 0,
+        }
+        .with_table_paged_manifest(true),
+        checksum: manifest_page_id,
+        row_count: rows.len(),
+        ..PersistedTableState::default()
+    };
+    runtime
+        .cache_deferred_paged_row_locators(table_name, state, manifest.chunks.as_ref())
+        .expect("cache verified paged rows");
+    runtime
+        .persisted_tables_mut()
+        .insert(table_name.to_string(), state);
+    runtime.dirty_tables_mut().remove(table_name);
+    Arc::make_mut(&mut runtime.tables).remove(table_name);
+    runtime.deferred_tables_mut().insert(table_name.to_string());
+}
+
+fn runtime_with_redeferable_test_tables() -> EngineRuntime {
+    let mut runtime = EngineRuntime::empty(1);
+    for (table_name, body_len) in [("paged_a", 257), ("paged_b", 769), ("plain", 129)] {
+        execute_sql(
+            &mut runtime,
+            &format!("CREATE TABLE {table_name} (id INT64 PRIMARY KEY, body TEXT)"),
+        );
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO {table_name} (id, body) VALUES (1, '{}')",
+                "x".repeat(body_len)
+            ),
+        );
+        runtime.dirty_tables_mut().insert(table_name.to_string());
+        runtime
+            .paged_mutations
+            .insert(table_name.to_string(), Default::default());
+    }
+    for table_name in ["paged_a", "paged_b"] {
+        runtime.persisted_tables_mut().insert(
+            table_name.to_string(),
+            PersistedTableState {
+                pointer: OverflowPointer {
+                    head_page_id: 1,
+                    logical_len: 1,
+                    flags: 0,
+                }
+                .with_table_paged_manifest(true),
+                ..PersistedTableState::default()
+            },
+        );
+    }
+    runtime
+        .persisted_tables_mut()
+        .insert("plain".to_string(), PersistedTableState::default());
+    runtime
+}
+
+#[test]
+fn redefer_persisted_tables_returns_exact_removed_heap_bytes_and_updates_state() {
+    let mut runtime = runtime_with_redeferable_test_tables();
+    let expected_freed_bytes = ["paged_a", "paged_b"]
+        .iter()
+        .map(|name| {
+            runtime
+                .tables
+                .get(*name)
+                .expect("resident test table")
+                .approximate_heap_bytes()
+        })
+        .sum::<usize>();
+
+    let freed_bytes =
+        runtime.redefer_persisted_tables(&["paged_a", "missing", "plain", "paged_b", "paged_a"]);
+
+    assert_eq!(freed_bytes, expected_freed_bytes);
+    for table_name in ["paged_a", "paged_b"] {
+        assert!(!runtime.tables.contains_key(table_name));
+        assert!(runtime.deferred_tables.contains(table_name));
+        assert!(!runtime.dirty_tables.contains(table_name));
+        assert!(!runtime.paged_mutations.contains_key(table_name));
+    }
+    assert!(runtime.tables.contains_key("plain"));
+    assert!(!runtime.deferred_tables.contains("plain"));
+    assert!(runtime.dirty_tables.contains("plain"));
+    assert!(runtime.paged_mutations.contains_key("plain"));
+}
+
+#[test]
+fn redefer_all_persisted_paged_tables_counts_only_resident_sources() {
+    let mut runtime = runtime_with_redeferable_test_tables();
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE already_deferred (id INT64 PRIMARY KEY, body TEXT)",
+    );
+    runtime.persisted_tables_mut().insert(
+        "already_deferred".to_string(),
+        PersistedTableState {
+            pointer: OverflowPointer {
+                head_page_id: 2,
+                logical_len: 1,
+                flags: 0,
+            }
+            .with_table_paged_manifest(true),
+            ..PersistedTableState::default()
+        },
+    );
+    runtime.tables_mut().remove("already_deferred");
+    runtime
+        .deferred_tables_mut()
+        .insert("already_deferred".to_string());
+    let expected_freed_bytes = ["paged_a", "paged_b"]
+        .iter()
+        .map(|name| {
+            runtime
+                .tables
+                .get(*name)
+                .expect("resident test table")
+                .approximate_heap_bytes()
+        })
+        .sum::<usize>();
+
+    let freed_bytes = runtime.redefer_all_persisted_paged_tables();
+
+    assert_eq!(freed_bytes, expected_freed_bytes);
+    assert!(!runtime.tables.contains_key("paged_a"));
+    assert!(!runtime.tables.contains_key("paged_b"));
+    assert!(runtime.tables.contains_key("plain"));
+    assert!(runtime.deferred_tables.contains("already_deferred"));
+}
 
 #[test]
 fn like_match_fast_patterns_match_recursive_semantics() {
@@ -355,7 +514,7 @@ fn non_nullable_int64_btree_indexes_use_typed_runtime_keys() {
     let RuntimeBtreeKeys::UniqueInt64(entries, _) = keys else {
         panic!("expected typed INT64 runtime keys");
     };
-    assert_eq!(entries.get(&7), Some(&7));
+    assert_eq!(entries.get(&7), Some(7));
     assert_eq!(
         keys.row_ids_for_value(&Value::Int64(7))
             .expect("INT64 lookup should succeed"),
@@ -2206,6 +2365,125 @@ fn simple_filtered_projection_range_index_with_residual_uses_fast_path() {
 }
 
 #[test]
+fn encoded_key_indexes_preserve_short_and_long_queries_across_checkpoint_reopen() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("encoded-key-inline-spill-reopen.ddb");
+    let config = DbConfig {
+        background_checkpoint_worker: false,
+        wal_checkpoint_threshold_pages: 0,
+        wal_checkpoint_threshold_bytes: 0,
+        ..DbConfig::default()
+    };
+    let db = Db::open_or_create(&path, config.clone()).expect("create db");
+    db.execute(
+        "CREATE TABLE encoded_keys (\
+             id INT64 PRIMARY KEY, unique_key TEXT NOT NULL, group_key TEXT NOT NULL\
+         )",
+    )
+    .expect("create table");
+    db.execute("CREATE UNIQUE INDEX encoded_keys_unique_idx ON encoded_keys(unique_key)")
+        .expect("create unique index");
+    db.execute("CREATE INDEX encoded_keys_group_idx ON encoded_keys(group_key)")
+        .expect("create nonunique index");
+    for (id, unique_key, group_key) in [
+        (1, "a", "g"),
+        (
+            2,
+            "a unique key that is definitely heap backed",
+            "a nonunique key that is definitely heap backed",
+        ),
+        (3, "middle", "g"),
+        (
+            4,
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "a nonunique key that is definitely heap backed",
+        ),
+    ] {
+        db.execute_with_params(
+            "INSERT INTO encoded_keys (id, unique_key, group_key) VALUES ($1, $2, $3)",
+            &[
+                Value::Int64(id),
+                Value::Text(unique_key.into()),
+                Value::Text(group_key.into()),
+            ],
+        )
+        .expect("insert key row");
+    }
+
+    let assert_ids = |db: &Db, sql: &str, params: &[Value], expected: &[i64]| {
+        let result = db
+            .execute_with_params(sql, params)
+            .expect("execute indexed query");
+        let ids = result
+            .rows()
+            .iter()
+            .map(|row| match row.values() {
+                [Value::Int64(id)] => *id,
+                values => panic!("expected one INT64 id, got {values:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "query: {sql}");
+    };
+    let assert_all_index_queries = |db: &Db| {
+        assert_ids(
+            db,
+            "SELECT id FROM encoded_keys WHERE unique_key = $1 ORDER BY id",
+            &[Value::Text("a".into())],
+            &[1],
+        );
+        assert_ids(
+            db,
+            "SELECT id FROM encoded_keys WHERE unique_key = $1 ORDER BY id",
+            &[Value::Text(
+                "a unique key that is definitely heap backed".into(),
+            )],
+            &[2],
+        );
+        assert_ids(
+            db,
+            "SELECT id FROM encoded_keys WHERE group_key = $1 ORDER BY id",
+            &[Value::Text("g".into())],
+            &[1, 3],
+        );
+        assert_ids(
+            db,
+            "SELECT id FROM encoded_keys WHERE group_key = $1 ORDER BY id",
+            &[Value::Text(
+                "a nonunique key that is definitely heap backed".into(),
+            )],
+            &[2, 4],
+        );
+        assert_ids(
+            db,
+            "SELECT id FROM encoded_keys \
+             WHERE unique_key >= $1 AND unique_key <= $2 ORDER BY id",
+            &[
+                Value::Text("a".into()),
+                Value::Text("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".into()),
+            ],
+            &[1, 2, 3, 4],
+        );
+        assert_ids(
+            db,
+            "SELECT id FROM encoded_keys \
+             WHERE group_key >= $1 AND group_key <= $2 ORDER BY id",
+            &[
+                Value::Text("a".into()),
+                Value::Text("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".into()),
+            ],
+            &[1, 2, 3, 4],
+        );
+    };
+
+    assert_all_index_queries(&db);
+    db.checkpoint().expect("checkpoint");
+    drop(db);
+
+    let reopened = Db::open_or_create(&path, config).expect("reopen db");
+    assert_all_index_queries(&reopened);
+}
+
+#[test]
 fn simple_filtered_projection_order_by_limit_offset_uses_fast_path() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -3929,6 +4207,325 @@ fn deferred_row_lookup_reads_compressed_table_payload() {
 }
 
 #[test]
+fn streaming_int64_pointer_scan_matches_materialized_scan_across_pages() {
+    let data = TableData::from_rows(vec![
+        StoredRow {
+            row_id: 1,
+            values: vec![
+                Value::Int64(1),
+                Value::Text("a".repeat(257)),
+                Value::Int64(-8193),
+            ],
+        },
+        StoredRow {
+            row_id: 2,
+            values: vec![Value::Int64(2), Value::Text("b".repeat(193)), Value::Null],
+        },
+        StoredRow {
+            row_id: 3,
+            values: vec![
+                Value::Int64(3),
+                Value::Text("c".repeat(129)),
+                Value::Int64(i64::MAX),
+            ],
+        },
+    ]);
+    let payload = encode_table_payload(&data).expect("encode table payload");
+    let mut store = InMemoryPageStore::new(64);
+    let pointer =
+        crate::record::overflow::write_overflow(&mut store, &payload, CompressionMode::Never)
+            .expect("write uncompressed payload");
+    assert!(
+        store.allocated_page_count() > 3,
+        "test payload should cross several overflow pages"
+    );
+
+    let mut materialized = Vec::new();
+    let materialized_count =
+        visit_table_payload_int64_column_from_bytes(&payload, 2, None, &mut |row_id, value| {
+            materialized.push((row_id, value));
+            Ok(())
+        })
+        .expect("scan materialized payload");
+    let mut streamed = Vec::new();
+    let streamed_count = visit_table_payload_int64_column_from_pointer(
+        &store,
+        pointer,
+        2,
+        None,
+        &mut |row_id, value| {
+            streamed.push((row_id, value));
+            Ok(())
+        },
+    )
+    .expect("stream overflow payload");
+
+    assert_eq!(streamed_count, materialized_count);
+    assert_eq!(streamed, materialized);
+    assert_eq!(
+        streamed,
+        vec![(1, Some(-8193)), (2, None), (3, Some(i64::MAX))]
+    );
+}
+
+#[test]
+fn streaming_int64_pointer_scan_preserves_compression_and_tombstone_semantics() {
+    let data = TableData::from_rows(
+        (1_i64..=4_i64)
+            .map(|row_id| StoredRow {
+                row_id,
+                values: vec![
+                    Value::Int64(row_id),
+                    Value::Text("compressible".repeat(128)),
+                    Value::Int64(row_id * 100),
+                ],
+            })
+            .collect(),
+    );
+    let payload = encode_table_payload(&data).expect("encode table payload");
+    let mut store = InMemoryPageStore::new(PAGE_SIZE);
+    let pointer = crate::record::overflow::write_overflow(
+        &mut store,
+        &payload,
+        CompressionMode::AutoMinBytes(1),
+    )
+    .expect("write compressed payload");
+    assert!(pointer.is_compressed(), "test payload should compress");
+
+    let tombstones = [2_i64];
+    let mut materialized = Vec::new();
+    visit_table_payload_int64_column_from_bytes(
+        &payload,
+        2,
+        Some(&tombstones),
+        &mut |row_id, value| {
+            materialized.push((row_id, value));
+            Ok(())
+        },
+    )
+    .expect("scan materialized compressed payload");
+    let mut streamed = Vec::new();
+    visit_table_payload_int64_column_from_pointer(
+        &store,
+        pointer,
+        2,
+        Some(&tombstones),
+        &mut |row_id, value| {
+            streamed.push((row_id, value));
+            Ok(())
+        },
+    )
+    .expect("scan compressed pointer");
+
+    assert_eq!(streamed, materialized);
+    assert_eq!(streamed.len(), 3);
+    assert!(!streamed.iter().any(|(row_id, _)| *row_id == 2));
+}
+
+#[test]
+fn streaming_persisted_int64_scan_merges_base_tombstones_and_overlay() {
+    let body = "x".repeat(2048);
+    let data = TableData::from_rows(
+        (1_i64..=96_i64)
+            .map(|row_id| StoredRow {
+                row_id,
+                values: vec![
+                    Value::Int64(row_id),
+                    Value::Text(body.clone()),
+                    Value::Int64(row_id * 10),
+                ],
+            })
+            .collect(),
+    );
+    let mut store = InMemoryPageStore::new(PAGE_SIZE);
+    let chunks = encode_paged_table_chunks(&data, PAGE_SIZE).expect("encode paged chunks");
+    let initial_state = persist_paged_table(
+        &mut store,
+        PersistedTableState::default(),
+        &chunks,
+        data.row_count(),
+    )
+    .expect("persist paged table");
+    let manifest =
+        read_table_page_manifest_from_state(&store, initial_state).expect("read page manifest");
+    let mut changes = BTreeMap::new();
+    changes.insert(
+        1,
+        Some(vec![
+            Value::Int64(1),
+            Value::Text("updated".to_string()),
+            Value::Int64(777),
+        ]),
+    );
+    changes.insert(2, None);
+    let updated =
+        apply_paged_row_changes_to_manifest(&manifest, &changes).expect("apply sparse changes");
+    assert!(updated.tombstoned_row_ids.contains(&1));
+    assert!(updated.tombstoned_row_ids.contains(&2));
+    assert!(updated
+        .chunks
+        .iter()
+        .any(|chunk| chunk.overlay_payload.is_some()));
+    let (updated_state, _) = rewrite_paged_table_from_manifest(&mut store, initial_state, &updated)
+        .expect("persist sparse changes");
+
+    let mut streamed = Vec::new();
+    let count = visit_persisted_table_int64_column(&store, updated_state, 2, |row_id, value| {
+        streamed.push((row_id, value));
+        Ok(())
+    })
+    .expect("stream persisted table");
+
+    assert_eq!(count, 95);
+    assert_eq!(streamed.len(), 95);
+    assert_eq!(
+        streamed.iter().find(|(row_id, _)| *row_id == 1),
+        Some(&(1, Some(777)))
+    );
+    assert!(!streamed.iter().any(|(row_id, _)| *row_id == 2));
+    assert_eq!(
+        streamed.iter().find(|(row_id, _)| *row_id == 96),
+        Some(&(96, Some(960)))
+    );
+}
+
+#[test]
+fn streaming_int64_pointer_scan_rejects_row_and_chain_corruption() {
+    let data = TableData::from_rows(vec![StoredRow {
+        row_id: 1,
+        values: vec![Value::Int64(7)],
+    }]);
+    let payload = encode_table_payload(&data).expect("encode table payload");
+    let mut store = InMemoryPageStore::new(64);
+    let pointer =
+        crate::record::overflow::write_overflow(&mut store, &payload, CompressionMode::Never)
+            .expect("write exact payload");
+
+    let declared_too_long = OverflowPointer {
+        logical_len: pointer.logical_len + 1,
+        ..pointer
+    };
+    visit_table_payload_int64_column_from_pointer(
+        &store,
+        declared_too_long,
+        0,
+        None,
+        &mut |_, _| Ok(()),
+    )
+    .expect_err("short overflow chain should be rejected");
+
+    let mut payload_with_extra_byte = payload.clone();
+    payload_with_extra_byte.push(0);
+    let physical_too_long = crate::record::overflow::write_overflow(
+        &mut store,
+        &payload_with_extra_byte,
+        CompressionMode::Never,
+    )
+    .expect("write overlong physical payload");
+    let declared_without_extra = OverflowPointer {
+        logical_len: u32::try_from(payload.len()).expect("payload length"),
+        ..physical_too_long
+    };
+    visit_table_payload_int64_column_from_pointer(
+        &store,
+        declared_without_extra,
+        0,
+        None,
+        &mut |_, _| Ok(()),
+    )
+    .expect_err("overlong overflow chain should be rejected");
+
+    let row_len_offset = TABLE_PAYLOAD_MAGIC.len() + 4 + 8;
+    let mut truncated_row = payload.clone();
+    truncated_row[row_len_offset..row_len_offset + 4].copy_from_slice(&1_u32.to_le_bytes());
+    let truncated_row_pointer =
+        crate::record::overflow::write_overflow(&mut store, &truncated_row, CompressionMode::Never)
+            .expect("write truncated row declaration");
+    visit_table_payload_int64_column_from_pointer(
+        &store,
+        truncated_row_pointer,
+        0,
+        None,
+        &mut |_, _| Ok(()),
+    )
+    .expect_err("row-local truncation should be rejected");
+
+    visit_table_payload_int64_column_from_pointer(&store, pointer, 1, None, &mut |_, _| Ok(()))
+        .expect_err("column index beyond the encoded field count should be rejected");
+
+    let mut trailing_int_payload = payload.clone();
+    let row_body_offset = row_len_offset + 4;
+    assert_eq!(trailing_int_payload[row_body_offset], 1, "one field");
+    assert_eq!(trailing_int_payload[row_body_offset + 1], 1, "INT64 tag");
+    trailing_int_payload[row_body_offset + 2] = 2;
+    let trailing_pointer = crate::record::overflow::write_overflow(
+        &mut store,
+        &trailing_int_payload,
+        CompressionMode::Never,
+    )
+    .expect("write trailing INT64 payload");
+    visit_table_payload_int64_column_from_pointer(
+        &store,
+        trailing_pointer,
+        0,
+        None,
+        &mut |_, _| Ok(()),
+    )
+    .expect_err("INT64 payload trailing bytes should be rejected");
+
+    let mut internally_tombstoned = payload;
+    let raw_len = u32::from_le_bytes(
+        internally_tombstoned[row_len_offset..row_len_offset + 4]
+            .try_into()
+            .expect("row length bytes"),
+    );
+    internally_tombstoned[row_len_offset..row_len_offset + 4]
+        .copy_from_slice(&(raw_len | TABLE_PAYLOAD_ROW_TOMBSTONE_FLAG).to_le_bytes());
+    let tombstoned_pointer = crate::record::overflow::write_overflow(
+        &mut store,
+        &internally_tombstoned,
+        CompressionMode::Never,
+    )
+    .expect("write internally tombstoned payload");
+    let mut visited = Vec::new();
+    let count = visit_table_payload_int64_column_from_pointer(
+        &store,
+        tombstoned_pointer,
+        0,
+        None,
+        &mut |row_id, value| {
+            visited.push((row_id, value));
+            Ok(())
+        },
+    )
+    .expect("skip internal tombstone");
+    assert_eq!(count, 0);
+    assert!(visited.is_empty());
+
+    let mut zero_progress_store = InMemoryPageStore::new(64);
+    let zero_progress_page = zero_progress_store
+        .allocate_page()
+        .expect("allocate malicious overflow page");
+    let mut zero_progress_bytes = vec![0_u8; 64];
+    zero_progress_bytes[..4].copy_from_slice(&zero_progress_page.to_le_bytes());
+    zero_progress_store
+        .write_page(zero_progress_page, &zero_progress_bytes)
+        .expect("write malicious zero-progress page");
+    visit_table_payload_int64_column_from_pointer(
+        &zero_progress_store,
+        OverflowPointer {
+            head_page_id: zero_progress_page,
+            logical_len: 12,
+            flags: 0,
+        },
+        0,
+        None,
+        &mut |_, _| Ok(()),
+    )
+    .expect_err("zero-length self-looping overflow chunk should be rejected");
+}
+
+#[test]
 fn persist_paged_table_writes_multi_chunk_manifest() {
     let body = "x".repeat(2048);
     let data = TableData::from_rows(
@@ -4238,6 +4835,314 @@ fn sparse_paged_row_changes_do_not_decode_untouched_chunks() {
         &updated.chunks[corrupt_chunk].payload,
         &corrupted_manifest.chunks[corrupt_chunk].payload
     ));
+}
+
+#[test]
+fn contiguous_paged_rows_use_compact_dense_directory_and_deferred_cache() {
+    let body = "x".repeat(2048);
+    let rows = (10_i64..=105_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(manifest.chunks.len() > 2, "expected multiple chunks");
+    assert!(manifest.rows.is_dense());
+    assert_eq!(std::mem::size_of::<super::RowLocatorV1>(), 8);
+    assert!(
+        manifest.rows.approximate_heap_bytes()
+            <= rows.len() * 8 + manifest.chunks.len() * std::mem::size_of::<usize>(),
+        "dense directory should use one eight-byte locator per row plus chunk ends"
+    );
+    assert_eq!(manifest.row_ids_in_range(8, 12), vec![10, 11, 12]);
+    assert_eq!(manifest.row_ids_in_range(103, 110), vec![103, 104, 105]);
+    for row_id in [10_i64, 58, 105] {
+        let row = manifest
+            .row_by_id(row_id)
+            .expect("lookup row")
+            .expect("row should exist");
+        assert_eq!(row.row_id(), row_id);
+        assert_eq!(row.values()[0], Value::Int64(row_id));
+    }
+    let full_row = manifest
+        .full_query_row_by_id(58)
+        .expect("decode full query row")
+        .expect("full query row should exist");
+    assert_eq!(full_row.values(), rows[48].values.as_slice());
+    assert!(manifest.row_by_id(9).expect("lookup miss").is_none());
+    assert!(manifest.row_by_id(106).expect("lookup miss").is_none());
+    assert!(manifest
+        .full_query_row_by_id(106)
+        .expect("full query row miss")
+        .is_none());
+
+    let state = PersistedTableState {
+        pointer: OverflowPointer {
+            head_page_id: 42,
+            logical_len: 128,
+            flags: 0,
+        },
+        checksum: 77,
+        row_count: rows.len(),
+        ..PersistedTableState::default()
+    };
+    let cache = super::build_deferred_paged_row_locator_cache(state, &manifest.chunks)
+        .expect("build deferred cache");
+    assert!(cache.locators.is_dense());
+    assert_eq!(cache.locators.sparse_len(), 0);
+    assert_eq!(cache.min_row_id(), Some(10));
+    for row_id in [10_i64, 58, 105] {
+        let cached = cache.locators.get(row_id).expect("cached locator");
+        let (_, entry) = manifest
+            .rows
+            .entry_for_row_id(row_id)
+            .expect("lookup directory")
+            .expect("directory entry");
+        assert_eq!(cached.locator, entry.locator);
+        assert_eq!(
+            cached.checksum,
+            manifest.chunks[entry.chunk_index as usize].checksum
+        );
+    }
+    assert!(cache.locators.get(9).is_none());
+    assert!(cache.locators.get(106).is_none());
+    assert!(cache.matches_state(state));
+    assert!(!cache.matches_state(PersistedTableState {
+        checksum: state.checksum.wrapping_add(1),
+        ..state
+    }));
+}
+
+#[test]
+fn dense_paged_row_directory_grows_locators_amortized() {
+    let mut directory = super::DensePagedRowDirectory::empty(1).expect("empty dense directory");
+    let locator = super::RowLocatorV1 {
+        byte_offset: 12,
+        byte_len: 7,
+    };
+    let row_count = 16_385_usize;
+    let mut capacity_growths = 0_usize;
+    let mut previous_capacity = directory.locators.capacity();
+
+    for offset in 0..row_count {
+        assert!(directory
+            .try_append(offset as i64 + 1, 0, false, locator)
+            .expect("append dense locator"));
+        if directory.locators.capacity() != previous_capacity {
+            capacity_growths += 1;
+            previous_capacity = directory.locators.capacity();
+        }
+    }
+    assert_eq!(directory.locators.len(), row_count);
+    assert!(
+        capacity_growths <= usize::BITS as usize,
+        "amortized growth should require logarithmically many allocations"
+    );
+    assert!(directory.locators.capacity() < row_count.saturating_mul(2));
+    assert_eq!(
+        directory
+            .entry_at(row_count - 1)
+            .expect("lookup appended locator")
+            .expect("appended directory entry")
+            .row_id,
+        row_count as i64
+    );
+}
+
+#[test]
+fn prepared_paged_append_consumes_one_plan_without_replanning() {
+    let mut manifest = TablePageManifest::from_rows(
+        &[StoredRow {
+            row_id: 1,
+            values: vec![Value::Int64(1), Value::Text("one".to_string())],
+        }],
+        PAGE_SIZE,
+    )
+    .expect("build manifest");
+    let appended = StoredRow {
+        row_id: 2,
+        values: vec![Value::Int64(2), Value::Text("two".to_string())],
+    };
+    let mut encoded_values = Vec::new();
+
+    super::reset_paged_row_append_plan_count();
+    let prepared = manifest
+        .try_prepare_append_row_with_scratch(&appended, PAGE_SIZE, &mut encoded_values)
+        .expect("prepare append");
+    assert_eq!(super::paged_row_append_plan_count(), 1);
+    manifest
+        .append_prepared_row_with_scratch(&appended, PAGE_SIZE, &encoded_values, prepared)
+        .expect("consume prepared append");
+
+    assert_eq!(super::paged_row_append_plan_count(), 1);
+    assert_eq!(
+        manifest
+            .row_by_id(2)
+            .expect("read appended row")
+            .expect("appended row")
+            .values(),
+        appended.values.as_slice()
+    );
+}
+
+#[test]
+fn paged_manifest_heap_estimate_includes_overlay_and_chunk_metadata() {
+    let rows = (1_i64..=8_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text("base".repeat(32))],
+        })
+        .collect::<Vec<_>>();
+    let mut manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks.reserve(3);
+    let mut overlay_payload = Vec::with_capacity(1024 * 1024 + 257);
+    overlay_payload.extend_from_slice(b"overlay");
+    chunks[0].overlay_payload = Some(Arc::new(overlay_payload));
+    chunks[0].tombstoned_row_ids = Arc::new(BTreeSet::from([2_i64, 4_i64]));
+    manifest.chunks = Arc::new(chunks);
+    manifest.tombstoned_row_ids = Arc::new(BTreeSet::from([2_i64, 4_i64]));
+
+    let expected_bytes = manifest
+        .chunks
+        .capacity()
+        .saturating_mul(std::mem::size_of::<TablePageManifestChunk>())
+        .saturating_add(manifest.chunks.iter().fold(0usize, |bytes, chunk| {
+            bytes
+                .saturating_add(chunk.payload.capacity())
+                .saturating_add(
+                    chunk
+                        .overlay_payload
+                        .as_ref()
+                        .map_or(0, |payload| payload.capacity()),
+                )
+                .saturating_add(
+                    chunk
+                        .tombstoned_row_ids
+                        .len()
+                        .saturating_mul(std::mem::size_of::<i64>()),
+                )
+        }))
+        .saturating_add(
+            manifest
+                .tombstoned_row_ids
+                .len()
+                .saturating_mul(std::mem::size_of::<i64>()),
+        )
+        .saturating_add(manifest.rows.approximate_heap_bytes());
+
+    assert_eq!(manifest.approximate_heap_bytes(), expected_bytes);
+    assert!(manifest.approximate_heap_bytes() >= 1024 * 1024);
+}
+
+#[test]
+fn paged_row_locator_bounds_fail_as_corruption_without_panicking() {
+    let error = TablePageManifest::row_bytes_from_locator(
+        &[0_u8; 16],
+        super::RowLocatorV1 {
+            byte_offset: u32::MAX,
+            byte_len: u32::MAX,
+        },
+    )
+    .expect_err("oversized locator should fail");
+    assert!(matches!(error, crate::DbError::Corruption { .. }));
+}
+
+#[test]
+fn gapped_and_out_of_order_paged_rows_use_sparse_directories() {
+    for row_ids in [vec![10_i64, 11, 13], vec![10_i64, 12, 11]] {
+        let rows = row_ids
+            .iter()
+            .map(|row_id| StoredRow {
+                row_id: *row_id,
+                values: vec![Value::Int64(*row_id)],
+            })
+            .collect::<Vec<_>>();
+        let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+        assert!(!manifest.rows.is_dense());
+        for row_id in row_ids {
+            assert!(manifest
+                .row_by_id(row_id)
+                .expect("lookup sparse row")
+                .is_some());
+        }
+        let cache = super::build_deferred_paged_row_locator_cache(
+            PersistedTableState::default(),
+            &manifest.chunks,
+        )
+        .expect("build sparse deferred cache");
+        assert!(!cache.locators.is_dense());
+        assert_eq!(cache.locators.sparse_len(), rows.len());
+    }
+}
+
+#[test]
+fn paged_update_and_delete_fall_back_to_sparse_directories_and_locators() {
+    let rows = (1_i64..=12_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(format!("row-{row_id}"))],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(manifest.rows.is_dense());
+
+    let mut changes = BTreeMap::new();
+    changes.insert(
+        6,
+        Some(vec![Value::Int64(6), Value::Text("updated".to_string())]),
+    );
+    let mut updated = apply_paged_row_changes_to_manifest(&manifest, &changes).expect("update");
+    assert!(!updated.rows.is_dense());
+    assert_eq!(
+        updated
+            .row_by_id(6)
+            .expect("lookup updated row")
+            .expect("updated row")
+            .values()[1],
+        Value::Text("updated".to_string())
+    );
+    for (chunk_index, chunk) in Arc::make_mut(&mut updated.chunks).iter_mut().enumerate() {
+        chunk.pointer = OverflowPointer {
+            head_page_id: 100 + u32::try_from(chunk_index).expect("chunk index"),
+            logical_len: u32::try_from(chunk.payload.len()).expect("base payload length"),
+            flags: 0,
+        };
+        if let Some(overlay_payload) = &chunk.overlay_payload {
+            chunk.overlay_pointer = Some(OverflowPointer {
+                head_page_id: 200 + u32::try_from(chunk_index).expect("chunk index"),
+                logical_len: u32::try_from(overlay_payload.len()).expect("overlay payload length"),
+                flags: 0,
+            });
+            chunk.overlay_checksum = Some(crc32c_parts(&[overlay_payload.as_slice()]));
+        }
+    }
+    let update_cache = super::build_deferred_paged_row_locator_cache(
+        PersistedTableState::default(),
+        &updated.chunks,
+    )
+    .expect("build update cache");
+    assert!(!update_cache.locators.is_dense());
+    assert_eq!(update_cache.locators.sparse_len(), rows.len());
+    let updated_locator = update_cache.locators.get(6).expect("updated locator");
+    assert!(updated.chunks.iter().any(|chunk| {
+        chunk.overlay_pointer == Some(updated_locator.pointer)
+            && chunk.overlay_checksum == Some(updated_locator.checksum)
+    }));
+
+    let deleted_ids = [6_i64].into_iter().collect::<BTreeSet<_>>();
+    let deleted = apply_paged_row_deletions_to_manifest(&manifest, &deleted_ids).expect("delete");
+    assert!(!deleted.rows.is_dense());
+    assert!(deleted.row_by_id(6).expect("lookup deleted row").is_none());
+    let delete_cache = super::build_deferred_paged_row_locator_cache(
+        PersistedTableState::default(),
+        &deleted.chunks,
+    )
+    .expect("build delete cache");
+    assert!(!delete_cache.locators.is_dense());
+    assert_eq!(delete_cache.locators.sparse_len(), rows.len() - 1);
+    assert!(delete_cache.locators.get(6).is_none());
 }
 
 #[test]
@@ -4581,7 +5486,12 @@ fn persist_to_db_resident_paged_row_updates_preserves_untouched_chunk_pointers()
         initial_manifest.chunks.len() > 2,
         "expected multiple chunks to observe pointer preservation"
     );
-    let changed_chunk_index = initial_page_manifest.rows[5].chunk_index as usize;
+    let changed_chunk_index = initial_page_manifest
+        .rows
+        .entry_at(5)
+        .expect("read initial page entry")
+        .expect("initial page entry")
+        .chunk_index as usize;
     let untouched_pointers = initial_manifest
         .chunks
         .iter()
@@ -4686,7 +5596,12 @@ fn persist_to_db_paged_row_delete_succeeds_after_materialized_snapshot() {
         initial_manifest.chunks.len() > 2,
         "expected multiple chunks to observe pointer preservation"
     );
-    let changed_chunk_index = initial_page_manifest.rows[5].chunk_index as usize;
+    let changed_chunk_index = initial_page_manifest
+        .rows
+        .entry_at(5)
+        .expect("read initial page entry")
+        .expect("initial page entry")
+        .chunk_index as usize;
     let untouched_pointers = initial_manifest
         .chunks
         .iter()
@@ -5614,6 +6529,89 @@ fn execute_sql(runtime: &mut EngineRuntime, sql: &str) {
         .expect("execute SQL");
 }
 
+fn indexed_join_grouped_count_runtime(child_counts: &[i64]) -> EngineRuntime {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE parents (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE children (id INT64 PRIMARY KEY, parent_id INT64 NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_children_parent ON children (parent_id)",
+    );
+
+    let mut child_id = 1_i64;
+    for (index, child_count) in child_counts.iter().copied().enumerate() {
+        let parent_id = i64::try_from(index + 1).expect("test parent id fits INT64");
+        execute_sql(
+            &mut runtime,
+            &format!("INSERT INTO parents VALUES ({parent_id}, 'parent_{parent_id}')"),
+        );
+        for _ in 0..child_count {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO children VALUES ({child_id}, {parent_id})"),
+            );
+            child_id += 1;
+        }
+    }
+    runtime
+}
+
+fn indexed_join_grouped_count_fast_and_generic(
+    runtime: &EngineRuntime,
+    sql: &str,
+    expected_scalar_top_n_limit: Option<usize>,
+) -> QueryResult {
+    let statement = parse_sql_statement(sql).expect("parse grouped count SQL");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected grouped count query");
+    };
+
+    let plan = runtime
+        .analyze_indexed_join_grouped_count_query(query, &[])
+        .expect("analyze indexed grouped count")
+        .expect("query should match indexed grouped count path");
+    assert_eq!(
+        plan.scalar_count_top_n_limit(),
+        expected_scalar_top_n_limit,
+        "unexpected scalar count top-N gate for {sql}"
+    );
+
+    let generic = super::dataset_to_result(
+        runtime
+            .evaluate_query(query, &[], &BTreeMap::new())
+            .expect("generic grouped count executor"),
+    );
+    let fast = runtime
+        .try_execute_indexed_join_grouped_count_query(query, &[])
+        .expect("indexed grouped count execution")
+        .expect("query should use indexed grouped count path");
+
+    assert_eq!(
+        fast.columns(),
+        generic.columns(),
+        "column mismatch for {sql}"
+    );
+    assert_eq!(
+        fast.rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        generic
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        "row mismatch for {sql}"
+    );
+    fast
+}
+
 fn paged_row_source(rows: Vec<StoredRow>) -> TableRowSource {
     let payload = encode_table_payload(&TableData::from_rows(rows.clone()))
         .expect("encode paged test payload");
@@ -6213,6 +7211,87 @@ fn indexed_join_top10_like_shape_with_album_table_path() {
             .collect::<Vec<_>>(),
         expected
     );
+}
+
+#[test]
+fn indexed_join_grouped_count_scalar_top_n_matches_generic_above_limit() {
+    let runtime = indexed_join_grouped_count_runtime(&[2, 8, 4, 7, 3, 6]);
+    let result = indexed_join_grouped_count_fast_and_generic(
+        &runtime,
+        "SELECT p.id, p.name, COUNT(c.id) AS child_count \
+         FROM parents p JOIN children c ON c.parent_id = p.id \
+         GROUP BY p.id, p.name ORDER BY child_count DESC LIMIT 3",
+        Some(3),
+    );
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(2), Value::Int64(4), Value::Int64(6)]
+    );
+}
+
+#[test]
+fn indexed_join_grouped_count_scalar_top_n_preserves_cutoff_ties() {
+    let runtime = indexed_join_grouped_count_runtime(&[5, 4, 4, 4, 3]);
+    let result = indexed_join_grouped_count_fast_and_generic(
+        &runtime,
+        "SELECT p.id, p.name, COUNT(c.id) AS child_count \
+         FROM parents p JOIN children c ON c.parent_id = p.id \
+         GROUP BY p.id, p.name ORDER BY child_count DESC LIMIT 2",
+        Some(2),
+    );
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(1), Value::Int64(2)],
+        "a count tied with the cutoff must not displace the earlier candidate"
+    );
+}
+
+#[test]
+fn indexed_join_grouped_count_scalar_top_n_handles_limit_zero() {
+    let runtime = indexed_join_grouped_count_runtime(&[3, 2, 1]);
+    let result = indexed_join_grouped_count_fast_and_generic(
+        &runtime,
+        "SELECT p.id, p.name, COUNT(c.id) AS child_count \
+         FROM parents p JOIN children c ON c.parent_id = p.id \
+         GROUP BY p.id, p.name ORDER BY child_count DESC LIMIT 0",
+        Some(0),
+    );
+
+    assert!(result.rows().is_empty());
+}
+
+#[test]
+fn indexed_join_grouped_count_scalar_top_n_rejects_other_order_shapes() {
+    let runtime = indexed_join_grouped_count_runtime(&[5, 4, 4, 2]);
+    for sql in [
+        "SELECT p.id, p.name, COUNT(c.id) AS child_count \
+         FROM parents p JOIN children c ON c.parent_id = p.id \
+         GROUP BY p.id, p.name ORDER BY child_count ASC LIMIT 2",
+        "SELECT p.id, p.name, COUNT(c.id) AS child_count \
+         FROM parents p JOIN children c ON c.parent_id = p.id \
+         GROUP BY p.id, p.name ORDER BY child_count DESC, p.id ASC LIMIT 2",
+        "SELECT p.id, p.name, COUNT(c.id) AS child_count \
+         FROM parents p JOIN children c ON c.parent_id = p.id \
+         GROUP BY p.id, p.name ORDER BY child_count COLLATE NOCASE DESC LIMIT 2",
+        "SELECT p.id, p.name, COUNT(c.id) AS child_count \
+         FROM parents p JOIN children c ON c.parent_id = p.id \
+         GROUP BY p.id, p.name ORDER BY child_count DESC LIMIT 2 OFFSET 1",
+        "SELECT p.id, p.name, COUNT(c.id) AS child_count \
+         FROM parents p JOIN children c ON c.parent_id = p.id \
+         GROUP BY p.id, p.name ORDER BY child_count DESC",
+    ] {
+        indexed_join_grouped_count_fast_and_generic(&runtime, sql, None);
+    }
 }
 
 #[test]
@@ -7006,6 +8085,15 @@ fn view_filter_pushdown_can_prefilter_rowid_alias_join_chain() {
     );
     execute_sql(
         &mut runtime,
+        "CREATE VIEW artist_songs AS
+         SELECT a.id AS artist_id, a.name AS artist_name,
+                al.title AS album_title, s.title AS song_title
+         FROM artists a
+         JOIN albums al ON al.artist_id = a.id
+         JOIN songs s ON s.album_id = al.id",
+    );
+    execute_sql(
+        &mut runtime,
         "INSERT INTO artists (id, name) VALUES (1, 'a')",
     );
     execute_sql(
@@ -7058,6 +8146,82 @@ fn view_filter_pushdown_can_prefilter_rowid_alias_join_chain() {
         .rows
         .iter()
         .all(|row| row.first() == Some(&Value::Int64(1))));
+
+    let result = runtime
+        .try_execute_resident_simple_row_id_projection(
+            "artist_songs",
+            &["album_title", "song_title"],
+            "artist_id",
+            1,
+        )
+        .expect("execute resident view projection")
+        .expect("fully resident indexed view should use the observed-current path");
+    assert_eq!(
+        result.columns(),
+        &["album_title".to_string(), "song_title".to_string()]
+    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("a1".to_string()), Value::Text("s1".to_string())]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Text("a1".to_string()), Value::Text("s2".to_string())]
+    );
+
+    redefer_runtime_table_with_verified_payload_for_test(&mut runtime, "artists", 100, 200);
+    redefer_runtime_table_with_verified_payload_for_test(&mut runtime, "albums", 300, 400);
+    redefer_runtime_table_with_verified_payload_for_test(&mut runtime, "songs", 500, 600);
+
+    runtime.dirty_tables_mut().insert("artists".to_string());
+    assert!(runtime
+        .try_execute_resident_simple_row_id_projection("artists", &["id", "name"], "id", 1)
+        .expect("reject stale table cache")
+        .is_none());
+    assert!(runtime
+        .try_execute_resident_simple_row_id_projection(
+            "artist_songs",
+            &["album_title", "song_title"],
+            "artist_id",
+            1,
+        )
+        .expect("reject view cache with dirty base table")
+        .is_none());
+    runtime.dirty_tables_mut().remove("artists");
+
+    let artist = runtime
+        .try_execute_resident_simple_row_id_projection("artists", &["id", "name"], "id", 1)
+        .expect("execute observed-current cached table projection")
+        .expect("verified deferred payload should answer row-id lookup");
+    assert_eq!(
+        artist.rows()[0].values(),
+        &[Value::Int64(1), Value::Text("a".to_string())]
+    );
+
+    let cached_view = runtime
+        .try_execute_resident_simple_row_id_projection(
+            "artist_songs",
+            &["album_title", "song_title"],
+            "artist_id",
+            1,
+        )
+        .expect("execute observed-current cached view projection")
+        .expect("verified deferred payloads should answer indexed view lookup");
+    assert_eq!(cached_view.rows(), result.rows());
+
+    runtime
+        .deferred_paged_row_locator_caches_mut()
+        .remove("songs");
+    assert!(runtime
+        .try_execute_resident_simple_row_id_projection(
+            "artist_songs",
+            &["album_title", "song_title"],
+            "artist_id",
+            1,
+        )
+        .expect("fall back when a view source has no verified cache")
+        .is_none());
 }
 
 #[test]

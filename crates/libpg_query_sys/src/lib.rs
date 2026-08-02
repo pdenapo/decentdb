@@ -36,13 +36,20 @@ impl std::error::Error for ParserError {}
 
 /// Parses a single SQL statement into the libpg_query protobuf tree.
 pub fn parse_statement(sql: &str) -> Result<protobuf::ParseResult> {
-    let parsed = pg_query::parse(sql).map_err(|error| ParserError::new(error.to_string()))?;
-    if parsed.protobuf.stmts.len() != 1 {
+    let parsed = parse_statements(sql)?;
+    if parsed.stmts.len() != 1 {
         return Err(ParserError::new(
             "expected exactly one SQL statement after parser split",
         ));
     }
-    Ok(parsed.protobuf)
+    Ok(parsed)
+}
+
+/// Parses one or more SQL statements into the libpg_query protobuf tree.
+pub fn parse_statements(sql: &str) -> Result<protobuf::ParseResult> {
+    pg_query::parse(sql)
+        .map(|parsed| parsed.protobuf)
+        .map_err(|error| ParserError::new(error.to_string()))
 }
 
 /// Splits a SQL batch into individual statements using the parser.

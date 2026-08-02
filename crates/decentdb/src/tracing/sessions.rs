@@ -146,4 +146,34 @@ impl RecentSessionBuffer {
     pub(crate) fn reset(&mut self) {
         self.sessions.clear();
     }
+
+    #[cfg(test)]
+    pub(crate) fn allocated_capacity(&self) -> usize {
+        self.sessions.capacity()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_capacity_buffer_does_not_allocate_or_retain_sessions() {
+        let mut sessions = RecentSessionBuffer::with_capacity(0);
+        assert_eq!(sessions.allocated_capacity(), 0);
+        sessions.push(SessionSnapshot {
+            session_id: 1,
+            connection_id: 1,
+            database_id_hash: "hash".to_string(),
+            opened_at_unix_ms: 0,
+            closed_at_unix_ms: Some(1),
+            state: SessionState::Closed,
+            binding: None,
+            tracing_enabled: false,
+            slow_query_threshold_us: None,
+            internal: false,
+        });
+        assert!(sessions.snapshot().is_empty());
+        assert_eq!(sessions.allocated_capacity(), 0);
+    }
 }

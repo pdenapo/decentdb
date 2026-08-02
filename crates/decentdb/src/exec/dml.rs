@@ -9,7 +9,7 @@ use crate::catalog::{
     TableSchema, TriggerEvent,
 };
 use crate::error::{DbError, Result};
-use crate::record::key::encode_index_key;
+use crate::record::key::{encode_index_key, encode_runtime_index_key, RuntimeEncodedKey};
 use crate::record::row::Row;
 use crate::record::value::Value;
 use crate::sql::ast::{
@@ -25,10 +25,25 @@ use super::{
     compare_values, compute_index_key, compute_index_values, covering_payload_values_for_row,
     generated_columns_are_stored, infer_expr_name, plain_single_text_index_column_position,
     row_satisfies_index_predicate, row_satisfies_index_predicate_with_expr,
-    spatial_index_value_for_row, table_row_dataset, EngineRuntime, RuntimeBtreeKey,
-    RuntimeBtreeKeys, RuntimeIndex, RuntimeRowIdSet, StoredRow, TablePageManifest, TableRowRef,
-    TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
+    spatial_index_value_for_row, table_row_dataset, EngineRuntime, PreparedTablePageAppend,
+    RuntimeBtreeKey, RuntimeBtreeKeys, RuntimeIndex, RuntimeRowIdSet, StoredRow, TablePageManifest,
+    TableRowRef, TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
 };
+
+#[cfg(test)]
+thread_local! {
+    static PREPARED_UNCONDITIONAL_INDEX_FAST_PATH_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_prepared_unconditional_index_fast_path_count() {
+    PREPARED_UNCONDITIONAL_INDEX_FAST_PATH_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_unconditional_index_fast_path_count() -> u64 {
+    PREPARED_UNCONDITIONAL_INDEX_FAST_PATH_COUNT.with(std::cell::Cell::get)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum PreparedInsertValueSource {
@@ -112,17 +127,18 @@ pub(crate) struct PreparedSimpleInsert {
     pub(crate) compiled_index_state_epoch: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PreparedInsertApplyMode {
+struct PreparedInsertApplyOptions<'a> {
     preserve_stored_row: bool,
     update_catalog_next_row_id: bool,
+    paged_append_scratch: Option<&'a mut Vec<u8>>,
 }
 
-impl PreparedInsertApplyMode {
+impl<'a> PreparedInsertApplyOptions<'a> {
     const fn update_catalog(preserve_stored_row: bool) -> Self {
         Self {
             preserve_stored_row,
             update_catalog_next_row_id: true,
+            paged_append_scratch: None,
         }
     }
 
@@ -130,8 +146,24 @@ impl PreparedInsertApplyMode {
         Self {
             preserve_stored_row: false,
             update_catalog_next_row_id: false,
+            paged_append_scratch: None,
         }
     }
+
+    fn caller_tracks_next_row_id_reusing(encoded_values: &'a mut Vec<u8>) -> Self {
+        Self {
+            preserve_stored_row: false,
+            update_catalog_next_row_id: false,
+            paged_append_scratch: Some(encoded_values),
+        }
+    }
+}
+
+struct PreparedInsertApplyOutcome {
+    affected_rows: u64,
+    preserved_stored_row: Option<StoredRow>,
+    next_row_id: i64,
+    reusable_candidate: Option<Vec<Value>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2019,6 +2051,44 @@ impl EngineRuntime {
         cached_next_row_id: &mut i64,
         page_size: u32,
     ) -> Result<u64> {
+        self.execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id_mode(
+            prepared,
+            params,
+            candidate,
+            cached_next_row_id,
+            page_size,
+            None,
+        )
+    }
+
+    pub(crate) fn execute_prepared_simple_insert_positional_params_in_place_with_reusable_buffers(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        params: &mut [Value],
+        candidate: &mut Vec<Value>,
+        encoded_values: &mut Vec<u8>,
+        cached_next_row_id: &mut i64,
+        page_size: u32,
+    ) -> Result<u64> {
+        self.execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id_mode(
+            prepared,
+            params,
+            candidate,
+            cached_next_row_id,
+            page_size,
+            Some(encoded_values),
+        )
+    }
+
+    fn execute_prepared_simple_insert_positional_params_in_place_with_cached_next_row_id_mode(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        params: &mut [Value],
+        candidate: &mut Vec<Value>,
+        cached_next_row_id: &mut i64,
+        page_size: u32,
+        encoded_values: Option<&mut Vec<u8>>,
+    ) -> Result<u64> {
         let table_name = prepared.table_name.as_str();
         let mut next_row_id = *cached_next_row_id;
         candidate.clear();
@@ -2065,17 +2135,23 @@ impl EngineRuntime {
         }
         apply_prepared_generated_columns(self, prepared, candidate, params)?;
 
-        let (affected, _stored_row, new_next_row_id) = self
-            .apply_prepared_simple_insert_candidate_with_next_row_id_mode(
-                prepared,
-                std::mem::take(candidate),
-                next_row_id,
-                params,
-                page_size,
-                PreparedInsertApplyMode::caller_tracks_next_row_id(),
-            )?;
-        *cached_next_row_id = new_next_row_id;
-        Ok(affected)
+        let apply_options = encoded_values.map_or_else(
+            PreparedInsertApplyOptions::caller_tracks_next_row_id,
+            PreparedInsertApplyOptions::caller_tracks_next_row_id_reusing,
+        );
+        let outcome = self.apply_prepared_simple_insert_candidate_with_next_row_id_mode(
+            prepared,
+            std::mem::take(candidate),
+            next_row_id,
+            params,
+            page_size,
+            apply_options,
+        )?;
+        if let Some(reusable_candidate) = outcome.reusable_candidate {
+            *candidate = reusable_candidate;
+        }
+        *cached_next_row_id = outcome.next_row_id;
+        Ok(outcome.affected_rows)
     }
 
     fn apply_prepared_simple_insert_candidate(
@@ -2093,9 +2169,9 @@ impl EngineRuntime {
             next_row_id,
             params,
             page_size,
-            PreparedInsertApplyMode::update_catalog(preserve_stored_row),
+            PreparedInsertApplyOptions::update_catalog(preserve_stored_row),
         )
-        .map(|(affected, stored_row, _next_row_id)| (affected, stored_row))
+        .map(|outcome| (outcome.affected_rows, outcome.preserved_stored_row))
     }
 
     fn apply_prepared_simple_insert_candidate_with_next_row_id_mode(
@@ -2105,9 +2181,16 @@ impl EngineRuntime {
         mut next_row_id: i64,
         params: &[Value],
         page_size: u32,
-        apply_mode: PreparedInsertApplyMode,
-    ) -> Result<(u64, Option<StoredRow>, i64)> {
+        apply_options: PreparedInsertApplyOptions<'_>,
+    ) -> Result<PreparedInsertApplyOutcome> {
         let table_name = prepared.table_name.as_str();
+        let preserve_stored_row = apply_options.preserve_stored_row;
+        let update_catalog_next_row_id = apply_options.update_catalog_next_row_id;
+        let caller_recycles_paged_values = apply_options.paged_append_scratch.is_some();
+        let mut local_paged_append_scratch = Vec::new();
+        let paged_append_scratch = apply_options
+            .paged_append_scratch
+            .unwrap_or(&mut local_paged_append_scratch);
 
         if prepared.use_generic_validation {
             self.validate_row(table_name, &candidate, None, params)?;
@@ -2134,6 +2217,17 @@ impl EngineRuntime {
         } else {
             Vec::new()
         };
+        let paged_append_prepared =
+            if let Some(catalog_table_name) = prepared.catalog_table_name.as_deref() {
+                self.try_prepare_catalog_table_paged_row_append(
+                    catalog_table_name,
+                    &stored_row,
+                    page_size,
+                    paged_append_scratch,
+                )?
+            } else {
+                None
+            };
 
         if !prepared.use_generic_index_updates {
             apply_prepared_insert_index_updates(
@@ -2143,19 +2237,48 @@ impl EngineRuntime {
                 !prepared.use_generic_validation,
             )?;
         }
-        let preserved_stored_row = apply_mode.preserve_stored_row.then(|| stored_row.clone());
-        let update_catalog_next_row_id = apply_mode.update_catalog_next_row_id;
-        if let Some(catalog_table_name) = prepared.catalog_table_name.as_deref() {
+        let preserved_stored_row = preserve_stored_row.then(|| stored_row.clone());
+        let reusable_candidate = if let Some(catalog_table_name) =
+            prepared.catalog_table_name.as_deref()
+        {
             if update_catalog_next_row_id {
                 self.catalog_table_exact_mut(catalog_table_name)
                     .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
                     .next_row_id = next_row_id;
             }
-            self.append_owned_stored_row_to_catalog_table_row_source(
-                catalog_table_name,
-                stored_row,
-                page_size,
-            )?;
+            if let Some(paged_append_prepared) = paged_append_prepared {
+                self.append_prepared_owned_stored_row_to_catalog_paged_row_source(
+                    catalog_table_name,
+                    stored_row,
+                    page_size,
+                    paged_append_scratch,
+                    paged_append_prepared,
+                    caller_recycles_paged_values && !preserve_stored_row,
+                )?
+            } else if !preserve_stored_row {
+                if caller_recycles_paged_values {
+                    self.append_owned_stored_row_to_catalog_table_row_source_recycling_paged(
+                        catalog_table_name,
+                        stored_row,
+                        page_size,
+                        paged_append_scratch,
+                    )?
+                } else {
+                    self.append_owned_stored_row_to_catalog_table_row_source(
+                        catalog_table_name,
+                        stored_row,
+                        page_size,
+                    )?;
+                    None
+                }
+            } else {
+                self.append_owned_stored_row_to_catalog_table_row_source(
+                    catalog_table_name,
+                    stored_row,
+                    page_size,
+                )?;
+                None
+            }
         } else {
             if update_catalog_next_row_id {
                 self.catalog_table_mut(table_name)
@@ -2163,7 +2286,8 @@ impl EngineRuntime {
                     .next_row_id = next_row_id;
             }
             self.append_owned_stored_row_to_table_row_source(table_name, stored_row, page_size)?;
-        }
+            None
+        };
         if prepared.use_generic_index_updates {
             self.apply_insert_index_updates(index_updates)?;
         }
@@ -2172,7 +2296,12 @@ impl EngineRuntime {
         } else {
             self.mark_table_row_appended(table_name);
         }
-        Ok((1, preserved_stored_row, next_row_id))
+        Ok(PreparedInsertApplyOutcome {
+            affected_rows: 1,
+            preserved_stored_row,
+            next_row_id,
+            reusable_candidate,
+        })
     }
 
     fn catalog_table_exact_mut(&mut self, table_name: &str) -> Option<&mut TableSchema> {
@@ -2249,6 +2378,83 @@ impl EngineRuntime {
             TableRowSource::Paged(manifest) => {
                 Arc::make_mut(manifest).append_row(&stored_row, page_size)
             }
+        }
+    }
+
+    fn append_owned_stored_row_to_catalog_table_row_source_recycling_paged(
+        &mut self,
+        table_name: &str,
+        mut stored_row: StoredRow,
+        page_size: u32,
+        encoded_values: &mut Vec<u8>,
+    ) -> Result<Option<Vec<Value>>> {
+        if !matches!(self.tables.get(table_name), Some(TableRowSource::Paged(_))) {
+            self.append_owned_stored_row_to_catalog_table_row_source(
+                table_name, stored_row, page_size,
+            )?;
+            return Ok(None);
+        }
+
+        let Some(row_source) = self.tables_mut().get_mut(table_name) else {
+            return Err(DbError::internal(format!(
+                "table row source for {table_name} is missing"
+            )));
+        };
+        let TableRowSource::Paged(manifest) = row_source else {
+            return Err(DbError::internal(
+                "paged prepared insert target changed row-source representation",
+            ));
+        };
+        Arc::make_mut(manifest).append_row_with_scratch(&stored_row, page_size, encoded_values)?;
+        stored_row.values.clear();
+        Ok(Some(stored_row.values))
+    }
+
+    fn try_prepare_catalog_table_paged_row_append(
+        &mut self,
+        table_name: &str,
+        stored_row: &StoredRow,
+        page_size: u32,
+        encoded_values: &mut Vec<u8>,
+    ) -> Result<Option<PreparedTablePageAppend>> {
+        let Some(row_source) = self.tables_mut().get_mut(table_name) else {
+            return Err(DbError::internal(format!(
+                "table row source for {table_name} is missing"
+            )));
+        };
+        let TableRowSource::Paged(manifest) = row_source else {
+            return Ok(None);
+        };
+        Arc::make_mut(manifest)
+            .try_prepare_append_row_with_scratch(stored_row, page_size, encoded_values)
+            .map(Some)
+    }
+
+    fn append_prepared_owned_stored_row_to_catalog_paged_row_source(
+        &mut self,
+        table_name: &str,
+        mut stored_row: StoredRow,
+        page_size: u32,
+        encoded_values: &[u8],
+        prepared_append: PreparedTablePageAppend,
+        recycle_values: bool,
+    ) -> Result<Option<Vec<Value>>> {
+        let Some(TableRowSource::Paged(manifest)) = self.tables_mut().get_mut(table_name) else {
+            return Err(DbError::internal(
+                "paged prepared insert target changed row-source representation",
+            ));
+        };
+        Arc::make_mut(manifest).append_prepared_row_with_scratch(
+            &stored_row,
+            page_size,
+            encoded_values,
+            prepared_append,
+        )?;
+        if recycle_values {
+            stored_row.values.clear();
+            Ok(Some(stored_row.values))
+        } else {
+            Ok(None)
         }
     }
 
@@ -6266,9 +6472,9 @@ fn validate_prepared_insert(
         let matched_row_ids = if child_values.len() == 1 {
             keys.row_ids_for_value(child_values[0])?
         } else {
-            keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+            keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(RuntimeEncodedKey::from_vec(
                 Row::new(child_values.iter().map(|value| (*value).clone()).collect()).encode()?,
-            ))
+            )))
         };
         if matched_row_ids.is_empty() {
             return Err(DbError::constraint(format!(
@@ -6591,6 +6797,58 @@ fn apply_prepared_insert_index_updates(
     row: &StoredRow,
     check_unique: bool,
 ) -> Result<()> {
+    let unique_tombstone_cleanup_required =
+        prepared.insert_indexes.iter().any(|index| index.unique)
+            && prepared
+                .catalog_table_name
+                .as_deref()
+                .and_then(|table_name| runtime.tables.get(table_name))
+                .is_none_or(|row_source| row_source.has_tombstoned_rows());
+    if !prepared.insert_indexes.is_empty()
+        && prepared
+            .insert_indexes
+            .iter()
+            .all(|index| !index.has_covering_payload && index.predicate_expr.is_none())
+        && !unique_tombstone_cleanup_required
+    {
+        #[cfg(test)]
+        PREPARED_UNCONDITIONAL_INDEX_FAST_PATH_COUNT
+            .with(|count| count.set(count.get().saturating_add(1)));
+        // The common bulk-insert shape has unconditional B-tree indexes and
+        // no tombstones to reconcile. Detach the outer copy-on-write map once
+        // per row, rather than repeating its Arc uniqueness check and map
+        // traversal through `EngineRuntime::index_mut` for every index.
+        // Covering, partial, and tombstone-bearing indexes retain the fully
+        // general path below.
+        let indexes = Arc::make_mut(&mut runtime.indexes);
+        for index in &prepared.insert_indexes {
+            if index.unique && prepared_index_contains_null(index, &row.values) {
+                continue;
+            }
+            let key = prepared_btree_index_key(index, &row.values)?;
+            let Some(super::RuntimeIndex::Btree { keys, covering }) =
+                indexes.get_mut(&index.name).map(Arc::make_mut)
+            else {
+                return Err(DbError::internal(format!(
+                    "runtime index {} is missing",
+                    index.name
+                )));
+            };
+            debug_assert!(covering.is_none());
+            if check_unique && index.unique {
+                if keys.insert_row_id(key, row.row_id).is_err() {
+                    return Err(DbError::constraint(format!(
+                        "unique constraint {} on {} was violated",
+                        index.name, prepared.table_name
+                    )));
+                }
+            } else {
+                keys.insert_row_id(key, row.row_id)?;
+            }
+        }
+        return Ok(());
+    }
+
     let table = if prepared
         .insert_indexes
         .iter()
@@ -6605,13 +6863,6 @@ fn apply_prepared_insert_index_updates(
     } else {
         None
     };
-    let unique_tombstone_cleanup_required =
-        prepared.insert_indexes.iter().any(|index| index.unique)
-            && prepared
-                .catalog_table_name
-                .as_deref()
-                .and_then(|table_name| runtime.tables.get(table_name))
-                .is_none_or(|row_source| row_source.has_tombstoned_rows());
     for index in &prepared.insert_indexes {
         let Some(key) = prepared_btree_index_key_if_row_should_be_indexed(
             runtime,
@@ -6805,7 +7056,7 @@ fn prepared_btree_index_key(index: &PreparedBtreeIndex, row: &[Value]) -> Result
         let value = row
             .get(*column_index)
             .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?;
-        return encode_index_key(value).map(RuntimeBtreeKey::Encoded);
+        return encode_runtime_index_key(value).map(RuntimeBtreeKey::Encoded);
     }
 
     let values = index
@@ -6818,9 +7069,12 @@ fn prepared_btree_index_key(index: &PreparedBtreeIndex, row: &[Value]) -> Result
         })
         .collect::<Result<Vec<_>>>()?;
     if values.len() == 1 {
-        encode_index_key(&values[0]).map(RuntimeBtreeKey::Encoded)
+        encode_runtime_index_key(&values[0]).map(RuntimeBtreeKey::Encoded)
     } else {
-        Row::new(values).encode().map(RuntimeBtreeKey::Encoded)
+        Row::new(values)
+            .encode()
+            .map(RuntimeEncodedKey::from_vec)
+            .map(RuntimeBtreeKey::Encoded)
     }
 }
 
@@ -8113,33 +8367,33 @@ fn single_btree_range_row_ids(
     use std::ops::Bound;
 
     let lower_key = lower
-        .map(|bound| encode_index_key(&bound.value))
+        .map(|bound| encode_runtime_index_key(&bound.value))
         .transpose()?;
     let upper_key = upper
-        .map(|bound| encode_index_key(&bound.value))
+        .map(|bound| encode_runtime_index_key(&bound.value))
         .transpose()?;
-    let lower_bound = match (lower, lower_key.as_ref()) {
-        (Some(bound), Some(key)) if bound.inclusive => Bound::Included(key.clone()),
-        (Some(_), Some(key)) => Bound::Excluded(key.clone()),
+    let lower_bound: Bound<&[u8]> = match (lower, lower_key.as_ref()) {
+        (Some(bound), Some(key)) if bound.inclusive => Bound::Included(key.as_slice()),
+        (Some(_), Some(key)) => Bound::Excluded(key.as_slice()),
         _ => Bound::Unbounded,
     };
-    let upper_bound = match (upper, upper_key.as_ref()) {
-        (Some(bound), Some(key)) if bound.inclusive => Bound::Included(key.clone()),
-        (Some(_), Some(key)) => Bound::Excluded(key.clone()),
+    let upper_bound: Bound<&[u8]> = match (upper, upper_key.as_ref()) {
+        (Some(bound), Some(key)) if bound.inclusive => Bound::Included(key.as_slice()),
+        (Some(_), Some(key)) => Bound::Excluded(key.as_slice()),
         _ => Bound::Unbounded,
     };
 
     let mut row_ids = Vec::new();
     match keys {
         super::RuntimeBtreeKeys::UniqueEncoded(entries, deleted) => {
-            for (_, row_id) in entries.range((lower_bound, upper_bound)) {
+            for (_, row_id) in entries.range::<[u8], _>((lower_bound, upper_bound)) {
                 if !deleted.contains(row_id) {
                     row_ids.push(*row_id);
                 }
             }
         }
         super::RuntimeBtreeKeys::NonUniqueEncoded(entries, deleted) => {
-            for (_, entry_row_ids) in entries.range((lower_bound, upper_bound)) {
+            for (_, entry_row_ids) in entries.range::<[u8], _>((lower_bound, upper_bound)) {
                 row_ids.extend(
                     entry_row_ids
                         .iter()
@@ -8150,19 +8404,19 @@ fn single_btree_range_row_ids(
         }
         super::RuntimeBtreeKeys::UniqueInt64(entries, deleted) => {
             for (key, row_id) in entries.iter() {
-                if deleted.contains(row_id) {
+                if deleted.contains(&row_id) {
                     continue;
                 }
-                if dml_value_position_in_range(&Value::Int64(*key), lower, upper)?
+                if dml_value_position_in_range(&Value::Int64(key), lower, upper)?
                     == DmlRangePosition::Match
                 {
-                    row_ids.push(*row_id);
+                    row_ids.push(row_id);
                 }
             }
         }
         super::RuntimeBtreeKeys::NonUniqueInt64(entries, deleted) => {
             for (key, entry_row_ids) in entries.iter() {
-                if dml_value_position_in_range(&Value::Int64(*key), lower, upper)?
+                if dml_value_position_in_range(&Value::Int64(key), lower, upper)?
                     != DmlRangePosition::Match
                 {
                     continue;
@@ -8170,7 +8424,6 @@ fn single_btree_range_row_ids(
                 row_ids.extend(
                     entry_row_ids
                         .iter()
-                        .copied()
                         .filter(|row_id| !deleted.contains(row_id)),
                 );
             }
@@ -9249,9 +9502,9 @@ fn matching_foreign_key_children_for_parent_rows(
             }
         } else {
             for parent_key in &parent_keys {
-                keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+                keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(RuntimeEncodedKey::from_vec(
                     Row::new(parent_key.clone()).encode()?,
-                ))
+                )))
                 .into_iter()
                 .try_for_each(|row_id| -> Result<()> {
                     let Some(row) = row_source.row_by_id(row_id)? else {
@@ -9388,9 +9641,9 @@ fn prepared_delete_has_referencing_child(
                 keys.row_ids_for_value_set(parent_values[0])?,
             );
         }
-        let row_ids = keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+        let row_ids = keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(RuntimeEncodedKey::from_vec(
             Row::new(parent_values.iter().map(|value| (*value).clone()).collect()).encode()?,
-        ));
+        )));
         return row_ids_have_live_row(runtime, &child.child_table_name, row_ids);
     }
     let Some(row_source) = runtime.visible_table_row_source(&child.child_table_name) else {
@@ -10304,7 +10557,9 @@ fn fk_matching_row_ids_via_index(
     if foreign_key.columns.len() == 1 {
         return keys.row_ids_for_value(&parent_key[0]).map(Some);
     }
-    let key = RuntimeBtreeKey::Encoded(Row::new(parent_key.to_vec()).encode()?);
+    let key = RuntimeBtreeKey::Encoded(RuntimeEncodedKey::from_vec(
+        Row::new(parent_key.to_vec()).encode()?,
+    ));
     Ok(Some(keys.row_ids_for_key(&key)))
 }
 
@@ -11261,7 +11516,7 @@ mod tests {
             prepared_btree_index_key(&index3, &[Value::Text("x".to_string())]).unwrap()
         {
             let expected = encode_index_key(&Value::Text("x".to_string())).unwrap();
-            assert_eq!(bytes, expected);
+            assert_eq!(bytes.as_slice(), expected.as_slice());
         } else {
             panic!("expected encoded key");
         }
@@ -11838,19 +12093,24 @@ mod tests {
             Row::new(vec![Value::Int64(7), Value::Int64(9)])
                 .encode()
                 .expect("encode first composite key"),
-            vec![1],
+            super::super::RuntimeEncodedRowIds::one(1),
         );
         entries.insert(
             Row::new(vec![Value::Int64(8), Value::Int64(10)])
                 .encode()
                 .expect("encode second composite key"),
-            vec![2],
+            super::super::RuntimeEncodedRowIds::one(2),
         );
         runtime.indexes_mut().insert(
             "child_parent_fk_idx".to_string(),
             Arc::new(RuntimeIndex::Btree {
                 keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(
-                    Arc::new(entries),
+                    Arc::new(super::super::RuntimeEncodedPostings::new(
+                        entries
+                            .into_iter()
+                            .map(|(key, row_ids)| (RuntimeEncodedKey::from_vec(key), row_ids))
+                            .collect(),
+                    )),
                     BTreeSet::new(),
                 ),
                 covering: None,
@@ -12016,19 +12276,24 @@ mod tests {
             Row::new(vec![Value::Int64(7), Value::Int64(9)])
                 .encode()
                 .expect("encode matching composite key"),
-            vec![1],
+            super::super::RuntimeEncodedRowIds::one(1),
         );
         entries.insert(
             Row::new(vec![Value::Int64(8), Value::Int64(10)])
                 .encode()
                 .expect("encode non-matching composite key"),
-            vec![2],
+            super::super::RuntimeEncodedRowIds::one(2),
         );
         runtime.indexes_mut().insert(
             "child_parent_fk_idx".to_string(),
             Arc::new(RuntimeIndex::Btree {
                 keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(
-                    Arc::new(entries),
+                    Arc::new(super::super::RuntimeEncodedPostings::new(
+                        entries
+                            .into_iter()
+                            .map(|(key, row_ids)| (RuntimeEncodedKey::from_vec(key), row_ids))
+                            .collect(),
+                    )),
                     BTreeSet::new(),
                 ),
                 covering: None,

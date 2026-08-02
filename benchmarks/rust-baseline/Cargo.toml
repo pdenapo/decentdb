@@ -12,6 +12,7 @@ required-features = ["default"]
 [[bin]]
 name = "memory-probe"
 path = "src/memory_probe.rs"
+required-features = ["extended-suites"]
 
 [[bin]]
 name = "query-probe"
@@ -23,15 +24,21 @@ path = "src/seed_only.rs"
 
 [features]
 default = []
+extended-suites = ["dep:clap"]
+lua-extensions = ["decentdb/lua-extensions"]
+sqlite = ["dep:rusqlite"]
+duckdb = ["dep:duckdb"]
+comparisons = ["sqlite", "duckdb", "extended-suites"]
 
 [dependencies]
-decentdb = { path = "../../crates/decentdb" }
+decentdb = { path = "../../crates/decentdb", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage"], optional = true }
 anyhow = "1"
-rusqlite = "0.31"
-duckdb = { version = "1.0", features = ["bundled"] }
+sha2 = "0.10"
+rusqlite = { version = "0.31", optional = true }
+duckdb = { version = "1.0", features = ["bundled"], optional = true }
 
 [profile.release]
 opt-level = 3
@@ -40,3 +47,11 @@ codegen-units = 1
 debug = false
 panic = "abort"
 strip = "symbols"
+
+# Profiling profile: full release optimizations but with debug symbols and no
+# stripping so flamegraph/samply/perf can resolve symbols. Not used by the
+# canonical benchmark; only for local profiling.
+[profile.prof]
+inherits = "release"
+debug = true
+strip = "none"

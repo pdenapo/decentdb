@@ -1,38 +1,116 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-use crate::catalog::{ColumnSchema, ColumnType, IndexKind, IndexSchema, TableSchema, ViewSchema};
+use crate::catalog::{
+    ColumnSchema, ColumnType, IndexKind, IndexSchema, TableSchema, TableStats, ViewSchema,
+};
 use crate::config::DbConfig;
 use crate::db::SqlTxnSlot;
 use crate::error::{DbError, Result};
 use crate::exec::{
-    decode_paged_table_manifest_payload, EngineRuntime, RuntimeBtreeKeys, RuntimeIndex, TableData,
-    TableRowSource,
+    decode_paged_table_manifest_payload, EngineRuntime, PersistedTableState, RuntimeBtreeKeys,
+    RuntimeIndex, TableData, TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
 };
-use crate::record::overflow::read_overflow;
+use crate::record::overflow::{read_overflow, OverflowPointer, OverflowTailInfo};
 use crate::storage::header::DB_HEADER_SIZE;
 use crate::storage::page::{PageId, PageStore};
 use crate::storage::DatabaseHeader;
 
-use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
+use crate::exec::dml::{
+    prepared_unconditional_index_fast_path_count,
+    reset_prepared_unconditional_index_fast_path_count, PreparedInsertColumn,
+    PreparedInsertValueSource, PreparedSimpleInsert,
+};
 use crate::sql::parser::parse_sql_statement;
 use crate::{BulkLoadOptions, Db, QueuedWriteOptions, Value, WalSyncMode};
 
 use super::{
-    parse_simple_count_star_sql, parse_simple_grouped_count_sql,
-    parse_simple_row_id_projection_sql, parse_simple_row_id_range_projection_sql,
-    simple_single_statement_fast_path_sql, split_sql_batch, PreparedInsertCache, StatementCache,
-    TempSchemaState,
+    explicit_schema_batch_fast_path_count, force_next_bootstrap_sync_spawn_failure,
+    paged_row_source_heap_release_count, parse_simple_count_star_sql,
+    parse_simple_grouped_count_sql, parse_simple_row_id_projection_sql,
+    parse_simple_row_id_range_projection_sql, reset_paged_row_source_heap_release_count,
+    reset_schema_batch_fixed_cost_counters, schema_batch_fixed_cost_counters,
+    should_release_freed_paged_row_source_heap, simple_single_statement_fast_path_sql,
+    split_sql_batch, PreparedInsertCache, StatementCache, TempSchemaState,
+    PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD, RESIDENT_COMMIT_HEAP_RELEASE_THRESHOLD,
 };
 
 #[derive(Debug)]
 struct PagerReadStore<'a> {
     db: &'a Db,
+}
+
+#[test]
+fn paged_row_source_heap_release_threshold_has_exact_boundaries() {
+    assert!(!should_release_freed_paged_row_source_heap(0));
+    assert!(!should_release_freed_paged_row_source_heap(
+        PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD - 1
+    ));
+    assert!(should_release_freed_paged_row_source_heap(
+        PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD
+    ));
+    assert!(should_release_freed_paged_row_source_heap(
+        PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD + 1
+    ));
+}
+
+#[test]
+fn paged_row_source_heap_release_counts_only_threshold_crossings_when_enabled() {
+    let db = Db::open_or_create(
+        ":memory:",
+        DbConfig {
+            paged_row_storage: true,
+            release_freed_memory_after_checkpoint: true,
+            ..DbConfig::default()
+        },
+    )
+    .expect("open paged database");
+    reset_paged_row_source_heap_release_count();
+
+    db.release_freed_heap_after_paged_row_source_drop(0);
+    db.release_freed_heap_after_paged_row_source_drop(PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD - 1);
+    assert_eq!(paged_row_source_heap_release_count(), 0);
+    db.release_freed_heap_after_paged_row_source_drop(PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD);
+    db.release_freed_heap_after_paged_row_source_drop(PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD + 1);
+    assert_eq!(paged_row_source_heap_release_count(), 2);
+    db.release_freed_heap_after_runtime_compaction(RESIDENT_COMMIT_HEAP_RELEASE_THRESHOLD);
+    assert_eq!(paged_row_source_heap_release_count(), 3);
+
+    let non_paged_db = Db::open_or_create(
+        ":memory:",
+        DbConfig {
+            paged_row_storage: false,
+            release_freed_memory_after_checkpoint: true,
+            ..DbConfig::default()
+        },
+    )
+    .expect("open resident database");
+    reset_paged_row_source_heap_release_count();
+    non_paged_db
+        .release_freed_heap_after_paged_row_source_drop(PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD);
+    assert_eq!(paged_row_source_heap_release_count(), 0);
+
+    let release_disabled_db = Db::open_or_create(
+        ":memory:",
+        DbConfig {
+            paged_row_storage: true,
+            release_freed_memory_after_checkpoint: false,
+            ..DbConfig::default()
+        },
+    )
+    .expect("open heap-release-disabled database");
+    reset_paged_row_source_heap_release_count();
+    release_disabled_db
+        .release_freed_heap_after_paged_row_source_drop(PAGED_ROW_SOURCE_HEAP_RELEASE_THRESHOLD);
+    release_disabled_db
+        .release_freed_heap_after_runtime_compaction(RESIDENT_COMMIT_HEAP_RELEASE_THRESHOLD);
+    release_disabled_db.release_freed_heap_if_configured();
+    assert_eq!(paged_row_source_heap_release_count(), 0);
 }
 
 impl PageStore for PagerReadStore<'_> {
@@ -194,6 +272,199 @@ fn runtime_has_stale_indexes_detects_only_missing_or_nonfresh_indexes() {
     runtime.catalog = Arc::new(catalog);
     runtime.indexes = Arc::new(BTreeMap::new());
     assert!(Db::runtime_has_stale_indexes(&runtime));
+}
+
+#[test]
+fn non_pk_unique_int64_runtime_index_falls_back_and_rebuilds_after_checkpoint() {
+    fn assert_runtime_representation(db: &Db, expected_dense: bool) {
+        let runtime = db.inner.engine.read().expect("engine runtime lock");
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index("items_code_uq") else {
+            panic!("unique secondary INT64 index should be loaded");
+        };
+        let RuntimeBtreeKeys::UniqueInt64(entries, _) = keys else {
+            panic!("unique secondary INT64 index should use typed runtime keys");
+        };
+        assert_eq!(entries.is_dense_identity(), expected_dense);
+    }
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("unique-int64-runtime-rebuild.ddb");
+    let config = DbConfig {
+        defer_table_materialization: false,
+        background_checkpoint_worker: false,
+        ..DbConfig::default()
+    };
+
+    {
+        let db = Db::create(&path, config.clone()).expect("create db");
+        db.execute("CREATE TABLE items (id INT64 PRIMARY KEY, code INT64 NOT NULL, label TEXT)")
+            .expect("create table");
+        db.execute("CREATE UNIQUE INDEX items_code_uq ON items(code)")
+            .expect("create unique index");
+
+        db.execute("INSERT INTO items VALUES (1, 1, 'one'), (2, 2, 'two')")
+            .expect("insert dense identity prefix");
+        assert_runtime_representation(&db, true);
+
+        // The missing key/row ID 3 forces the dense identity representation
+        // through its sparse fallback. The following out-of-order row also
+        // proves the secondary index does not assume key == primary row ID.
+        db.execute("INSERT INTO items VALUES (4, 4, 'four')")
+            .expect("insert gapped identity mapping");
+        assert_runtime_representation(&db, false);
+        db.execute("INSERT INTO items VALUES (3, 30, 'three')")
+            .expect("insert out-of-order non-identity mapping");
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT id FROM items WHERE code = 30")
+                    .expect("lookup non-identity mapping")
+            ),
+            3
+        );
+
+        db.execute("INSERT INTO items VALUES (5, 30, 'duplicate')")
+            .expect_err("duplicate secondary key should be rejected");
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM items")
+                    .expect("count rows")
+            ),
+            4
+        );
+
+        db.execute("UPDATE items SET code = 20 WHERE id = 2")
+            .expect("update secondary key");
+        assert!(db
+            .execute("SELECT id FROM items WHERE code = 2")
+            .expect("lookup removed key")
+            .rows()
+            .is_empty());
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT id FROM items WHERE code = 20")
+                    .expect("lookup updated key")
+            ),
+            2
+        );
+
+        db.execute("DELETE FROM items WHERE id = 4")
+            .expect("delete indexed row");
+        db.execute("INSERT INTO items VALUES (6, 4, 'four-again')")
+            .expect("reuse deleted unique key for a different row");
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT id FROM items WHERE code = 4")
+                    .expect("lookup reinserted key")
+            ),
+            6
+        );
+        db.execute("INSERT INTO items VALUES (7, 20, 'duplicate-update')")
+            .expect_err("updated secondary key should remain unique");
+
+        db.checkpoint().expect("checkpoint before reopen");
+    }
+
+    let db = Db::open(&path, config).expect("reopen checkpointed db");
+    assert_runtime_representation(&db, false);
+    for (code, expected_id) in [(1, 1), (4, 6), (20, 2), (30, 3)] {
+        assert_eq!(
+            scalar_i64(
+                &db.execute_with_params(
+                    "SELECT id FROM items WHERE code = $1",
+                    &[Value::Int64(code)],
+                )
+                .expect("lookup rebuilt secondary index")
+            ),
+            expected_id
+        );
+    }
+    assert!(db
+        .execute("SELECT id FROM items WHERE code = 2")
+        .expect("lookup old updated key after reopen")
+        .rows()
+        .is_empty());
+    db.execute("INSERT INTO items VALUES (8, 30, 'duplicate-reopen')")
+        .expect_err("rebuilt secondary index should enforce uniqueness");
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM items")
+                .expect("count rows")
+        ),
+        4
+    );
+}
+
+#[test]
+fn nonunique_int64_runtime_index_rebuilds_dense_after_checkpoint() {
+    fn assert_dense_runtime_index(db: &Db, expected_dense: bool) {
+        let runtime = db.inner.engine.read().expect("engine runtime lock");
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index("events_group_idx") else {
+            panic!("non-unique INT64 index should be loaded");
+        };
+        let RuntimeBtreeKeys::NonUniqueInt64(entries, _) = keys else {
+            panic!("non-unique INT64 index should use typed runtime keys");
+        };
+        assert_eq!(entries.is_dense(), expected_dense);
+    }
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("nonunique-int64-runtime-rebuild.ddb");
+    let config = DbConfig {
+        defer_table_materialization: false,
+        background_checkpoint_worker: false,
+        ..DbConfig::default()
+    };
+
+    {
+        let db = Db::create(&path, config.clone()).expect("create db");
+        db.execute("CREATE TABLE events (id INT64 PRIMARY KEY, group_id INT64 NOT NULL)")
+            .expect("create table");
+        db.execute("CREATE INDEX events_group_idx ON events(group_id)")
+            .expect("create index");
+        db.execute("INSERT INTO events VALUES (1, 10), (2, 10), (3, 11), (4, 11), (5, 11)")
+            .expect("insert grouped rows");
+        assert_dense_runtime_index(&db, true);
+        db.checkpoint().expect("checkpoint before reopen");
+    }
+
+    let db = Db::open(&path, config).expect("reopen checkpointed db");
+    assert_dense_runtime_index(&db, true);
+    let grouped = db
+        .execute("SELECT group_id, COUNT(*) FROM events GROUP BY group_id ORDER BY group_id")
+        .expect("grouped count through rebuilt index");
+    assert_eq!(
+        grouped
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(10), Value::Int64(2)],
+            vec![Value::Int64(11), Value::Int64(3)],
+        ]
+    );
+
+    db.execute("UPDATE events SET group_id = 11 WHERE id = 2")
+        .expect("move row into existing posting");
+    assert_dense_runtime_index(&db, true);
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM events WHERE group_id = 11")
+                .expect("count moved row")
+        ),
+        4
+    );
+
+    db.execute("INSERT INTO events VALUES (6, 10)")
+        .expect("insert into earlier key");
+    assert_dense_runtime_index(&db, false);
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM events WHERE group_id = 10")
+                .expect("count sparse fallback rows")
+        ),
+        2
+    );
 }
 
 #[test]
@@ -369,6 +640,162 @@ fn execute_batch_schema_only_ddl_is_single_commit_and_queryable() {
     assert_eq!(scalar_i64(&count), 2);
 }
 
+fn benchmark_style_schema_batch(suffix: Option<&str>) -> String {
+    const DDL: [&str; 9] = [
+        "CREATE TABLE batch_artists (id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE batch_albums (id INTEGER PRIMARY KEY, artist_id INTEGER, title TEXT)",
+        "CREATE TABLE batch_songs (id INTEGER PRIMARY KEY, album_id INTEGER, artist_id INTEGER, title TEXT)",
+        "CREATE INDEX batch_albums_artist_idx ON batch_albums(artist_id)",
+        "CREATE INDEX batch_songs_album_idx ON batch_songs(album_id)",
+        "CREATE INDEX batch_songs_artist_idx ON batch_songs(artist_id)",
+        "CREATE INDEX batch_artists_name_idx ON batch_artists(name)",
+        "CREATE INDEX batch_albums_title_idx ON batch_albums(title)",
+        "CREATE VIEW batch_artist_songs AS SELECT a.id FROM batch_artists a JOIN batch_albums al ON al.artist_id = a.id JOIN batch_songs s ON s.album_id = al.id",
+    ];
+    let mut sql = String::from("BEGIN;\n");
+    for statement in DDL {
+        sql.push_str(statement);
+        sql.push_str(";\n");
+    }
+    sql.push_str("COMMIT;");
+    if let Some(suffix) = suffix {
+        sql.push('\n');
+        sql.push_str(suffix);
+        sql.push(';');
+    }
+    sql
+}
+
+#[test]
+fn explicit_schema_batch_splits_once_and_returns_every_result() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    reset_schema_batch_fixed_cost_counters();
+
+    let results = db
+        .execute_batch(&benchmark_style_schema_batch(None))
+        .expect("execute benchmark-style schema batch");
+    assert_eq!(results.len(), 11, "BEGIN + 9 DDL + COMMIT");
+    assert_eq!(schema_batch_fixed_cost_counters(), (1, 0));
+    assert_eq!(explicit_schema_batch_fast_path_count(), 1);
+    assert!(!db.in_transaction().expect("transaction state"));
+}
+
+#[test]
+fn explicit_schema_batch_preserves_post_commit_extended_suite_suffix() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    reset_schema_batch_fixed_cost_counters();
+
+    let results = db
+        .execute_batch(&benchmark_style_schema_batch(Some(
+            "CREATE TABLE batch_write_events (id INTEGER PRIMARY KEY, payload TEXT)",
+        )))
+        .expect("execute schema batch with post-commit suffix");
+    assert_eq!(results.len(), 12);
+    assert_eq!(schema_batch_fixed_cost_counters(), (1, 1));
+    db.execute("INSERT INTO batch_write_events VALUES (1, 'visible')")
+        .expect("suffix table remains usable");
+}
+
+#[test]
+fn single_split_batch_preserves_shared_parameter_semantics() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute("CREATE TABLE parameter_items (id INTEGER PRIMARY KEY, value TEXT)")
+        .expect("create table");
+    reset_schema_batch_fixed_cost_counters();
+
+    let results = db
+        .execute_batch_with_params(
+            "INSERT INTO parameter_items VALUES ($1, 'value');
+             SELECT value FROM parameter_items WHERE id = $1;",
+            &[Value::Int64(7)],
+        )
+        .expect("execute parameterized batch");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].affected_rows(), 1);
+    assert_eq!(
+        results[1].rows()[0].values(),
+        &[Value::Text("value".to_string())]
+    );
+    assert_eq!(schema_batch_fixed_cost_counters().0, 1);
+}
+
+#[test]
+fn explicit_schema_batch_failure_leaves_transaction_active_for_rollback() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    reset_schema_batch_fixed_cost_counters();
+
+    db.execute_batch(
+        "BEGIN;
+         CREATE TABLE staged_batch_table (id INTEGER PRIMARY KEY);
+         CREATE TABLE staged_batch_table (id INTEGER PRIMARY KEY);
+         COMMIT;",
+    )
+    .expect_err("duplicate DDL should stop the batch");
+    assert_eq!(schema_batch_fixed_cost_counters(), (1, 0));
+    assert_eq!(explicit_schema_batch_fast_path_count(), 0);
+    assert!(db.in_transaction().expect("transaction remains active"));
+    db.rollback_transaction().expect("rollback failed batch");
+    assert!(!db.in_transaction().expect("transaction rolled back"));
+    db.execute("SELECT * FROM staged_batch_table")
+        .expect_err("rolled-back DDL must not become visible");
+}
+
+#[test]
+fn explicit_transaction_classifies_temp_and_persistent_ddl_from_local_runtime() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("explicit-transaction-schema-classification.ddb");
+    let db = Db::create(&path, DbConfig::default()).expect("create db");
+    reset_schema_batch_fixed_cost_counters();
+
+    let results = db
+        .execute_batch(
+            "BEGIN;
+             CREATE TEMP TABLE txn_temp_items (id INTEGER PRIMARY KEY, value TEXT);
+             INSERT INTO txn_temp_items VALUES (1, 'temporary');
+             CREATE TABLE txn_persistent_items (id INTEGER PRIMARY KEY, value TEXT);
+             INSERT INTO txn_persistent_items VALUES (1, 'durable');
+             COMMIT;",
+        )
+        .expect("execute mixed temp and persistent transaction");
+    assert_eq!(results.len(), 6);
+    assert_eq!(
+        schema_batch_fixed_cost_counters(),
+        (1, 0),
+        "active writes must classify against transaction-local runtime only"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM txn_temp_items")
+                .expect("query temp table")
+        ),
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM txn_persistent_items")
+                .expect("query persistent table")
+        ),
+        1
+    );
+    db.checkpoint_wal().expect("checkpoint persistent schema");
+    drop(db);
+
+    let reopened = Db::open(&path, DbConfig::default()).expect("reopen db");
+    assert_eq!(
+        scalar_i64(
+            &reopened
+                .execute("SELECT COUNT(*) FROM txn_persistent_items")
+                .expect("persistent table survives reopen")
+        ),
+        1
+    );
+    reopened
+        .execute("SELECT * FROM txn_temp_items")
+        .expect_err("temp table must remain connection-local");
+}
+
 #[test]
 fn zero_row_prepared_dml_does_not_commit_autocommit_wal_frame() {
     let tempdir = TempDir::new().expect("tempdir");
@@ -467,6 +894,314 @@ fn simple_count_sql_fast_path_parser_accepts_only_plain_count_star() {
     assert_eq!(plan.table_name, "songs");
     assert!(parse_simple_count_star_sql("SELECT COUNT(id) FROM songs").is_none());
     assert!(parse_simple_count_star_sql("SELECT COUNT(*) FROM songs WHERE id = 1").is_none());
+}
+
+#[test]
+fn runtime_table_row_count_uses_known_metadata_without_reading_the_manifest() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    let mut runtime = EngineRuntime::empty(1);
+    let table_name = "songs".to_string();
+    Arc::make_mut(&mut runtime.catalog).tables.insert(
+        table_name.clone(),
+        TableSchema {
+            name: table_name.clone(),
+            temporary: false,
+            columns: vec![ColumnSchema {
+                name: "id".to_string(),
+                column_type: ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: false,
+                checks: Vec::new(),
+                foreign_key: None,
+            }],
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 1,
+            pk_index_root: None,
+        },
+    );
+    let unreadable_manifest = OverflowPointer {
+        head_page_id: u32::MAX,
+        logical_len: 64,
+        flags: 0,
+    }
+    .with_table_paged_manifest(true);
+    Arc::make_mut(&mut runtime.persisted_tables).insert(
+        table_name.clone(),
+        PersistedTableState {
+            pointer: unreadable_manifest,
+            checksum: 0,
+            row_count: 37,
+            tail: OverflowTailInfo::default(),
+            pk_index_root: None,
+        },
+    );
+
+    // A resident source is the most specific snapshot representation.
+    Arc::make_mut(&mut runtime.tables).insert(table_name.clone(), TableData::default().into());
+    assert_eq!(
+        db.runtime_table_row_count(&runtime, &table_name, None)
+            .expect("resident count"),
+        0
+    );
+    Arc::make_mut(&mut runtime.tables).remove(&table_name);
+
+    // The deliberately unreadable pointer makes this a direct assertion that
+    // an exact hot state count does not materialize the paged manifest.
+    assert_eq!(
+        db.runtime_table_row_count(&runtime, &table_name, None)
+            .expect("persisted state count"),
+        37
+    );
+
+    Arc::make_mut(&mut runtime.persisted_tables)
+        .get_mut(&table_name)
+        .expect("persisted state")
+        .row_count = 0;
+    Arc::make_mut(&mut runtime.catalog)
+        .table_stats
+        .insert(table_name.clone(), TableStats { row_count: 12 });
+    assert_eq!(
+        db.runtime_table_row_count(&runtime, &table_name, None)
+            .expect("analyzed count"),
+        12
+    );
+
+    // Presence of zero-valued ANALYZE stats makes the otherwise ambiguous
+    // zero state count authoritative without touching storage.
+    Arc::make_mut(&mut runtime.catalog)
+        .table_stats
+        .insert(table_name.clone(), TableStats { row_count: 0 });
+    assert_eq!(
+        db.runtime_table_row_count(&runtime, &table_name, None)
+            .expect("analyzed empty count"),
+        0
+    );
+
+    // Without either source of exact metadata, zero plus a non-empty pointer
+    // remains unknown and must conservatively attempt the storage fallback.
+    Arc::make_mut(&mut runtime.catalog)
+        .table_stats
+        .remove(&table_name);
+    assert!(db
+        .runtime_table_row_count(&runtime, &table_name, None)
+        .is_err());
+
+    {
+        let state = Arc::make_mut(&mut runtime.persisted_tables)
+            .get_mut(&table_name)
+            .expect("persisted state");
+        state.pointer = state.pointer.with_table_paged_manifest(false);
+    }
+    assert!(db
+        .runtime_table_row_count(&runtime, &table_name, None)
+        .is_err());
+
+    Arc::make_mut(&mut runtime.persisted_tables)
+        .get_mut(&table_name)
+        .expect("persisted state")
+        .pointer = OverflowPointer {
+        head_page_id: 0,
+        logical_len: 0,
+        flags: 0,
+    };
+    Arc::make_mut(&mut runtime.catalog)
+        .table_stats
+        .insert(table_name.clone(), TableStats { row_count: 12 });
+    assert_eq!(
+        db.runtime_table_row_count(&runtime, &table_name, None)
+            .expect("empty pointer count"),
+        0
+    );
+}
+
+#[test]
+fn simple_count_tracks_paged_updates_deletes_resurrection_and_reopen() -> Result<()> {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("simple-count-paged-mutations.ddb");
+    let config = DbConfig {
+        background_checkpoint_worker: false,
+        paged_row_storage: true,
+        ..DbConfig::default()
+    };
+
+    {
+        let db = Db::create(&path, config.clone())?;
+        db.execute("CREATE TABLE songs (id INT64 PRIMARY KEY, duration_ms INT64, title TEXT)")?;
+        let mut txn = db.transaction()?;
+        let insert = txn.prepare("INSERT INTO songs VALUES ($1, $2, $3)")?;
+        let song_count = PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 + 2;
+        for id in 1_i64..=song_count {
+            insert.execute_in(
+                &mut txn,
+                &[
+                    Value::Int64(id),
+                    Value::Int64(id * 100),
+                    Value::Text(format!("song-{id}")),
+                ],
+            )?;
+        }
+        txn.commit()?;
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM songs")?),
+            song_count
+        );
+
+        db.execute("UPDATE songs SET title = 'updated-with-overlay' WHERE id = 1")?;
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM songs")?),
+            song_count
+        );
+
+        db.execute("DELETE FROM songs WHERE id = 2")?;
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM songs")?),
+            song_count - 1
+        );
+
+        db.execute("INSERT INTO songs VALUES (2, 250, 'resurrected')")?;
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM songs")?),
+            song_count
+        );
+
+        let runtime = db.inner.engine.read().expect("runtime read lock");
+        let state = runtime
+            .persisted_table_state("songs")
+            .expect("persisted songs state");
+        assert!(state.pointer.is_table_paged_manifest());
+        assert_eq!(state.row_count, song_count as usize);
+        drop(runtime);
+        db.checkpoint_wal()?;
+    }
+
+    let reopened = Db::open(&path, config)?;
+    assert_eq!(
+        scalar_i64(&reopened.execute("SELECT COUNT(*) FROM songs")?),
+        PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 + 2
+    );
+    Ok(())
+}
+
+#[test]
+fn scalar_int64_aggregates_stream_paged_tombstones_and_overlays_after_reopen() -> Result<()> {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("scalar-int64-paged-streaming.ddb");
+    let config = DbConfig {
+        background_checkpoint_worker: false,
+        paged_row_storage: true,
+        ..DbConfig::default()
+    };
+    let song_count = PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 + 2;
+
+    {
+        let db = Db::create(&path, config.clone())?;
+        db.execute("CREATE TABLE songs (id INT64 PRIMARY KEY, duration_ms INT64, body TEXT)")?;
+        let body = "x".repeat(256);
+        let mut txn = db.transaction()?;
+        let insert = txn.prepare("INSERT INTO songs VALUES ($1, $2, $3)")?;
+        for id in 1_i64..=song_count {
+            let duration = if id == song_count {
+                Value::Null
+            } else {
+                Value::Int64(10)
+            };
+            insert.execute_in(
+                &mut txn,
+                &[Value::Int64(id), duration, Value::Text(body.clone())],
+            )?;
+        }
+        txn.commit()?;
+        db.checkpoint_wal()?;
+    }
+
+    {
+        let db = Db::open(&path, config.clone())?;
+        let initial = db.execute(
+            "SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), \
+                 MIN(duration_ms), MAX(duration_ms) FROM songs",
+        )?;
+        assert_eq!(
+            initial.rows()[0].values(),
+            &[
+                Value::Int64(song_count),
+                Value::Int64((song_count - 1) * 10),
+                Value::Float64(10.0),
+                Value::Int64(10),
+                Value::Int64(10),
+            ]
+        );
+        let json = db.inspect_storage_state_json()?;
+        assert!(json.contains("\"loaded_table_count\":0"), "{json}");
+        assert!(json.contains("\"deferred_table_count\":1"), "{json}");
+
+        db.execute("UPDATE songs SET duration_ms = 30 WHERE id = 1")?;
+        db.execute("DELETE FROM songs WHERE id = 2")?;
+        db.execute("INSERT INTO songs VALUES (2, 20, 'resurrected')")?;
+        db.checkpoint_wal()?;
+    }
+
+    let db = Db::open(&path, config)?;
+    let after_mutations = db.execute(
+        "SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), \
+             MIN(duration_ms), MAX(duration_ms) FROM songs",
+    )?;
+    let non_null_count = song_count - 1;
+    let expected_sum = non_null_count * 10 + 30;
+    assert_eq!(
+        after_mutations.rows()[0].values(),
+        &[
+            Value::Int64(song_count),
+            Value::Int64(expected_sum),
+            Value::Float64(expected_sum as f64 / non_null_count as f64),
+            Value::Int64(10),
+            Value::Int64(30),
+        ]
+    );
+    let json = db.inspect_storage_state_json()?;
+    assert!(json.contains("\"loaded_table_count\":0"), "{json}");
+    assert!(json.contains("\"deferred_table_count\":1"), "{json}");
+    assert!(json.contains("\"rows_in_memory_count\":0"), "{json}");
+    Ok(())
+}
+
+#[test]
+fn runtime_table_row_count_honors_a_pinned_precommit_snapshot() -> Result<()> {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("simple-count-pinned-snapshot.ddb");
+    let config = DbConfig {
+        background_checkpoint_worker: false,
+        paged_row_storage: true,
+        ..DbConfig::default()
+    };
+    let db = Db::create(&path, config)?;
+    db.execute("CREATE TABLE songs (id INT64 PRIMARY KEY)")?;
+    db.execute("INSERT INTO songs VALUES (1), (2)")?;
+
+    let reader = db.inner.wal.begin_reader_with_pager(&db.inner.pager)?;
+    let pinned_lsn = reader.snapshot_lsn();
+    db.execute("INSERT INTO songs VALUES (3)")?;
+
+    db.refresh_engine_from_snapshot(pinned_lsn)?;
+    {
+        let runtime = db.inner.engine.read().expect("runtime read lock");
+        assert_eq!(
+            db.runtime_table_row_count(&runtime, "songs", Some(pinned_lsn))?,
+            2
+        );
+    }
+    drop(reader);
+
+    assert_eq!(scalar_i64(&db.execute("SELECT COUNT(*) FROM songs")?), 3);
+    Ok(())
 }
 
 #[test]
@@ -2153,6 +2888,471 @@ fn exclusive_transaction_prepared_batch_reuses_insert_plan() {
 }
 
 #[test]
+fn exclusive_prepared_batch_updates_multiple_unconditional_nonunique_indexes() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute_batch(
+        "CREATE TABLE indexed_items (
+             id INTEGER PRIMARY KEY,
+             group_id INTEGER NOT NULL,
+             label TEXT NOT NULL
+         );
+         CREATE INDEX indexed_items_group_idx ON indexed_items(group_id);
+         CREATE INDEX indexed_items_label_idx ON indexed_items(label);",
+    )
+    .expect("create indexed table");
+
+    let insert = db
+        .prepare("INSERT INTO indexed_items VALUES ($1, $2, $3)")
+        .expect("prepare insert");
+    let mut txn = db.transaction().expect("begin exclusive txn");
+    let mut params = vec![Value::Null, Value::Null, Value::Null];
+    reset_prepared_unconditional_index_fast_path_count();
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare batch");
+        for row_id in 1..=64_i64 {
+            params[0] = Value::Int64(row_id);
+            params[1] = Value::Int64(row_id % 4);
+            params[2] = Value::Text(format!("label-{row_id}"));
+            assert_eq!(batch.execute_mut(&mut params).expect("insert row"), 1);
+        }
+    }
+    assert_eq!(prepared_unconditional_index_fast_path_count(), 64);
+    txn.commit().expect("commit transaction");
+
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM indexed_items WHERE group_id = 2")
+                .expect("query integer index")
+        ),
+        16
+    );
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT id FROM indexed_items WHERE label = 'label-37'")
+                .expect("query text index")
+        ),
+        37
+    );
+}
+
+#[test]
+fn prepared_unconditional_index_fast_path_enforces_multiple_unique_indexes_and_rolls_back() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute_batch(
+        "CREATE TABLE unique_items (
+             id INTEGER PRIMARY KEY,
+             email TEXT NOT NULL,
+             external_code TEXT NOT NULL
+         );
+         CREATE UNIQUE INDEX unique_items_email_idx ON unique_items(email);
+         CREATE UNIQUE INDEX unique_items_code_idx ON unique_items(external_code);",
+    )
+    .expect("create unique indexes");
+    let insert = db
+        .prepare("INSERT INTO unique_items VALUES ($1, $2, $3)")
+        .expect("prepare insert");
+
+    let mut txn = db.transaction().expect("begin transaction");
+    let mut params = vec![Value::Null, Value::Null, Value::Null];
+    reset_prepared_unconditional_index_fast_path_count();
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare batch");
+        params[0] = Value::Int64(1);
+        params[1] = Value::Text("first@example.test".to_string());
+        params[2] = Value::Text("duplicate-code".to_string());
+        batch.execute_mut(&mut params).expect("insert first row");
+
+        params[0] = Value::Int64(2);
+        params[1] = Value::Text("second@example.test".to_string());
+        params[2] = Value::Text("duplicate-code".to_string());
+        let error = batch
+            .execute_mut(&mut params)
+            .expect_err("second unique index must reject duplicate code");
+        assert!(matches!(error, DbError::Constraint { .. }));
+    }
+    assert_eq!(prepared_unconditional_index_fast_path_count(), 2);
+    txn.rollback().expect("roll back failed batch");
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM unique_items")
+                .expect("count rolled-back rows")
+        ),
+        0
+    );
+
+    let mut txn = db.transaction().expect("begin replacement transaction");
+    let mut params = vec![
+        Value::Int64(2),
+        Value::Text("second@example.test".to_string()),
+        Value::Text("replacement-code".to_string()),
+    ];
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare replacement batch");
+        batch
+            .execute_mut(&mut params)
+            .expect("rolled-back index entries must not survive");
+    }
+    txn.commit().expect("commit replacement row");
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT id FROM unique_items WHERE email = 'second@example.test'")
+                .expect("query replacement unique index")
+        ),
+        2
+    );
+}
+
+#[test]
+fn prepared_index_fast_path_defers_partial_and_covering_indexes_to_general_updates() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute_batch(
+        "CREATE TABLE indexed_docs (
+             id INTEGER PRIMARY KEY,
+             label TEXT NOT NULL,
+             payload TEXT NOT NULL,
+             active BOOLEAN NOT NULL
+         );
+         CREATE INDEX indexed_docs_partial_idx ON indexed_docs(label) WHERE active = TRUE;
+         CREATE INDEX indexed_docs_covering_idx ON indexed_docs(label) INCLUDE (payload);",
+    )
+    .expect("create partial and covering indexes");
+    let insert = db
+        .prepare("INSERT INTO indexed_docs VALUES ($1, $2, $3, $4)")
+        .expect("prepare insert");
+    let mut txn = db.transaction().expect("begin transaction");
+    let mut params = vec![Value::Null, Value::Null, Value::Null, Value::Null];
+    reset_prepared_unconditional_index_fast_path_count();
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare batch");
+        for (id, active) in [(1_i64, true), (2_i64, false)] {
+            params[0] = Value::Int64(id);
+            params[1] = Value::Text("shared-label".to_string());
+            params[2] = Value::Text(format!("payload-{id}"));
+            params[3] = Value::Bool(active);
+            batch.execute_mut(&mut params).expect("insert indexed doc");
+        }
+    }
+    assert_eq!(prepared_unconditional_index_fast_path_count(), 0);
+    txn.commit().expect("commit indexed docs");
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM indexed_docs WHERE label = 'shared-label'")
+                .expect("query indexed docs")
+        ),
+        2
+    );
+}
+
+#[test]
+fn prepared_index_fast_path_defers_tombstoned_unique_indexes_to_cleanup_path() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute_batch(
+        "CREATE TABLE reusable_emails (id INTEGER PRIMARY KEY, email TEXT NOT NULL);
+         CREATE UNIQUE INDEX reusable_emails_email_idx ON reusable_emails(email);
+         INSERT INTO reusable_emails VALUES (1, 'reuse@example.test');",
+    )
+    .expect("seed unique row");
+    let mut txn = db.transaction().expect("begin transaction");
+    let delete = txn
+        .prepare("DELETE FROM reusable_emails WHERE id = $1")
+        .expect("prepare delete");
+    let insert = txn
+        .prepare("INSERT INTO reusable_emails VALUES ($1, $2)")
+        .expect("prepare insert");
+    delete
+        .execute_in(&mut txn, &[Value::Int64(1)])
+        .expect("tombstone original row");
+
+    reset_prepared_unconditional_index_fast_path_count();
+    let mut params = vec![
+        Value::Int64(2),
+        Value::Text("reuse@example.test".to_string()),
+    ];
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare replacement batch");
+        batch
+            .execute_mut(&mut params)
+            .expect("reuse tombstoned unique key");
+    }
+    assert_eq!(prepared_unconditional_index_fast_path_count(), 0);
+    txn.commit().expect("commit replacement");
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT id FROM reusable_emails WHERE email = 'reuse@example.test'")
+                .expect("query reused key")
+        ),
+        2
+    );
+}
+
+#[test]
+fn exclusive_transaction_prepared_batch_reuses_paged_insert_buffers() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .expect("create table");
+
+    let mut txn = db.transaction().expect("begin exclusive txn");
+    let insert = txn
+        .prepare("INSERT INTO t VALUES ($1, $2)")
+        .expect("prepare insert");
+    let mut params = vec![Value::Null, Value::Null];
+    let first_paged_row_id = PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 + 1;
+    let second_paged_row_id = first_paged_row_id + 1;
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare batch");
+
+        for row_id in 1..=PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 {
+            params[0] = Value::Int64(row_id);
+            params[1] = Value::Text(format!("value-{row_id}"));
+            assert_eq!(batch.execute_mut(&mut params).expect("insert row"), 1);
+        }
+
+        // Resident rows retain ownership of their values, so neither buffer is
+        // available for recycling until the following append reaches the now
+        // paged row source.
+        let resident_state = batch.prepared_insert_buffer_state_for_tests();
+        assert_eq!(resident_state.0, 0);
+        assert_eq!(resident_state.1, 0);
+        assert_eq!(resident_state.3, 0);
+
+        params[0] = Value::Int64(first_paged_row_id);
+        params[1] = Value::Text(format!("value-{first_paged_row_id}"));
+        assert_eq!(batch.execute_mut(&mut params).expect("insert paged row"), 1);
+        let first_paged_state = batch.prepared_insert_buffer_state_for_tests();
+        assert_eq!(first_paged_state.0, 0);
+        assert!(first_paged_state.1 >= params.len());
+        assert!(first_paged_state.3 > 0);
+
+        params[0] = Value::Int64(second_paged_row_id);
+        params[1] = Value::Text(format!("value-{second_paged_row_id}"));
+        assert_eq!(
+            batch.execute_mut(&mut params).expect("reuse paged buffers"),
+            1
+        );
+        let second_paged_state = batch.prepared_insert_buffer_state_for_tests();
+        assert_eq!(second_paged_state.0, 0);
+        assert_eq!(second_paged_state.1, first_paged_state.1);
+        assert_eq!(second_paged_state.2, first_paged_state.2);
+        assert_eq!(second_paged_state.3, first_paged_state.3);
+        assert_eq!(second_paged_state.4, first_paged_state.4);
+    }
+    txn.commit().expect("commit txn");
+
+    assert_eq!(
+        scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
+        second_paged_row_id
+    );
+    db.execute("INSERT INTO t VALUES (NULL, 'auto')")
+        .expect("insert generated row id");
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT id FROM t WHERE val = 'auto'")
+                .expect("read generated row id")
+        ),
+        second_paged_row_id + 1
+    );
+}
+
+#[test]
+fn prepared_paged_insert_directory_reservation_failure_is_atomic_and_retryable() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute("CREATE TABLE t (val TEXT NOT NULL)")
+        .expect("create table");
+
+    let mut txn = db.transaction().expect("begin exclusive txn");
+    let insert = txn
+        .prepare("INSERT INTO t VALUES ($1)")
+        .expect("prepare insert");
+    let mut params = vec![Value::Null];
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare batch");
+        for row_id in 1..=PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 {
+            params[0] = Value::Text(format!("value-{row_id}"));
+            assert_eq!(
+                batch.execute_mut(&mut params).expect("seed resident row"),
+                1
+            );
+        }
+
+        crate::exec::force_next_paged_row_directory_reservation_failure("dense row locators");
+        params[0] = Value::Text("failed-attempt".to_string());
+        let error = batch
+            .execute_mut(&mut params)
+            .expect_err("directory reservation failure must abort the append");
+        assert!(
+            error
+                .to_string()
+                .contains("injected paged row directory reservation failure"),
+            "unexpected error: {error}"
+        );
+
+        params[0] = Value::Text("retry".to_string());
+        assert_eq!(batch.execute_mut(&mut params).expect("retry append"), 1);
+    }
+
+    let count = txn
+        .prepare("SELECT COUNT(*) FROM t")
+        .expect("prepare count");
+    assert_eq!(
+        scalar_i64(
+            &txn.execute_prepared(&count, &[])
+                .expect("count rows in same transaction")
+        ),
+        PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 + 1
+    );
+    let retry = txn
+        .prepare("SELECT COUNT(*) FROM t WHERE val = 'retry'")
+        .expect("prepare retry lookup");
+    assert_eq!(
+        scalar_i64(
+            &txn.execute_prepared(&retry, &[])
+                .expect("select retry in same transaction")
+        ),
+        1
+    );
+    txn.commit().expect("commit retried transaction");
+
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM t")
+                .expect("count committed rows")
+        ),
+        PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 + 1
+    );
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM t WHERE val = 'failed-attempt'")
+                .expect("check failed attempt")
+        ),
+        0
+    );
+}
+
+#[test]
+fn prepared_paged_insert_exact_directory_reservation_failure_preserves_manifest() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT NOT NULL)")
+        .expect("create table");
+    db.execute("CREATE UNIQUE INDEX t_val_unique ON t (val)")
+        .expect("create unique secondary index");
+
+    let mut txn = db.transaction().expect("begin exclusive txn");
+    let insert = txn
+        .prepare("INSERT INTO t VALUES ($1, $2)")
+        .expect("prepare insert");
+    let mut params = vec![Value::Null, Value::Null];
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare seed batch");
+        for row_id in 1..=PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 + 1 {
+            params[0] = Value::Int64(row_id);
+            params[1] = Value::Text(format!("value-{row_id}"));
+            assert_eq!(batch.execute_mut(&mut params).expect("seed paged row"), 1);
+        }
+    }
+
+    let (manifest_before_failure, indexes_before_failure) = {
+        let runtime = &txn.state.as_ref().expect("active transaction").runtime;
+        let Some(TableRowSource::Paged(manifest)) = runtime.tables.get("t") else {
+            panic!("test table should use a paged manifest");
+        };
+        (manifest.as_ref().clone(), runtime.indexes.as_ref().clone())
+    };
+    let sparse_row_id = PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 + 3;
+    crate::exec::force_next_paged_row_directory_reservation_failure("sparse paged row entries");
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare failing batch");
+        params[0] = Value::Int64(sparse_row_id);
+        params[1] = Value::Text("failed-exact-attempt".to_string());
+        let error = batch
+            .execute_mut(&mut params)
+            .expect_err("exact directory reservation failure must abort the append");
+        assert!(
+            error.to_string().contains(
+                "injected paged row directory reservation failure for sparse paged row entries"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+    let manifest_after_failure = {
+        let runtime = &txn.state.as_ref().expect("active transaction").runtime;
+        let Some(TableRowSource::Paged(manifest)) = runtime.tables.get("t") else {
+            panic!("test table should retain its paged manifest");
+        };
+        manifest.as_ref().clone()
+    };
+    assert_eq!(manifest_after_failure, manifest_before_failure);
+    let indexes_after_failure = &txn
+        .state
+        .as_ref()
+        .expect("active transaction")
+        .runtime
+        .indexes;
+    assert_eq!(indexes_after_failure.len(), indexes_before_failure.len());
+    for (name, index_before) in &indexes_before_failure {
+        let index_after = indexes_after_failure
+            .get(name)
+            .unwrap_or_else(|| panic!("runtime index {name} should remain present"));
+        assert!(
+            Arc::ptr_eq(index_after, index_before),
+            "runtime index {name} must be unchanged"
+        );
+    }
+
+    {
+        let mut batch = txn
+            .prepared_batch(&insert, params.len())
+            .expect("prepare retry batch");
+        params[0] = Value::Int64(sparse_row_id);
+        params[1] = Value::Text("retry-exact".to_string());
+        assert_eq!(batch.execute_mut(&mut params).expect("retry append"), 1);
+    }
+    let count = txn
+        .prepare("SELECT COUNT(*) FROM t")
+        .expect("prepare count");
+    assert_eq!(
+        scalar_i64(
+            &txn.execute_prepared(&count, &[])
+                .expect("count rows in same transaction")
+        ),
+        PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD as i64 + 2
+    );
+    txn.commit().expect("commit retried transaction");
+
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM t WHERE val = 'failed-exact-attempt'")
+                .expect("check failed attempt")
+        ),
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM t WHERE val = 'retry-exact'")
+                .expect("check retry")
+        ),
+        1
+    );
+}
+
+#[test]
 fn autocommit_execute_mut_reuses_buffered_positional_params() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -2970,6 +4170,19 @@ fn storage_refresh_reloads_when_seen_checkpoint_reuses_lower_wal_lsn() {
     let pre_checkpoint_lsn = db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire);
 
     db.checkpoint_wal().expect("checkpoint wal");
+    assert_eq!(
+        db.inner
+            .last_seen_checkpoint_epoch
+            .load(AtomicOrdering::Acquire),
+        db.inner.wal.checkpoint_epoch(),
+        "explicit checkpoint should mark its epoch as seen"
+    );
+    assert_eq!(
+        db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire),
+        0,
+        "explicit checkpoint that folds the hot runtime marks it current against the empty WAL"
+    );
+
     db.begin_write().expect("begin write to observe checkpoint");
     db.rollback().expect("rollback write observation");
     assert_eq!(
@@ -2981,7 +4194,7 @@ fn storage_refresh_reloads_when_seen_checkpoint_reuses_lower_wal_lsn() {
     );
     assert_eq!(
         db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire),
-        pre_checkpoint_lsn,
+        0,
         "observing the checkpoint through write setup should not reload runtime by itself"
     );
 
@@ -3171,6 +4384,11 @@ fn reopen_deferred_paged_secondary_index_lookup_hydrates_runtime_btree_index() {
                 .deferred_table_names()
                 .any(|name| name.eq_ignore_ascii_case("bench")),
             "hydration should leave the paged table deferred"
+        );
+        assert_eq!(
+            runtime.deferred_paged_row_locator_cache_is_dense_for_tests("bench"),
+            Some(true),
+            "checkpoint/reopen hydration should rebuild the compact dense locator cache"
         );
     }
     let json_after = db
@@ -14780,6 +15998,15 @@ fn prepared_row_id_range_uses_deferred_locator_cache() {
             runtime.has_deferred_paged_row_locator_cache_for_tests("users"),
             "expected INT64 primary-key table to build a deferred locator cache"
         );
+        assert_eq!(
+            runtime.deferred_paged_row_locator_cache_is_dense_for_tests("users"),
+            Some(true),
+            "contiguous primary keys should avoid the deferred locator hash map"
+        );
+        assert_eq!(
+            runtime.deferred_paged_row_locator_cache_sparse_len_for_tests("users"),
+            Some(0)
+        );
     }
 
     let prepared = db
@@ -18070,6 +19297,309 @@ fn read_page_for_snapshot_counts_held_snapshot_lock() {
     );
 }
 
+#[derive(Debug, Default)]
+struct FastReadCoordinationCounts {
+    coordination_reads: AtomicU64,
+    coordination_writes: AtomicU64,
+    coordination_locks: AtomicU64,
+    database_header_reads: AtomicU64,
+    database_catalog_reads: AtomicU64,
+}
+
+impl FastReadCoordinationCounts {
+    fn reset(&self) {
+        self.coordination_reads.store(0, AtomicOrdering::Release);
+        self.coordination_writes.store(0, AtomicOrdering::Release);
+        self.coordination_locks.store(0, AtomicOrdering::Release);
+        self.database_header_reads.store(0, AtomicOrdering::Release);
+        self.database_catalog_reads
+            .store(0, AtomicOrdering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct FastReadCountingVfs {
+    inner: crate::vfs::os::OsVfs,
+    counts: Arc<FastReadCoordinationCounts>,
+}
+
+impl FastReadCountingVfs {
+    fn new(counts: Arc<FastReadCoordinationCounts>) -> Self {
+        Self {
+            inner: crate::vfs::os::OsVfs,
+            counts,
+        }
+    }
+}
+
+impl crate::vfs::Vfs for FastReadCountingVfs {
+    fn open(
+        &self,
+        path: &Path,
+        mode: crate::vfs::OpenMode,
+        kind: crate::vfs::FileKind,
+    ) -> Result<Arc<dyn crate::vfs::VfsFile>> {
+        let inner = crate::vfs::Vfs::open(&self.inner, path, mode, kind)?;
+        Ok(Arc::new(FastReadCountingFile {
+            inner,
+            counts: Arc::clone(&self.counts),
+        }))
+    }
+
+    fn file_exists(&self, path: &Path) -> Result<bool> {
+        crate::vfs::Vfs::file_exists(&self.inner, path)
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        crate::vfs::Vfs::remove_file(&self.inner, path)
+    }
+
+    fn canonicalize_path(&self, path: &Path) -> Result<std::path::PathBuf> {
+        crate::vfs::Vfs::canonicalize_path(&self.inner, path)
+    }
+
+    fn supports_file_locks(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+struct FastReadCountingFile {
+    inner: Arc<dyn crate::vfs::VfsFile>,
+    counts: Arc<FastReadCoordinationCounts>,
+}
+
+impl crate::vfs::VfsFile for FastReadCountingFile {
+    fn kind(&self) -> crate::vfs::FileKind {
+        self.inner.kind()
+    }
+
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        match self.inner.kind() {
+            crate::vfs::FileKind::Coordination => {
+                self.counts
+                    .coordination_reads
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            crate::vfs::FileKind::Database if offset == 0 && buf.len() == DB_HEADER_SIZE => {
+                self.counts
+                    .database_header_reads
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            crate::vfs::FileKind::Database
+                if offset
+                    == crate::storage::page::page_offset(
+                        crate::storage::page::CATALOG_ROOT_PAGE_ID,
+                        crate::storage::page::DEFAULT_PAGE_SIZE,
+                    ) =>
+            {
+                self.counts
+                    .database_catalog_reads
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            _ => {}
+        }
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        if self.inner.kind() == crate::vfs::FileKind::Coordination {
+            self.counts
+                .coordination_writes
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.inner.write_at(offset, buf)
+    }
+
+    fn write_all_at_many(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        if self.inner.kind() == crate::vfs::FileKind::Coordination {
+            self.counts.coordination_writes.fetch_add(
+                u64::try_from(writes.len()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
+        self.inner.write_all_at_many(writes)
+    }
+
+    fn advise_sequential(&self) -> Result<()> {
+        self.inner.advise_sequential()
+    }
+
+    fn sync_data(&self) -> Result<()> {
+        self.inner.sync_data()
+    }
+
+    fn sync_metadata(&self) -> Result<()> {
+        self.inner.sync_metadata()
+    }
+
+    fn file_size(&self) -> Result<u64> {
+        self.inner.file_size()
+    }
+
+    fn set_len(&self, len: u64) -> Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn try_lock_range(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+    ) -> Result<Option<Box<dyn crate::vfs::VfsFileLock>>> {
+        if self.inner.kind() == crate::vfs::FileKind::Coordination {
+            self.counts
+                .coordination_locks
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.inner.try_lock_range(offset, len, exclusive)
+    }
+}
+
+fn fast_read_coordination_config() -> DbConfig {
+    DbConfig {
+        background_checkpoint_worker: false,
+        wal_checkpoint_threshold_pages: 0,
+        wal_checkpoint_threshold_bytes: 0,
+        ..DbConfig::default()
+    }
+}
+
+#[test]
+fn fresh_create_uses_known_empty_runtime_without_reader_admission() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("fresh-create-empty-runtime.ddb");
+    let counts = Arc::new(FastReadCoordinationCounts::default());
+    let vfs =
+        crate::vfs::VfsHandle::from_vfs(Arc::new(FastReadCountingVfs::new(Arc::clone(&counts))));
+    let config = fast_read_coordination_config();
+
+    let db = Db::create_with_vfs(&path, config.clone(), vfs.clone())?;
+    let header = db.header_info()?;
+    assert_eq!(header.schema_cookie, 0);
+    assert_eq!(
+        header.catalog_root_page_id,
+        crate::storage::page::CATALOG_ROOT_PAGE_ID
+    );
+    let schema = db.get_schema_snapshot()?;
+    assert_eq!(schema.schema_cookie, 0);
+    assert!(schema.tables.is_empty());
+    assert!(schema.views.is_empty());
+    assert!(schema.indexes.is_empty());
+    assert!(schema.triggers.is_empty());
+    assert_eq!(db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire), 0);
+    assert_eq!(
+        counts.database_catalog_reads.load(AtomicOrdering::Acquire),
+        0,
+        "the bootstrapped empty catalog is already known at create time"
+    );
+    assert_eq!(
+        counts.coordination_writes.load(AtomicOrdering::Acquire),
+        2,
+        "fresh creation should initialize coordination without reader-slot writes"
+    );
+
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")?;
+    db.execute("INSERT INTO items VALUES (1, 'survives')")?;
+    assert_eq!(scalar_i64(&db.execute("SELECT COUNT(*) FROM items")?), 1);
+    db.checkpoint_wal()?;
+    drop(db);
+    super::evict_shared_wal(&path)?;
+
+    counts.reset();
+    let reopened = Db::open_existing_with_vfs(&path, config, vfs)?;
+    assert_eq!(
+        scalar_i64(&reopened.execute("SELECT COUNT(*) FROM items")?),
+        1
+    );
+    assert!(
+        counts.database_catalog_reads.load(AtomicOrdering::Acquire) > 0,
+        "an existing database must still load its persisted catalog"
+    );
+    Ok(())
+}
+
+#[test]
+fn fresh_main_file_with_stale_wal_uses_recovery_runtime_load() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("fresh-main-stale-wal.ddb");
+    let counts = Arc::new(FastReadCoordinationCounts::default());
+    let vfs =
+        crate::vfs::VfsHandle::from_vfs(Arc::new(FastReadCountingVfs::new(Arc::clone(&counts))));
+    let config = fast_read_coordination_config();
+
+    let db = Db::create_with_vfs(&path, config.clone(), vfs.clone())?;
+    db.execute("CREATE TABLE retained (id INTEGER PRIMARY KEY, value TEXT)")?;
+    db.execute("INSERT INTO retained VALUES (1, 'from wal')")?;
+    let stale_wal_lsn = db.inner.wal.latest_snapshot();
+    assert!(stale_wal_lsn > 0);
+    drop(db);
+    super::evict_shared_wal(&path)?;
+    std::fs::remove_file(&path).expect("remove only the database main file");
+
+    counts.reset();
+    let recovered = Db::create_with_vfs(&path, config, vfs)?;
+    assert!(
+        recovered
+            .inner
+            .last_runtime_lsn
+            .load(AtomicOrdering::Acquire)
+            >= stale_wal_lsn,
+        "recovered runtime must be loaded at or beyond the stale WAL snapshot"
+    );
+    assert_eq!(
+        scalar_i64(&recovered.execute("SELECT COUNT(*) FROM retained")?),
+        1
+    );
+    let recovered_schema_cookie = recovered.get_schema_snapshot()?.schema_cookie;
+    assert_eq!(
+        recovered_schema_cookie,
+        recovered.current_schema_cookie_at_snapshot(recovered.inner.wal.latest_snapshot())?,
+        "recovered runtime schema cookie must match page-1 at the recovered WAL snapshot"
+    );
+    assert!(
+        recovered_schema_cookie > 0,
+        "recovery must not reset the catalog schema cookie to the freshly initialized main header"
+    );
+
+    recovered.execute("INSERT INTO retained VALUES (2, 'post recovery dml')")?;
+    let after_dml_schema_cookie = recovered.get_schema_snapshot()?.schema_cookie;
+    assert_eq!(
+        after_dml_schema_cookie, recovered_schema_cookie,
+        "DML after recovery must preserve the recovered schema cookie"
+    );
+    assert_eq!(
+        after_dml_schema_cookie,
+        recovered.current_schema_cookie_at_snapshot(recovered.inner.wal.latest_snapshot())?,
+        "post-recovery DML must keep runtime and page-1 schema cookies aligned"
+    );
+
+    recovered.execute("CREATE TABLE recovered_schema_cookie_advance (id INTEGER PRIMARY KEY)")?;
+    let after_ddl_schema_cookie = recovered.get_schema_snapshot()?.schema_cookie;
+    assert!(
+        after_ddl_schema_cookie > after_dml_schema_cookie,
+        "DDL after recovery must advance the recovered schema cookie monotonically"
+    );
+    assert_eq!(
+        after_ddl_schema_cookie,
+        recovered.current_schema_cookie_at_snapshot(recovered.inner.wal.latest_snapshot())?,
+        "post-recovery DDL must keep runtime and page-1 schema cookies aligned"
+    );
+    assert!(
+        counts.database_catalog_reads.load(AtomicOrdering::Acquire) > 0,
+        "a recovered non-empty WAL must decode its catalog"
+    );
+    assert!(
+        counts.coordination_writes.load(AtomicOrdering::Acquire) > 2,
+        "stale-WAL recovery must retain normal reader-slot coordination"
+    );
+    Ok(())
+}
+
 #[test]
 fn process_coordination_refreshes_independent_wal_handle() -> Result<()> {
     let temp = TempDir::new().expect("tempdir");
@@ -18092,6 +19622,177 @@ fn process_coordination_refreshes_independent_wal_handle() -> Result<()> {
 
     let coordination = db2.execute("SELECT * FROM sys.process_coordination")?;
     assert_eq!(coordination.rows()[0].values()[1], Value::Bool(true));
+    Ok(())
+}
+
+#[test]
+fn observed_current_resident_fast_reads_skip_process_reader_slots() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("resident-fast-read-no-slot.ddb");
+    let counts = Arc::new(FastReadCoordinationCounts::default());
+    let vfs =
+        crate::vfs::VfsHandle::from_vfs(Arc::new(FastReadCountingVfs::new(Arc::clone(&counts))));
+    let db = Db::create_with_vfs(&path, fast_read_coordination_config(), vfs)?;
+    db.execute(
+        "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, country TEXT, formed_year INT64)",
+    )?;
+    db.execute("CREATE TABLE songs (id INTEGER PRIMARY KEY, artist_id INT64, title TEXT)")?;
+    db.execute("INSERT INTO artists VALUES (1, 'Ada', 'US', 1995)")?;
+    db.execute("INSERT INTO songs VALUES (1, 1, 'one')")?;
+    db.execute("INSERT INTO songs VALUES (2, 1, 'two')")?;
+    db.checkpoint_wal()?;
+
+    counts.reset();
+    let count = scalar_i64(&db.execute("SELECT COUNT(*) FROM songs")?);
+    assert_eq!(count, 2);
+    let artist = db.execute_with_params(
+        "SELECT id, name, country, formed_year FROM artists WHERE id = $1",
+        &[Value::Int64(1)],
+    )?;
+    assert_eq!(
+        artist.rows()[0].values(),
+        &[
+            Value::Int64(1),
+            Value::Text("Ada".to_string()),
+            Value::Text("US".to_string()),
+            Value::Int64(1995),
+        ]
+    );
+    assert_eq!(
+        counts.coordination_writes.load(AtomicOrdering::Acquire),
+        0,
+        "resident observed-current reads must not allocate or clear process reader slots"
+    );
+    assert_eq!(
+        counts.coordination_locks.load(AtomicOrdering::Acquire),
+        0,
+        "resident observed-current reads must not lock process reader slots"
+    );
+    assert_eq!(
+        counts.database_header_reads.load(AtomicOrdering::Acquire),
+        0,
+        "explicit checkpoint should mark the current runtime without a timed header reread"
+    );
+    assert!(
+        counts.coordination_reads.load(AtomicOrdering::Acquire) >= 2,
+        "the seqlock-style before/after coordination header checks should remain active"
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_current_fast_read_falls_back_after_external_commit() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("resident-fast-read-external-commit.ddb");
+    let counts = Arc::new(FastReadCoordinationCounts::default());
+    let vfs =
+        crate::vfs::VfsHandle::from_vfs(Arc::new(FastReadCountingVfs::new(Arc::clone(&counts))));
+    let config = fast_read_coordination_config();
+    let db1 = Db::create_with_vfs(&path, config.clone(), vfs.clone())?;
+    db1.execute(
+        "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, country TEXT, formed_year INT64)",
+    )?;
+    super::evict_shared_wal(&path)?;
+    let db2 = Db::open_or_create_with_vfs(&path, config, vfs)?;
+
+    db1.execute("INSERT INTO artists VALUES (1, 'Ada', 'US', 1995)")?;
+    counts.reset();
+    let count = scalar_i64(&db2.execute("SELECT COUNT(*) FROM artists")?);
+    assert_eq!(count, 1);
+    let artist = db2.execute_with_params(
+        "SELECT id, name, country, formed_year FROM artists WHERE id = $1",
+        &[Value::Int64(1)],
+    )?;
+    assert_eq!(artist.rows()[0].values()[1], Value::Text("Ada".to_string()));
+    assert!(
+        counts.coordination_writes.load(AtomicOrdering::Acquire) > 0,
+        "external coordination changes must fall back through reader registration"
+    );
+    assert!(
+        counts.coordination_locks.load(AtomicOrdering::Acquire) > 0,
+        "external coordination changes must take a process reader slot"
+    );
+
+    db1.execute("INSERT INTO artists VALUES (2, 'Grace', 'UK', 1998)")?;
+    db1.checkpoint_wal()?;
+    counts.reset();
+    let count = scalar_i64(&db2.execute("SELECT COUNT(*) FROM artists")?);
+    assert_eq!(count, 2);
+    let artist = db2.execute_with_params(
+        "SELECT id, name, country, formed_year FROM artists WHERE id = $1",
+        &[Value::Int64(2)],
+    )?;
+    assert_eq!(
+        artist.rows()[0].values()[1],
+        Value::Text("Grace".to_string())
+    );
+    assert!(
+        counts.coordination_writes.load(AtomicOrdering::Acquire) > 0,
+        "external checkpoints must fall back through reader registration"
+    );
+    assert!(
+        counts.coordination_locks.load(AtomicOrdering::Acquire) > 0,
+        "external checkpoints must take a process reader slot"
+    );
+    Ok(())
+}
+
+#[test]
+fn reopened_deferred_rowid_projection_keeps_reader_backed_path() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("resident-fast-read-reopen.ddb");
+    let counts = Arc::new(FastReadCoordinationCounts::default());
+    let vfs =
+        crate::vfs::VfsHandle::from_vfs(Arc::new(FastReadCountingVfs::new(Arc::clone(&counts))));
+    let config = fast_read_coordination_config();
+    {
+        let db = Db::create_with_vfs(&path, config.clone(), vfs.clone())?;
+        db.execute("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, country TEXT, formed_year INT64)")?;
+        db.execute("INSERT INTO artists VALUES (1, 'Ada', 'US', 1995)")?;
+        db.checkpoint_wal()?;
+    }
+    super::evict_shared_wal(&path)?;
+    let reopened = Db::open_or_create_with_vfs(&path, config, vfs)?;
+
+    counts.reset();
+    let artist = reopened.execute_with_params(
+        "SELECT id, name, country, formed_year FROM artists WHERE id = $1",
+        &[Value::Int64(1)],
+    )?;
+    assert_eq!(artist.rows()[0].values()[1], Value::Text("Ada".to_string()));
+    assert!(
+        counts.coordination_writes.load(AtomicOrdering::Acquire) > 0,
+        "deferred storage-backed row lookup must retain reader protection"
+    );
+    assert!(
+        counts.coordination_locks.load(AtomicOrdering::Acquire) > 0,
+        "deferred storage-backed row lookup must take a process reader slot"
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_current_count_fast_read_respects_security_fallback() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("resident-fast-read-security.ddb");
+    let counts = Arc::new(FastReadCoordinationCounts::default());
+    let vfs =
+        crate::vfs::VfsHandle::from_vfs(Arc::new(FastReadCountingVfs::new(Arc::clone(&counts))));
+    let db = Db::create_with_vfs(&path, fast_read_coordination_config(), vfs)?;
+    db.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT)")?;
+    db.execute("INSERT INTO employees VALUES (1, 'tenant-a', 'Ada')")?;
+    db.execute("INSERT INTO employees VALUES (2, 'tenant-b', 'Grace')")?;
+    db.execute("CREATE POLICY tenant_filter ON employees USING tenant_id = current_tenant()")?;
+    db.execute("SET AUDIT CONTEXT tenant_id = 'tenant-a'")?;
+    db.checkpoint_wal()?;
+
+    counts.reset();
+    let count = scalar_i64(&db.execute("SELECT COUNT(*) FROM employees")?);
+    assert_eq!(count, 1);
+    assert!(
+        counts.coordination_writes.load(AtomicOrdering::Acquire) > 0,
+        "active security rules must bypass the readerless count shortcut"
+    );
     Ok(())
 }
 
@@ -18518,4 +20219,1215 @@ fn resident_delete_rollback_restores_rows() {
         50,
         "rolled-back delete must not persist"
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BootstrapSyncBehavior {
+    Block,
+    Error,
+    Panic,
+    Pass,
+}
+
+#[derive(Debug)]
+struct BootstrapSyncTestState {
+    behavior: BootstrapSyncBehavior,
+    fail_wal_open: bool,
+    sync_entered: AtomicBool,
+    sync_finished: AtomicBool,
+    sync_calls: AtomicU64,
+    wal_open_calls: AtomicU64,
+    wal_create_new_calls: AtomicU64,
+    wal_opens_during_sync: AtomicU64,
+    wal_recovery_opens_during_sync: AtomicU64,
+    inject_wal_acquire_race: AtomicBool,
+    wal_race_injected: AtomicBool,
+    wal_file_exists_calls: AtomicU64,
+    database_reads_during_sync: AtomicU64,
+    database_file_sizes_during_sync: AtomicU64,
+    database_other_ops_during_sync: AtomicU64,
+    canonicalize_calls_during_sync: AtomicU64,
+    sync_thread: Mutex<Option<std::thread::ThreadId>>,
+    released: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl BootstrapSyncTestState {
+    fn new(behavior: BootstrapSyncBehavior, fail_wal_open: bool) -> Self {
+        Self {
+            behavior,
+            fail_wal_open,
+            sync_entered: AtomicBool::new(false),
+            sync_finished: AtomicBool::new(false),
+            sync_calls: AtomicU64::new(0),
+            wal_open_calls: AtomicU64::new(0),
+            wal_create_new_calls: AtomicU64::new(0),
+            wal_opens_during_sync: AtomicU64::new(0),
+            wal_recovery_opens_during_sync: AtomicU64::new(0),
+            inject_wal_acquire_race: AtomicBool::new(false),
+            wal_race_injected: AtomicBool::new(false),
+            wal_file_exists_calls: AtomicU64::new(0),
+            database_reads_during_sync: AtomicU64::new(0),
+            database_file_sizes_during_sync: AtomicU64::new(0),
+            database_other_ops_during_sync: AtomicU64::new(0),
+            canonicalize_calls_during_sync: AtomicU64::new(0),
+            sync_thread: Mutex::new(None),
+            released: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn wait_until_sync_enters(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut released = self.released.lock().expect("release lock");
+        while !self.sync_entered.load(AtomicOrdering::Acquire) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "bootstrap sync did not start");
+            let (guard, timeout) = self
+                .wake
+                .wait_timeout(released, remaining)
+                .expect("wait for bootstrap sync");
+            released = guard;
+            assert!(
+                !timeout.timed_out() || self.sync_entered.load(AtomicOrdering::Acquire),
+                "bootstrap sync did not start"
+            );
+        }
+    }
+
+    fn release_sync(&self) {
+        *self.released.lock().expect("release lock") = true;
+        self.wake.notify_all();
+    }
+
+    fn wait_until_wal_opens(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.wal_open_calls.load(AtomicOrdering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "database initialization did not overlap bootstrap sync"
+            );
+            thread::yield_now();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BootstrapSyncTestVfs {
+    inner: crate::vfs::mem::MemVfs,
+    state: Arc<BootstrapSyncTestState>,
+    concurrent_bootstrap_sync: bool,
+}
+
+impl BootstrapSyncTestVfs {
+    fn new(state: Arc<BootstrapSyncTestState>, concurrent_bootstrap_sync: bool) -> Self {
+        Self {
+            inner: crate::vfs::mem::MemVfs::default(),
+            state,
+            concurrent_bootstrap_sync,
+        }
+    }
+
+    fn maybe_inject_competing_wal(&self, path: &Path) -> Result<()> {
+        if !self
+            .state
+            .inject_wal_acquire_race
+            .load(AtomicOrdering::Acquire)
+            || self
+                .state
+                .wal_race_injected
+                .swap(true, AtomicOrdering::AcqRel)
+        {
+            return Ok(());
+        }
+        drop(crate::vfs::Vfs::open(
+            &self.inner,
+            path,
+            crate::vfs::OpenMode::CreateNew,
+            crate::vfs::FileKind::Wal,
+        )?);
+        Ok(())
+    }
+}
+
+impl crate::vfs::Vfs for BootstrapSyncTestVfs {
+    fn open(
+        &self,
+        path: &Path,
+        mode: crate::vfs::OpenMode,
+        kind: crate::vfs::FileKind,
+    ) -> Result<Arc<dyn crate::vfs::VfsFile>> {
+        if kind == crate::vfs::FileKind::Wal {
+            if mode == crate::vfs::OpenMode::CreateNew {
+                self.state
+                    .wal_create_new_calls
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.maybe_inject_competing_wal(path)?;
+            }
+            if self.concurrent_bootstrap_sync
+                && matches!(self.state.behavior, BootstrapSyncBehavior::Block)
+            {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !self.state.sync_entered.load(AtomicOrdering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "WAL initialization waited too long for bootstrap sync to start"
+                    );
+                    thread::yield_now();
+                }
+            }
+            self.state
+                .wal_open_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            if self.state.sync_entered.load(AtomicOrdering::Acquire)
+                && !self.state.sync_finished.load(AtomicOrdering::Acquire)
+            {
+                self.state
+                    .wal_opens_during_sync
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                if mode != crate::vfs::OpenMode::CreateNew {
+                    self.state
+                        .wal_recovery_opens_during_sync
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+            if self.state.fail_wal_open {
+                return Err(DbError::internal("injected WAL open failure"));
+            }
+        }
+        let inner = crate::vfs::Vfs::open(&self.inner, path, mode, kind)?;
+        Ok(Arc::new(BootstrapSyncTestFile {
+            inner,
+            state: Arc::clone(&self.state),
+        }))
+    }
+
+    fn file_exists(&self, path: &Path) -> Result<bool> {
+        if path.as_os_str().to_string_lossy().ends_with(".wal")
+            && self
+                .state
+                .inject_wal_acquire_race
+                .load(AtomicOrdering::Acquire)
+        {
+            let call = self
+                .state
+                .wal_file_exists_calls
+                .fetch_add(1, AtomicOrdering::AcqRel);
+            if call == 0 {
+                // Reproduce the old check/open race: an initial observation
+                // sees no WAL, then the competing actor wins creation before
+                // the acquisition itself.
+                return Ok(false);
+            }
+            self.maybe_inject_competing_wal(path)?;
+        }
+        crate::vfs::Vfs::file_exists(&self.inner, path)
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        crate::vfs::Vfs::remove_file(&self.inner, path)
+    }
+
+    fn canonicalize_path(&self, path: &Path) -> Result<std::path::PathBuf> {
+        if self.state.sync_entered.load(AtomicOrdering::Acquire)
+            && !self.state.sync_finished.load(AtomicOrdering::Acquire)
+        {
+            self.state
+                .canonicalize_calls_during_sync
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        crate::vfs::Vfs::canonicalize_path(&self.inner, path)
+    }
+
+    fn concurrent_bootstrap_sync_reservation(
+        &self,
+    ) -> Option<Box<dyn crate::vfs::BootstrapSyncReservation + '_>> {
+        self.concurrent_bootstrap_sync
+            .then(|| Box::new(()) as Box<dyn crate::vfs::BootstrapSyncReservation>)
+    }
+}
+
+#[derive(Debug)]
+struct BootstrapSyncTestFile {
+    inner: Arc<dyn crate::vfs::VfsFile>,
+    state: Arc<BootstrapSyncTestState>,
+}
+
+impl BootstrapSyncTestFile {
+    fn record_main_file_overlap(&self, counter: &AtomicU64) {
+        if self.inner.kind() == crate::vfs::FileKind::Database
+            && self.state.sync_entered.load(AtomicOrdering::Acquire)
+            && !self.state.sync_finished.load(AtomicOrdering::Acquire)
+        {
+            counter.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+impl crate::vfs::VfsFile for BootstrapSyncTestFile {
+    fn kind(&self) -> crate::vfs::FileKind {
+        self.inner.kind()
+    }
+
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        self.record_main_file_overlap(&self.state.database_reads_during_sync);
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        self.record_main_file_overlap(&self.state.database_other_ops_during_sync);
+        self.inner.write_at(offset, buf)
+    }
+
+    fn write_all_at_many(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        self.record_main_file_overlap(&self.state.database_other_ops_during_sync);
+        self.inner.write_all_at_many(writes)
+    }
+
+    fn advise_sequential(&self) -> Result<()> {
+        self.record_main_file_overlap(&self.state.database_other_ops_during_sync);
+        self.inner.advise_sequential()
+    }
+
+    fn sync_data(&self) -> Result<()> {
+        if self.inner.kind() != crate::vfs::FileKind::Database {
+            return self.inner.sync_data();
+        }
+        self.state.sync_calls.fetch_add(1, AtomicOrdering::Relaxed);
+        *self.state.sync_thread.lock().expect("sync thread lock") =
+            Some(std::thread::current().id());
+        self.state.sync_entered.store(true, AtomicOrdering::Release);
+        self.state.wake.notify_all();
+
+        match self.state.behavior {
+            BootstrapSyncBehavior::Block => {
+                let mut released = self.state.released.lock().expect("release lock");
+                while !*released {
+                    released = self.state.wake.wait(released).expect("sync wait");
+                }
+                self.inner.sync_data()?;
+                self.state
+                    .sync_finished
+                    .store(true, AtomicOrdering::Release);
+                Ok(())
+            }
+            BootstrapSyncBehavior::Error => {
+                self.state
+                    .sync_finished
+                    .store(true, AtomicOrdering::Release);
+                Err(DbError::io(
+                    "injected bootstrap sync error",
+                    std::io::Error::other("injected bootstrap sync error"),
+                ))
+            }
+            BootstrapSyncBehavior::Panic => panic!("injected bootstrap sync panic"),
+            BootstrapSyncBehavior::Pass => {
+                self.inner.sync_data()?;
+                self.state
+                    .sync_finished
+                    .store(true, AtomicOrdering::Release);
+                Ok(())
+            }
+        }
+    }
+
+    fn sync_metadata(&self) -> Result<()> {
+        self.record_main_file_overlap(&self.state.database_other_ops_during_sync);
+        self.inner.sync_metadata()
+    }
+
+    fn file_size(&self) -> Result<u64> {
+        self.record_main_file_overlap(&self.state.database_file_sizes_during_sync);
+        self.inner.file_size()
+    }
+
+    fn set_len(&self, len: u64) -> Result<()> {
+        self.record_main_file_overlap(&self.state.database_other_ops_during_sync);
+        self.inner.set_len(len)
+    }
+
+    fn try_lock_range(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+    ) -> Result<Option<Box<dyn crate::vfs::VfsFileLock>>> {
+        self.record_main_file_overlap(&self.state.database_other_ops_during_sync);
+        self.inner.try_lock_range(offset, len, exclusive)
+    }
+}
+
+#[test]
+fn capability_enabled_create_overlaps_initialization_and_joins_bootstrap_sync() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("concurrent-bootstrap-sync.ddb");
+    let state = Arc::new(BootstrapSyncTestState::new(
+        BootstrapSyncBehavior::Block,
+        false,
+    ));
+    let vfs = crate::vfs::VfsHandle::from_vfs(Arc::new(BootstrapSyncTestVfs::new(
+        Arc::clone(&state),
+        true,
+    )));
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let create_path = path.clone();
+    let create_vfs = vfs.clone();
+    let create_thread = thread::spawn(move || {
+        let result = Db::create_with_vfs(&create_path, open_path_test_config(), create_vfs);
+        result_tx.send(result).expect("send create result");
+    });
+    let create_thread_id = create_thread.thread().id();
+
+    state.wait_until_sync_enters();
+    state.wait_until_wal_opens();
+    assert!(
+        result_rx.try_recv().is_err(),
+        "create must not return before the durability worker joins"
+    );
+    assert_eq!(
+        state
+            .database_reads_during_sync
+            .load(AtomicOrdering::Acquire),
+        0,
+        "fresh initialization must not read the main file during sync"
+    );
+    assert_eq!(
+        state
+            .database_file_sizes_during_sync
+            .load(AtomicOrdering::Acquire),
+        0,
+        "fresh initialization must use the known two-page bootstrap length"
+    );
+    assert_eq!(
+        state
+            .database_other_ops_during_sync
+            .load(AtomicOrdering::Acquire),
+        0,
+        "the worker sync must be the only main-file operation during overlap"
+    );
+    assert_eq!(
+        state
+            .canonicalize_calls_during_sync
+            .load(AtomicOrdering::Acquire),
+        0,
+        "fresh initialization must reuse the canonical path resolved before overlap"
+    );
+
+    let second_create = Db::create_with_vfs(&path, open_path_test_config(), vfs.clone());
+    assert!(
+        second_create.is_err(),
+        "same-path CreateNew should fail without waiting on the sync worker"
+    );
+
+    state.release_sync();
+    let db = result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("create should finish after sync release")?;
+    create_thread.join().expect("create thread");
+    assert_eq!(state.sync_calls.load(AtomicOrdering::Acquire), 1);
+    assert_eq!(state.wal_opens_during_sync.load(AtomicOrdering::Acquire), 1);
+    assert_ne!(
+        *state.sync_thread.lock().expect("sync thread lock"),
+        Some(create_thread_id),
+        "bootstrap sync should not run on the create caller"
+    );
+    db.execute("CREATE TABLE ready (id INTEGER PRIMARY KEY)")?;
+    Ok(())
+}
+
+#[test]
+fn wal_created_at_fresh_acquisition_waits_for_bootstrap_sync_before_recovery() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("wal-create-race-bootstrap-sync.ddb");
+    let state = Arc::new(BootstrapSyncTestState::new(
+        BootstrapSyncBehavior::Block,
+        false,
+    ));
+    state
+        .inject_wal_acquire_race
+        .store(true, AtomicOrdering::Release);
+    let vfs = crate::vfs::VfsHandle::from_vfs(Arc::new(BootstrapSyncTestVfs::new(
+        Arc::clone(&state),
+        true,
+    )));
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let create_thread = {
+        let path = path.clone();
+        let vfs = vfs.clone();
+        thread::spawn(move || {
+            result_tx
+                .send(Db::create_with_vfs(&path, open_path_test_config(), vfs))
+                .expect("send create result");
+        })
+    };
+
+    state.wait_until_sync_enters();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.wal_create_new_calls.load(AtomicOrdering::Acquire) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "fresh WAL acquisition did not attempt atomic CreateNew"
+        );
+        thread::yield_now();
+    }
+    assert!(state.wal_race_injected.load(AtomicOrdering::Acquire));
+    assert_eq!(
+        state
+            .wal_recovery_opens_during_sync
+            .load(AtomicOrdering::Acquire),
+        0,
+        "a WAL that wins the CreateNew race must not be opened for recovery during main-file sync"
+    );
+    assert!(
+        result_rx.try_recv().is_err(),
+        "create must join its bootstrap sync before retrying WAL recovery"
+    );
+
+    state.release_sync();
+    let db = result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("create should retry after bootstrap sync")?;
+    create_thread.join().expect("create thread");
+    assert!(state.wal_open_calls.load(AtomicOrdering::Acquire) >= 2);
+    assert_eq!(
+        state
+            .wal_recovery_opens_during_sync
+            .load(AtomicOrdering::Acquire),
+        0
+    );
+    db.execute("CREATE TABLE recovered_after_race (id INTEGER PRIMARY KEY)")?;
+    Ok(())
+}
+
+#[test]
+fn concurrent_bootstrap_sync_error_precedes_initialization_error() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("bootstrap-sync-error-precedence.ddb");
+    let state = Arc::new(BootstrapSyncTestState::new(
+        BootstrapSyncBehavior::Error,
+        true,
+    ));
+    let vfs = crate::vfs::VfsHandle::from_vfs(Arc::new(BootstrapSyncTestVfs::new(
+        Arc::clone(&state),
+        true,
+    )));
+
+    let error = Db::create_with_vfs(&path, open_path_test_config(), vfs)
+        .expect_err("bootstrap sync failure must prevent Db return");
+    assert!(matches!(error, DbError::Io { .. }));
+    assert!(error.to_string().contains("injected bootstrap sync error"));
+    assert_eq!(state.sync_calls.load(AtomicOrdering::Acquire), 1);
+    assert_eq!(state.wal_open_calls.load(AtomicOrdering::Acquire), 1);
+}
+
+#[test]
+fn bootstrap_sync_worker_panic_is_a_typed_internal_error() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("bootstrap-sync-panic.ddb");
+    let state = Arc::new(BootstrapSyncTestState::new(
+        BootstrapSyncBehavior::Panic,
+        false,
+    ));
+    let vfs = crate::vfs::VfsHandle::from_vfs(Arc::new(BootstrapSyncTestVfs::new(state, true)));
+
+    let error = Db::create_with_vfs(&path, open_path_test_config(), vfs)
+        .expect_err("worker panic must prevent Db return");
+    assert!(matches!(error, DbError::Internal { .. }));
+    assert!(error.to_string().contains("bootstrap sync worker panicked"));
+}
+
+#[test]
+fn bootstrap_sync_spawn_failure_falls_back_to_inline_sync_before_initialization() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("bootstrap-sync-spawn-fallback.ddb");
+    let state = Arc::new(BootstrapSyncTestState::new(
+        BootstrapSyncBehavior::Pass,
+        false,
+    ));
+    let vfs = crate::vfs::VfsHandle::from_vfs(Arc::new(BootstrapSyncTestVfs::new(
+        Arc::clone(&state),
+        true,
+    )));
+    let caller_thread = std::thread::current().id();
+    force_next_bootstrap_sync_spawn_failure();
+
+    let db = Db::create_with_vfs(&path, open_path_test_config(), vfs)?;
+    assert_eq!(state.sync_calls.load(AtomicOrdering::Acquire), 1);
+    assert_eq!(
+        *state.sync_thread.lock().expect("sync thread lock"),
+        Some(caller_thread),
+        "fallback sync must run inline on the create caller"
+    );
+    assert!(state.sync_finished.load(AtomicOrdering::Acquire));
+    assert_eq!(state.wal_open_calls.load(AtomicOrdering::Acquire), 1);
+    assert_eq!(state.wal_opens_during_sync.load(AtomicOrdering::Acquire), 0);
+    drop(db);
+    Ok(())
+}
+
+#[test]
+fn custom_vfs_without_capability_keeps_bootstrap_sync_inline() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("inline-custom-bootstrap-sync.ddb");
+    let state = Arc::new(BootstrapSyncTestState::new(
+        BootstrapSyncBehavior::Pass,
+        false,
+    ));
+    let vfs = crate::vfs::VfsHandle::from_vfs(Arc::new(BootstrapSyncTestVfs::new(
+        Arc::clone(&state),
+        false,
+    )));
+    let caller_thread = std::thread::current().id();
+
+    let db = Db::create_with_vfs(&path, open_path_test_config(), vfs)?;
+    assert_eq!(
+        *state.sync_thread.lock().expect("sync thread lock"),
+        Some(caller_thread)
+    );
+    assert_eq!(state.sync_calls.load(AtomicOrdering::Acquire), 1);
+    assert_eq!(state.wal_opens_during_sync.load(AtomicOrdering::Acquire), 0);
+    drop(db);
+    Ok(())
+}
+
+#[test]
+fn orphan_wal_sidecar_defers_recovery_until_bootstrap_sync_joins() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("orphan-wal-bootstrap-sync.ddb");
+    let state = Arc::new(BootstrapSyncTestState::new(
+        BootstrapSyncBehavior::Pass,
+        false,
+    ));
+    let vfs = crate::vfs::VfsHandle::from_vfs(Arc::new(BootstrapSyncTestVfs::new(
+        Arc::clone(&state),
+        true,
+    )));
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push(".wal");
+    drop(vfs.open(
+        Path::new(&wal_path),
+        crate::vfs::OpenMode::CreateNew,
+        crate::vfs::FileKind::Wal,
+    )?);
+    state.wal_create_new_calls.store(0, AtomicOrdering::Release);
+    let db = Db::create_with_vfs(&path, open_path_test_config(), vfs)?;
+    assert_ne!(
+        *state.sync_thread.lock().expect("sync thread lock"),
+        Some(std::thread::current().id()),
+        "an orphan WAL should be detected atomically while the scoped worker owns bootstrap sync"
+    );
+    assert_eq!(state.sync_calls.load(AtomicOrdering::Acquire), 1);
+    assert_eq!(state.wal_create_new_calls.load(AtomicOrdering::Acquire), 1);
+    assert_eq!(
+        state
+            .wal_recovery_opens_during_sync
+            .load(AtomicOrdering::Acquire),
+        0,
+        "existing-WAL recovery must wait until bootstrap sync joins"
+    );
+    assert_eq!(
+        state
+            .database_reads_during_sync
+            .load(AtomicOrdering::Acquire),
+        0
+    );
+    drop(db);
+    Ok(())
+}
+
+#[test]
+fn failpoint_install_serializes_with_reserved_concurrent_bootstrap_sync() -> Result<()> {
+    let _failpoint_guard = crate::vfs::faulty::test_failpoint_lock()
+        .lock()
+        .expect("failpoint test lock");
+    crate::vfs::faulty::clear_failpoints()?;
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp
+        .path()
+        .join("bootstrap-sync-failpoint-install-race.ddb");
+    let state = Arc::new(BootstrapSyncTestState::new(
+        BootstrapSyncBehavior::Block,
+        false,
+    ));
+    let inner: Arc<dyn crate::vfs::Vfs> =
+        Arc::new(BootstrapSyncTestVfs::new(Arc::clone(&state), true));
+    let vfs = crate::vfs::VfsHandle::from_vfs(Arc::new(crate::vfs::faulty::FaultyVfs::wrap(inner)));
+    let (create_tx, create_rx) = std::sync::mpsc::channel();
+    let create_thread = {
+        let path = path.clone();
+        let vfs = vfs.clone();
+        thread::spawn(move || {
+            create_tx
+                .send(Db::create_with_vfs(&path, open_path_test_config(), vfs))
+                .expect("send create result");
+        })
+    };
+    state.wait_until_sync_enters();
+
+    let (install_started_tx, install_started_rx) = std::sync::mpsc::channel();
+    let (install_result_tx, install_result_rx) = std::sync::mpsc::channel();
+    let install_thread = thread::spawn(move || {
+        install_started_tx.send(()).expect("send install start");
+        let result = crate::vfs::faulty::install_failpoint(crate::vfs::faulty::Failpoint {
+            label: "db.fsync".to_string(),
+            trigger_on: 1,
+            action: crate::vfs::faulty::FailAction::Error,
+        });
+        install_result_tx.send(result).expect("send install result");
+    });
+    install_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("installer should start");
+    assert!(
+        install_result_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "failpoint install must wait for the reserved sync operation"
+    );
+
+    state.release_sync();
+    let db = create_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("create should finish after sync release")?;
+    create_thread.join().expect("create thread");
+    install_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("install should resume after reservation release")?;
+    install_thread.join().expect("install thread");
+    assert!(
+        crate::vfs::faulty::failpoint_logs()?.is_empty(),
+        "a failpoint installed after the completed sync must not claim a skipped hit"
+    );
+    crate::vfs::faulty::clear_failpoints()?;
+    drop(db);
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct OpenPathVfsCounts {
+    database_open_attempts: std::sync::atomic::AtomicU64,
+    wal_open_attempts: std::sync::atomic::AtomicU64,
+    database_header_reads: std::sync::atomic::AtomicU64,
+    database_data_syncs: std::sync::atomic::AtomicU64,
+    database_metadata_syncs: std::sync::atomic::AtomicU64,
+    database_file_size_calls: std::sync::atomic::AtomicU64,
+    canonicalize_calls: std::sync::atomic::AtomicU64,
+}
+
+impl OpenPathVfsCounts {
+    fn reset(&self) {
+        self.database_open_attempts
+            .store(0, AtomicOrdering::Release);
+        self.wal_open_attempts.store(0, AtomicOrdering::Release);
+        self.database_header_reads.store(0, AtomicOrdering::Release);
+        self.database_data_syncs.store(0, AtomicOrdering::Release);
+        self.database_metadata_syncs
+            .store(0, AtomicOrdering::Release);
+        self.database_file_size_calls
+            .store(0, AtomicOrdering::Release);
+        self.canonicalize_calls.store(0, AtomicOrdering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct OpenPathCountingVfs {
+    inner: crate::vfs::mem::MemVfs,
+    counts: Arc<OpenPathVfsCounts>,
+}
+
+impl OpenPathCountingVfs {
+    fn new(counts: Arc<OpenPathVfsCounts>) -> Self {
+        Self {
+            inner: crate::vfs::mem::MemVfs::default(),
+            counts,
+        }
+    }
+}
+
+impl crate::vfs::Vfs for OpenPathCountingVfs {
+    fn open(
+        &self,
+        path: &Path,
+        mode: crate::vfs::OpenMode,
+        kind: crate::vfs::FileKind,
+    ) -> Result<Arc<dyn crate::vfs::VfsFile>> {
+        if kind == crate::vfs::FileKind::Database {
+            self.counts
+                .database_open_attempts
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if kind == crate::vfs::FileKind::Wal {
+            self.counts
+                .wal_open_attempts
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let inner = crate::vfs::Vfs::open(&self.inner, path, mode, kind)?;
+        Ok(Arc::new(OpenPathCountingFile {
+            inner,
+            counts: Arc::clone(&self.counts),
+        }))
+    }
+
+    fn file_exists(&self, path: &Path) -> Result<bool> {
+        crate::vfs::Vfs::file_exists(&self.inner, path)
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        crate::vfs::Vfs::remove_file(&self.inner, path)
+    }
+
+    fn canonicalize_path(&self, path: &Path) -> Result<std::path::PathBuf> {
+        self.counts
+            .canonicalize_calls
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        crate::vfs::Vfs::canonicalize_path(&self.inner, path)
+    }
+
+    // Exercise the native-path open flow while retaining deterministic,
+    // process-local test storage.
+    fn is_memory(&self) -> bool {
+        false
+    }
+
+    fn concurrent_bootstrap_sync_reservation(
+        &self,
+    ) -> Option<Box<dyn crate::vfs::BootstrapSyncReservation + '_>> {
+        Some(Box::new(()))
+    }
+}
+
+#[derive(Debug)]
+struct OpenPathCountingFile {
+    inner: Arc<dyn crate::vfs::VfsFile>,
+    counts: Arc<OpenPathVfsCounts>,
+}
+
+impl crate::vfs::VfsFile for OpenPathCountingFile {
+    fn kind(&self) -> crate::vfs::FileKind {
+        self.inner.kind()
+    }
+
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        if self.inner.kind() == crate::vfs::FileKind::Database
+            && offset == 0
+            && buf.len() == DB_HEADER_SIZE
+        {
+            self.counts
+                .database_header_reads
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        self.inner.write_at(offset, buf)
+    }
+
+    fn write_all_at_many(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        self.inner.write_all_at_many(writes)
+    }
+
+    fn advise_sequential(&self) -> Result<()> {
+        self.inner.advise_sequential()
+    }
+
+    fn sync_data(&self) -> Result<()> {
+        if self.inner.kind() == crate::vfs::FileKind::Database {
+            self.counts
+                .database_data_syncs
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.inner.sync_data()
+    }
+
+    fn sync_metadata(&self) -> Result<()> {
+        if self.inner.kind() == crate::vfs::FileKind::Database {
+            self.counts
+                .database_metadata_syncs
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.inner.sync_metadata()
+    }
+
+    fn file_size(&self) -> Result<u64> {
+        if self.inner.kind() == crate::vfs::FileKind::Database {
+            self.counts
+                .database_file_size_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.inner.file_size()
+    }
+
+    fn set_len(&self, len: u64) -> Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn try_lock_range(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+    ) -> Result<Option<Box<dyn crate::vfs::VfsFileLock>>> {
+        self.inner.try_lock_range(offset, len, exclusive)
+    }
+}
+
+fn open_path_test_config() -> DbConfig {
+    DbConfig {
+        process_coordination: crate::config::ProcessCoordinationMode::SingleProcessUnsafe,
+        background_checkpoint_worker: false,
+        wal_checkpoint_threshold_pages: 0,
+        wal_checkpoint_threshold_bytes: 0,
+        ..DbConfig::default()
+    }
+}
+
+#[test]
+fn create_and_existing_open_each_open_the_database_file_once() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("single-main-file-open.ddb");
+    let counts = Arc::new(OpenPathVfsCounts::default());
+    let counting_vfs = Arc::new(OpenPathCountingVfs::new(Arc::clone(&counts)));
+    let vfs = crate::vfs::VfsHandle::from_vfs(counting_vfs);
+
+    let db = Db::create_with_vfs(&path, open_path_test_config(), vfs.clone())?;
+    assert_eq!(
+        counts.database_open_attempts.load(AtomicOrdering::Acquire),
+        1
+    );
+    assert_eq!(
+        counts.database_header_reads.load(AtomicOrdering::Acquire),
+        0,
+        "a freshly constructed header should be reused"
+    );
+    assert_eq!(
+        counts.database_data_syncs.load(AtomicOrdering::Acquire),
+        1,
+        "fresh database creation must retain its durable data-and-length barrier"
+    );
+    assert_eq!(
+        counts.database_metadata_syncs.load(AtomicOrdering::Acquire),
+        0
+    );
+    assert_eq!(
+        counts
+            .database_file_size_calls
+            .load(AtomicOrdering::Acquire),
+        0,
+        "fresh pager initialization should use the known two-page bootstrap length"
+    );
+    drop(db);
+
+    counts.reset();
+    let reopened = Db::open_existing_with_vfs(&path, open_path_test_config(), vfs)?;
+    assert_eq!(
+        counts.database_open_attempts.load(AtomicOrdering::Acquire),
+        1
+    );
+    assert_eq!(
+        counts.database_header_reads.load(AtomicOrdering::Acquire),
+        1,
+        "existing databases must still validate their persisted header"
+    );
+    assert_eq!(
+        counts
+            .database_file_size_calls
+            .load(AtomicOrdering::Acquire),
+        1,
+        "WAL initialization should consume the pager's cached page count"
+    );
+    drop(reopened);
+    Ok(())
+}
+
+#[test]
+fn optimized_open_path_preserves_existing_and_malformed_file_failures() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let existing_path = temp.path().join("already-exists.ddb");
+    let malformed_path = temp.path().join("malformed.ddb");
+    let counts = Arc::new(OpenPathVfsCounts::default());
+    let counting_vfs = Arc::new(OpenPathCountingVfs::new(Arc::clone(&counts)));
+    let vfs = crate::vfs::VfsHandle::from_vfs(counting_vfs);
+
+    drop(Db::create_with_vfs(
+        &existing_path,
+        open_path_test_config(),
+        vfs.clone(),
+    )?);
+    counts.reset();
+    let error = Db::create_with_vfs(&existing_path, open_path_test_config(), vfs.clone())
+        .expect_err("CreateNew must reject an existing database");
+    assert!(matches!(error, DbError::Io { .. }));
+    assert_eq!(
+        counts.database_open_attempts.load(AtomicOrdering::Acquire),
+        1
+    );
+    assert_eq!(
+        counts.database_header_reads.load(AtomicOrdering::Acquire),
+        0
+    );
+
+    let malformed = vfs.open(
+        &malformed_path,
+        crate::vfs::OpenMode::CreateNew,
+        crate::vfs::FileKind::Database,
+    )?;
+    crate::vfs::write_all_at(malformed.as_ref(), 0, &[0_u8; DB_HEADER_SIZE])?;
+    drop(malformed);
+    counts.reset();
+    let error = Db::open_existing_with_vfs(&malformed_path, open_path_test_config(), vfs)
+        .expect_err("malformed persisted headers must still be rejected");
+    assert!(matches!(error, DbError::Corruption { .. }));
+    assert_eq!(
+        counts.database_open_attempts.load(AtomicOrdering::Acquire),
+        1
+    );
+    assert_eq!(
+        counts.database_header_reads.load(AtomicOrdering::Acquire),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn optimized_open_path_preserves_create_sync_and_existing_open_read_failpoints() -> Result<()> {
+    let _failpoint_guard = crate::vfs::faulty::test_failpoint_lock()
+        .lock()
+        .expect("failpoint test lock");
+    crate::vfs::faulty::clear_failpoints()?;
+
+    let temp = TempDir::new().expect("tempdir");
+    let create_path = temp.path().join("create-sync-failure.ddb");
+    let open_path = temp.path().join("open-read-failure.ddb");
+    let counts = Arc::new(OpenPathVfsCounts::default());
+    let counting_vfs = Arc::new(OpenPathCountingVfs::new(Arc::clone(&counts)));
+    let raw_vfs = crate::vfs::VfsHandle::from_vfs(counting_vfs.clone());
+    let faulty_vfs = crate::vfs::VfsHandle::from_vfs(Arc::new(
+        crate::vfs::faulty::FaultyVfs::wrap(counting_vfs),
+    ));
+
+    crate::vfs::faulty::install_failpoint(crate::vfs::faulty::Failpoint {
+        label: "db.fsync".to_string(),
+        trigger_on: 1,
+        action: crate::vfs::faulty::FailAction::Error,
+    })?;
+    let error = Db::create_with_vfs(&create_path, open_path_test_config(), faulty_vfs.clone())
+        .expect_err("the durable create barrier failure must be surfaced");
+    assert!(matches!(error, DbError::Io { .. }));
+    assert_eq!(
+        counts.database_open_attempts.load(AtomicOrdering::Acquire),
+        1
+    );
+    assert_eq!(
+        counts.database_header_reads.load(AtomicOrdering::Acquire),
+        0
+    );
+    assert_eq!(
+        counts.wal_open_attempts.load(AtomicOrdering::Acquire),
+        0,
+        "sync failure must retain inline ordering and prevent WAL initialization"
+    );
+    assert_eq!(
+        crate::vfs::faulty::failpoint_logs()?
+            .into_iter()
+            .filter(|entry| entry.label == "db.fsync")
+            .collect::<Vec<_>>(),
+        vec![crate::vfs::faulty::FailpointLogEntry {
+            label: "db.fsync".to_string(),
+            hit: 1,
+            outcome: "error".to_string(),
+        }],
+        "the owner thread must observe the create sync failpoint exactly once"
+    );
+
+    let drop_sync_path = temp.path().join("create-drop-sync.ddb");
+    crate::vfs::faulty::clear_failpoints()?;
+    counts.reset();
+    crate::vfs::faulty::install_failpoint(crate::vfs::faulty::Failpoint {
+        label: "db.fsync".to_string(),
+        trigger_on: 1,
+        action: crate::vfs::faulty::FailAction::DropSync,
+    })?;
+    drop(Db::create_with_vfs(
+        &drop_sync_path,
+        open_path_test_config(),
+        faulty_vfs.clone(),
+    )?);
+    assert_eq!(
+        crate::vfs::faulty::failpoint_logs()?
+            .into_iter()
+            .filter(|entry| entry.label == "db.fsync")
+            .collect::<Vec<_>>(),
+        vec![crate::vfs::faulty::FailpointLogEntry {
+            label: "db.fsync".to_string(),
+            hit: 1,
+            outcome: "drop_sync".to_string(),
+        }],
+        "dropped create sync must be decided exactly once on its owner thread"
+    );
+    assert_eq!(
+        counts.wal_open_attempts.load(AtomicOrdering::Acquire),
+        1,
+        "successful dropped-sync injection should allow initialization only afterward"
+    );
+
+    crate::vfs::faulty::clear_failpoints()?;
+    drop(Db::create_with_vfs(
+        &open_path,
+        open_path_test_config(),
+        raw_vfs,
+    )?);
+    counts.reset();
+    crate::vfs::faulty::install_failpoint(crate::vfs::faulty::Failpoint {
+        label: "db.read".to_string(),
+        trigger_on: 1,
+        action: crate::vfs::faulty::FailAction::Error,
+    })?;
+    let error = Db::open_existing_with_vfs(&open_path, open_path_test_config(), faulty_vfs)
+        .expect_err("existing database header read failures must be surfaced");
+    assert!(matches!(error, DbError::Io { .. }));
+    assert_eq!(
+        counts.database_open_attempts.load(AtomicOrdering::Acquire),
+        1
+    );
+
+    crate::vfs::faulty::clear_failpoints()?;
+    Ok(())
+}
+
+#[test]
+fn cached_page_count_drives_allocation_after_checkpoint_growth_and_tail_truncation() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("cached-page-count-allocation.ddb");
+    let counts = Arc::new(OpenPathVfsCounts::default());
+    let counting_vfs = Arc::new(OpenPathCountingVfs::new(Arc::clone(&counts)));
+    let vfs = crate::vfs::VfsHandle::from_vfs(counting_vfs);
+    let db = Db::create_with_vfs(&path, open_path_test_config(), vfs)?;
+
+    db.begin_write()?;
+    let page3 = db.allocate_page()?;
+    let page4 = db.allocate_page()?;
+    let page5 = db.allocate_page()?;
+    assert_eq!((page3, page4, page5), (3, 4, 5));
+    db.commit()?;
+    db.checkpoint_wal()?;
+    assert_eq!(db.inner.pager.cached_page_count(), 5);
+
+    counts.reset();
+    db.begin_write()?;
+    assert_eq!(db.allocate_page()?, 6);
+    assert_eq!(
+        counts
+            .database_file_size_calls
+            .load(AtomicOrdering::Acquire),
+        0,
+        "tail allocation should consume the checkpoint-refreshed cached count"
+    );
+    db.rollback()?;
+
+    db.begin_write()?;
+    db.free_page(page5)?;
+    db.free_page(page4)?;
+    db.commit()?;
+    db.checkpoint_wal()?;
+    assert_eq!(db.inner.pager.cached_page_count(), 3);
+    assert_eq!(
+        db.inner.pager.header_snapshot()?.freelist.page_count,
+        0,
+        "truncated tail pages must be removed from the freelist"
+    );
+
+    counts.reset();
+    db.begin_write()?;
+    assert_eq!(db.allocate_page()?, 4);
+    assert_eq!(
+        counts
+            .database_file_size_calls
+            .load(AtomicOrdering::Acquire),
+        0,
+        "post-truncation allocation should use the exact cached tail"
+    );
+    db.rollback()?;
+    Ok(())
+}
+
+#[test]
+fn allocate_page_rejects_page_id_exhaustion_without_reusing_max_staged_page() -> Result<()> {
+    let db = Db::open_or_create(":memory:", DbConfig::default())?;
+    db.begin_write()?;
+
+    let max_page_id = PageId::MAX;
+    db.write_page_owned(max_page_id, vec![0_u8; db.config().page_size as usize])?;
+    let error = db
+        .allocate_page()
+        .expect_err("allocation beyond the maximum page id must fail");
+    match error {
+        DbError::Constraint { message } => assert_eq!(
+            message,
+            format!(
+                "database page-id space exhausted; maximum page id {max_page_id} is already allocated"
+            )
+        ),
+        other => panic!("expected page-id exhaustion constraint, got {other:?}"),
+    }
+
+    let txn = db
+        .inner
+        .write_txn
+        .lock()
+        .map_err(|_| DbError::internal("write transaction lock poisoned"))?;
+    assert_eq!(txn.staged_pages.len(), 1);
+    assert!(txn.staged_pages.contains_key(&max_page_id));
+    drop(txn);
+    db.rollback()?;
+    Ok(())
+}
+
+#[test]
+fn coordinated_checkpoint_refreshes_cached_page_count_before_allocation() -> Result<()> {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("coordinated-page-count-refresh.ddb");
+    let config = DbConfig {
+        background_checkpoint_worker: false,
+        wal_checkpoint_threshold_pages: 0,
+        wal_checkpoint_threshold_bytes: 0,
+        ..DbConfig::default()
+    };
+
+    let db1 = Db::create(&path, config.clone())?;
+    db1.begin_write()?;
+    assert_eq!(db1.allocate_page()?, 3);
+    db1.commit()?;
+    db1.checkpoint_wal()?;
+
+    super::evict_shared_wal(&path)?;
+    let db2 = Db::open(&path, config)?;
+    assert_eq!(db2.inner.pager.cached_page_count(), 3);
+
+    db1.begin_write()?;
+    assert_eq!(db1.allocate_page()?, 4);
+    db1.commit()?;
+    db1.checkpoint_wal()?;
+
+    db2.begin_write()?;
+    assert_eq!(
+        db2.inner.pager.cached_page_count(),
+        4,
+        "checkpoint generation refresh must observe the external main-file growth"
+    );
+    assert_eq!(
+        db2.allocate_page()?,
+        5,
+        "allocation must not collide with the externally checkpointed page"
+    );
+    db2.rollback()?;
+    Ok(())
 }

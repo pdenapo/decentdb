@@ -14,121 +14,182 @@
 // Output: pretty-printed JSON to
 // results/<datetime>-rust-baseline-<profile>-<scale>.json.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
+#[cfg(feature = "extended-suites")]
 use std::hint::black_box;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{bail, Context};
+#[cfg(any(feature = "extended-suites", feature = "sqlite", feature = "duckdb"))]
+use anyhow::bail;
+#[cfg(feature = "extended-suites")]
+use anyhow::Context;
+#[cfg(feature = "extended-suites")]
 use clap::{Parser, ValueEnum};
 use decentdb::{DbConfig, PreparedStatement, Value};
+#[cfg(feature = "sqlite")]
 use rusqlite::{params, Connection as SqliteConnection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-#[derive(Parser, Debug)]
-#[command(version, about = "DecentDB rust-baseline benchmark")]
+#[derive(Debug)]
+#[cfg_attr(feature = "extended-suites", derive(Parser))]
+#[cfg_attr(
+    feature = "extended-suites",
+    command(
+        name = "rust-baseline",
+        version,
+        about = "DecentDB rust-baseline benchmark"
+    )
+)]
 struct Cli {
     /// Scale: smoke | medium | full | huge
-    #[arg(long, default_value = "smoke")]
+    #[cfg_attr(feature = "extended-suites", arg(long, default_value = "smoke"))]
     scale: String,
     /// Output directory for JSON report.
-    #[arg(long, default_value = "results")]
+    #[cfg_attr(feature = "extended-suites", arg(long, default_value = "results"))]
     out_dir: PathBuf,
     /// Database path (defaults by engine and scale).
-    #[arg(long)]
+    #[cfg_attr(feature = "extended-suites", arg(long))]
     db_path: Option<PathBuf>,
     /// Seed for the deterministic plan.
-    #[arg(long, default_value_t = 42u64)]
+    #[cfg_attr(feature = "extended-suites", arg(long, default_value_t = 42u64))]
     seed: u64,
     /// Engine profile: default | resident-hot-read.
-    #[arg(long, value_enum, default_value_t = BenchmarkProfile::Default)]
+    #[cfg_attr(
+        feature = "extended-suites",
+        arg(long, value_enum, default_value_t = BenchmarkProfile::Default)
+    )]
     profile: BenchmarkProfile,
-    /// Engine implementation: decentdb | sqlite | duckdb.
-    #[arg(long, value_enum, default_value_t = BenchmarkEngine::DecentDb)]
+    /// Engine implementation (available values depend on enabled Cargo features).
+    #[cfg_attr(
+        feature = "extended-suites",
+        arg(long, value_enum, default_value_t = BenchmarkEngine::DecentDb)
+    )]
     engine: BenchmarkEngine,
     /// Generate an HTML report from historical JSON files in the output directory.
+    #[cfg(feature = "extended-suites")]
     #[arg(long)]
     report: bool,
     /// Run all scales in order (smoke, medium, full, huge), then generate the HTML report.
+    #[cfg(feature = "extended-suites")]
     #[arg(long)]
     benchmark: bool,
     /// Run the DecentDB plan-cache guardrail benchmark and write a JSON report.
+    #[cfg(feature = "extended-suites")]
     #[arg(long)]
     plan_cache_benchmark: bool,
     /// HTML output path for --report or --benchmark (defaults to <out-dir>/report.html).
+    #[cfg(feature = "extended-suites")]
     #[arg(long)]
     report_file: Option<PathBuf>,
     /// Run music-library latency suite after seed and checkpoint.
+    #[cfg(feature = "extended-suites")]
     #[arg(long)]
     latency_suite: bool,
     /// Iterations for latency-suite queries.
+    #[cfg(feature = "extended-suites")]
     #[arg(long, default_value_t = 10000)]
     latency_iterations: u64,
     /// Warmup iterations for latency-suite queries.
+    #[cfg(feature = "extended-suites")]
     #[arg(long, default_value_t = 200)]
     latency_warmup: u64,
     /// Iterations for heavy latency-suite queries (view, top10).
+    #[cfg(feature = "extended-suites")]
     #[arg(long, default_value_t = 200)]
     heavy_latency_iterations: u64,
     /// Warmup iterations for heavy latency-suite queries.
+    #[cfg(feature = "extended-suites")]
     #[arg(long, default_value_t = 20)]
     heavy_latency_warmup: u64,
     /// Run concurrency suite after seed and checkpoint.
+    #[cfg(feature = "extended-suites")]
     #[arg(long)]
     concurrency_suite: bool,
     /// Comma-separated list of reader thread counts (e.g. 1,2,4,8).
+    #[cfg(feature = "extended-suites")]
     #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
     reader_thread_counts: Vec<usize>,
     /// Reads per thread in concurrency suite.
+    #[cfg(feature = "extended-suites")]
     #[arg(long, default_value_t = 25000)]
     concurrent_reads_per_thread: u64,
     /// Writer commits in concurrency read-under-write suite.
+    #[cfg(feature = "extended-suites")]
     #[arg(long, default_value_t = 1000)]
     writer_commits: u64,
     /// Run write suite after seed and checkpoint.
+    #[cfg(feature = "extended-suites")]
     #[arg(long)]
     write_suite: bool,
     /// Run cold/recovery suite.
+    #[cfg(feature = "extended-suites")]
     #[arg(long)]
     cold_suite: bool,
     /// Iterations for write-suite operations.
+    #[cfg(feature = "extended-suites")]
     #[arg(long, default_value_t = 1000)]
     write_iterations: u64,
     /// Row cap for full-scan materialization latency case.
+    #[cfg(feature = "extended-suites")]
     #[arg(long, default_value_t = 100000)]
     full_scan_row_limit: u64,
     /// SQLite exploratory profile (wal-normal).
-    #[arg(long)]
-    sqlite_profile: Option<String>,
+    #[cfg(feature = "sqlite")]
+    #[cfg_attr(feature = "extended-suites", arg(long, value_enum))]
+    sqlite_profile: Option<SqliteProfile>,
     /// Hidden: helper mode for cold-process open.
+    #[cfg(feature = "extended-suites")]
     #[arg(long, hide = true)]
     cold_helper: bool,
     /// Hidden: query type for cold helper (count_songs | artist_lookup).
+    #[cfg(feature = "extended-suites")]
     #[arg(long, hide = true)]
     cold_helper_query: Option<String>,
     /// Hidden: output path for cold helper JSON.
+    #[cfg(feature = "extended-suites")]
     #[arg(long, hide = true)]
     cold_helper_output: Option<PathBuf>,
     /// Hidden: expected query result for cold helper (count_songs only).
+    #[cfg(feature = "extended-suites")]
     #[arg(long, hide = true)]
     cold_helper_expected_count: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "extended-suites", derive(ValueEnum))]
 enum BenchmarkEngine {
-    #[value(name = "decentdb", alias = "decent-db")]
+    #[cfg_attr(
+        feature = "extended-suites",
+        value(name = "decentdb", alias = "decent-db")
+    )]
     DecentDb,
+    #[cfg(feature = "sqlite")]
     Sqlite,
-    #[value(name = "duckdb")]
+    #[cfg(feature = "duckdb")]
+    #[cfg_attr(feature = "extended-suites", value(name = "duckdb"))]
     DuckDb,
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "extended-suites", derive(ValueEnum))]
+enum SqliteProfile {
+    #[cfg_attr(feature = "extended-suites", value(name = "wal-normal"))]
+    WalNormal,
 }
 
 impl BenchmarkEngine {
     fn binding_name(self) -> &'static str {
         match self {
             Self::DecentDb => "RustRaw",
+            #[cfg(feature = "sqlite")]
             Self::Sqlite => "SQLiteRusqlite",
+            #[cfg(feature = "duckdb")]
             Self::DuckDb => "DuckDbRs",
         }
     }
@@ -136,13 +197,39 @@ impl BenchmarkEngine {
     fn default_db_path(self, scale: Scale) -> PathBuf {
         match self {
             Self::DecentDb => PathBuf::from(format!("run-rust-{}.ddb", scale.name)),
+            #[cfg(feature = "sqlite")]
             Self::Sqlite => PathBuf::from(format!("run-rust-sqlite-{}.db", scale.name)),
+            #[cfg(feature = "duckdb")]
             Self::DuckDb => PathBuf::from(format!("run-rust-duckdb-{}.db", scale.name)),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+fn validate_engine_profile(cli: &Cli) -> anyhow::Result<()> {
+    #[cfg(feature = "sqlite")]
+    if cli.sqlite_profile.is_some() && cli.engine != BenchmarkEngine::Sqlite {
+        bail!("--sqlite-profile is only supported for --engine sqlite");
+    }
+
+    match cli.engine {
+        BenchmarkEngine::DecentDb => Ok(()),
+        #[cfg(feature = "sqlite")]
+        BenchmarkEngine::Sqlite => validate_comparison_engine_profile(cli.profile),
+        #[cfg(feature = "duckdb")]
+        BenchmarkEngine::DuckDb => validate_comparison_engine_profile(cli.profile),
+    }
+}
+
+#[cfg(any(feature = "sqlite", feature = "duckdb"))]
+fn validate_comparison_engine_profile(profile: BenchmarkProfile) -> anyhow::Result<()> {
+    if profile != BenchmarkProfile::Default {
+        bail!("--profile is only supported for --engine decentdb");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "extended-suites", derive(ValueEnum))]
 enum BenchmarkProfile {
     /// Default durable engine configuration.
     Default,
@@ -169,10 +256,236 @@ impl BenchmarkProfile {
     }
 }
 
+#[cfg(not(feature = "extended-suites"))]
+#[derive(Debug)]
+enum CanonicalCliAction {
+    Run(Cli),
+    Help,
+    Version,
+}
+
+#[cfg(not(feature = "extended-suites"))]
+#[cold]
+#[inline(never)]
+fn canonical_missing_value(option: &str) -> String {
+    format!("missing value for {option}")
+}
+
+#[cfg(not(feature = "extended-suites"))]
+#[cold]
+#[inline(never)]
+fn canonical_invalid_value(option: &str, value: &str) -> String {
+    format!("invalid value '{value}' for {option}")
+}
+
+#[cfg(not(feature = "extended-suites"))]
+#[cold]
+#[inline(never)]
+fn canonical_unexpected_argument(argument: &str) -> String {
+    format!("unexpected argument {argument:?}")
+}
+
+#[cfg(not(feature = "extended-suites"))]
+#[cold]
+#[inline(never)]
+fn canonical_non_utf8_value(option: &str) -> String {
+    format!("value for {option} must be valid UTF-8")
+}
+
+#[cfg(not(feature = "extended-suites"))]
+fn canonical_required_os_value<I>(
+    arguments: &mut I,
+    inline_value: Option<&str>,
+    option: &str,
+) -> Result<std::ffi::OsString, String>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    inline_value.map(std::ffi::OsString::from).map_or_else(
+        || {
+            arguments
+                .next()
+                .ok_or_else(|| canonical_missing_value(option))
+        },
+        Ok,
+    )
+}
+
+#[cfg(not(feature = "extended-suites"))]
+fn canonical_required_text_value<I>(
+    arguments: &mut I,
+    inline_value: Option<&str>,
+    option: &str,
+) -> Result<String, String>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    canonical_required_os_value(arguments, inline_value, option)?
+        .into_string()
+        .map_err(|_| canonical_non_utf8_value(option))
+}
+
+#[cfg(not(feature = "extended-suites"))]
+fn parse_canonical_cli_from<I, T>(arguments: I) -> Result<CanonicalCliAction, String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    let mut arguments = arguments.into_iter().map(Into::into);
+    let _program = arguments.next();
+    let mut scale = "smoke".to_string();
+    let mut out_dir = PathBuf::from("results");
+    let mut db_path = None;
+    let mut seed = 42_u64;
+    let mut profile = BenchmarkProfile::Default;
+    let mut engine = BenchmarkEngine::DecentDb;
+    #[cfg(feature = "sqlite")]
+    let mut sqlite_profile = None;
+
+    while let Some(argument) = arguments.next() {
+        let argument = argument
+            .into_string()
+            .map_err(|_| "option names must be valid UTF-8".to_string())?;
+        if matches!(argument.as_str(), "-h" | "--help") {
+            return Ok(CanonicalCliAction::Help);
+        }
+        if matches!(argument.as_str(), "-V" | "--version") {
+            return Ok(CanonicalCliAction::Version);
+        }
+        let (option, inline_value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(option, value)| {
+                (option, Some(value.to_string()))
+            });
+        match option {
+            "--scale" => {
+                scale =
+                    canonical_required_text_value(&mut arguments, inline_value.as_deref(), option)?;
+            }
+            "--out-dir" => {
+                out_dir = PathBuf::from(canonical_required_os_value(
+                    &mut arguments,
+                    inline_value.as_deref(),
+                    option,
+                )?);
+            }
+            "--db-path" => {
+                db_path = Some(PathBuf::from(canonical_required_os_value(
+                    &mut arguments,
+                    inline_value.as_deref(),
+                    option,
+                )?));
+            }
+            "--seed" => {
+                let value =
+                    canonical_required_text_value(&mut arguments, inline_value.as_deref(), option)?;
+                seed = value
+                    .parse()
+                    .map_err(|_| canonical_invalid_value("--seed", &value))?;
+            }
+            "--profile" => {
+                let value =
+                    canonical_required_text_value(&mut arguments, inline_value.as_deref(), option)?;
+                profile = match value.as_str() {
+                    "default" => BenchmarkProfile::Default,
+                    "resident-hot-read" => BenchmarkProfile::ResidentHotRead,
+                    _ => return Err(canonical_invalid_value("--profile", &value)),
+                };
+            }
+            "--engine" => {
+                let value =
+                    canonical_required_text_value(&mut arguments, inline_value.as_deref(), option)?;
+                engine = match value.as_str() {
+                    "decentdb" | "decent-db" => BenchmarkEngine::DecentDb,
+                    #[cfg(feature = "sqlite")]
+                    "sqlite" => BenchmarkEngine::Sqlite,
+                    #[cfg(feature = "duckdb")]
+                    "duckdb" => BenchmarkEngine::DuckDb,
+                    _ => return Err(canonical_invalid_value("--engine", &value)),
+                };
+            }
+            #[cfg(feature = "sqlite")]
+            "--sqlite-profile" => {
+                let value =
+                    canonical_required_text_value(&mut arguments, inline_value.as_deref(), option)?;
+                sqlite_profile = match value.as_str() {
+                    "wal-normal" => Some(SqliteProfile::WalNormal),
+                    _ => {
+                        return Err(format!(
+                            "{}; expected 'wal-normal'",
+                            canonical_invalid_value("--sqlite-profile", &value)
+                        ));
+                    }
+                };
+            }
+            _ => return Err(canonical_unexpected_argument(&argument)),
+        }
+    }
+
+    Ok(CanonicalCliAction::Run(Cli {
+        scale,
+        out_dir,
+        db_path,
+        seed,
+        profile,
+        engine,
+        #[cfg(feature = "sqlite")]
+        sqlite_profile,
+    }))
+}
+
+#[cfg(not(feature = "extended-suites"))]
+fn parse_cli() -> Cli {
+    match parse_canonical_cli_from(std::env::args_os()) {
+        Ok(CanonicalCliAction::Run(cli)) => cli,
+        Ok(CanonicalCliAction::Help) => {
+            println!(
+                "DecentDB rust-baseline benchmark\n\n\
+                 Usage: rust-baseline [OPTIONS]\n\n\
+                 Options:\n  \
+                   --scale <smoke|medium|full|huge>\n  \
+                   --out-dir <PATH>\n  \
+                   --db-path <PATH>\n  \
+                   --seed <INTEGER>\n  \
+                   --profile <default|resident-hot-read>\n  \
+                   --engine <decentdb{}{}>\n  \
+                   -h, --help\n  \
+                   -V, --version",
+                if cfg!(feature = "sqlite") {
+                    "|sqlite"
+                } else {
+                    ""
+                },
+                if cfg!(feature = "duckdb") {
+                    "|duckdb"
+                } else {
+                    ""
+                },
+            );
+            std::process::exit(0);
+        }
+        Ok(CanonicalCliAction::Version) => {
+            println!("rust-baseline {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(feature = "extended-suites")]
+fn parse_cli() -> Cli {
+    Cli::parse()
+}
+
 fn engine_access_path(engine: BenchmarkEngine) -> &'static str {
     match engine {
         BenchmarkEngine::DecentDb => "decentdb_native_rust",
+        #[cfg(feature = "sqlite")]
         BenchmarkEngine::Sqlite => "sqlite_rusqlite_c_api",
+        #[cfg(feature = "duckdb")]
         BenchmarkEngine::DuckDb => "duckdb_rs_c_api",
     }
 }
@@ -180,7 +493,9 @@ fn engine_access_path(engine: BenchmarkEngine) -> &'static str {
 fn durability_profile_label(engine: BenchmarkEngine) -> &'static str {
     match engine {
         BenchmarkEngine::DecentDb => "decentdb_durable_wal_default",
+        #[cfg(feature = "sqlite")]
         BenchmarkEngine::Sqlite => "sqlite_wal_full",
+        #[cfg(feature = "duckdb")]
         BenchmarkEngine::DuckDb => "duckdb_engine_default",
     }
 }
@@ -191,17 +506,29 @@ fn cache_profile_label(engine: BenchmarkEngine, profile: BenchmarkProfile) -> &'
             BenchmarkProfile::Default => "decentdb_default_low_memory",
             BenchmarkProfile::ResidentHotRead => "decentdb_resident_hot_read",
         },
+        #[cfg(feature = "sqlite")]
         BenchmarkEngine::Sqlite => "sqlite_default_cache",
+        #[cfg(feature = "duckdb")]
         BenchmarkEngine::DuckDb => "duckdb_threads_1",
     }
 }
+
+const DECENTDB_CHECKPOINT_DURABILITY_CONTRACT: &str = "main-db-sync-before-wal-truncate-v1";
+const RUNNER_CONTRACT_VERSION: u32 = 1;
+const RESULT_SCHEMA_VERSION: u32 = 3;
 
 fn populate_run_report_metadata(
     report: &mut RunReport,
     engine: BenchmarkEngine,
     profile: BenchmarkProfile,
 ) {
-    report.result_schema_version = 2;
+    report.result_schema_version = RESULT_SCHEMA_VERSION;
+    report.compiled_optional_features = compiled_optional_features();
+    report.checkpoint_durability_contract = if engine == BenchmarkEngine::DecentDb {
+        DECENTDB_CHECKPOINT_DURABILITY_CONTRACT.to_string()
+    } else {
+        String::new()
+    };
     report.measurement_family = "music_library_total_runtime".to_string();
     report.engine_access_path = engine_access_path(engine).to_string();
     report.durability_profile = durability_profile_label(engine).to_string();
@@ -211,6 +538,20 @@ fn populate_run_report_metadata(
     report.cold_state_policy = "same_process_fresh_create_then_query".to_string();
 }
 
+fn compiled_optional_features() -> Vec<String> {
+    [
+        (cfg!(feature = "duckdb"), "duckdb"),
+        (cfg!(feature = "extended-suites"), "extended-suites"),
+        (cfg!(feature = "lua-extensions"), "lua-extensions"),
+        (cfg!(feature = "sqlite"), "sqlite"),
+    ]
+    .into_iter()
+    .filter(|(enabled, _)| *enabled)
+    .map(|(_, feature)| feature.to_string())
+    .collect()
+}
+
+#[cfg(feature = "extended-suites")]
 fn write_events_ddl() -> &'static str {
     "CREATE TABLE write_events (\
         id BIGINT PRIMARY KEY,\
@@ -301,6 +642,7 @@ const HUGE: Scale = Scale {
     max_songs_per_album: 10,
     songs_cap: 25_000_000,
 };
+#[cfg(any(feature = "extended-suites", test))]
 const BENCHMARK_SCALES: [Scale; 4] = [SMOKE, MEDIUM, FULL, HUGE];
 
 fn parse_scale(name: &str) -> Scale {
@@ -551,6 +893,18 @@ struct RunReport {
     #[serde(default = "default_result_schema_version")]
     result_schema_version: u32,
     #[serde(default)]
+    runner_contract_version: u32,
+    #[serde(default)]
+    seed: u64,
+    #[serde(default)]
+    invocation_argv: Vec<String>,
+    #[serde(default)]
+    executable_sha256: String,
+    #[serde(default)]
+    compiled_optional_features: Vec<String>,
+    #[serde(default)]
+    checkpoint_durability_contract: String,
+    #[serde(default)]
     measurement_family: String,
     #[serde(default)]
     engine_access_path: String,
@@ -585,6 +939,302 @@ struct RunReport {
     cold_cases: Vec<LatencyCaseMetric>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum SemanticValue {
+    Null,
+    Int64(i64),
+    Float64(f64),
+    Bool(bool),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+type SemanticRows = Vec<Vec<SemanticValue>>;
+
+fn semantic_rows_from_decentdb(result: &decentdb::QueryResult) -> Result<SemanticRows, String> {
+    result
+        .rows()
+        .iter()
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(|value| match value {
+                    Value::Null => Ok(SemanticValue::Null),
+                    Value::Int64(value) => Ok(SemanticValue::Int64(*value)),
+                    Value::Float64(value) => Ok(SemanticValue::Float64(*value)),
+                    Value::Bool(value) => Ok(SemanticValue::Bool(*value)),
+                    Value::Text(value) => Ok(SemanticValue::Text(value.clone())),
+                    Value::Blob(value) => Ok(SemanticValue::Blob(value.clone())),
+                    other => Err(format!(
+                        "unsupported value in benchmark semantic evidence: {other:?}"
+                    )),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn semantic_checksum(rows: &SemanticRows) -> String {
+    fn update_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut row_digests = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut row_hasher = Sha256::new();
+        row_hasher.update(b"decentdb-rust-baseline-query-row-v1\0");
+        row_hasher.update((row.len() as u64).to_le_bytes());
+        for value in row {
+            match value {
+                SemanticValue::Null => row_hasher.update([0]),
+                SemanticValue::Int64(value) => {
+                    row_hasher.update([1]);
+                    row_hasher.update(value.to_le_bytes());
+                }
+                SemanticValue::Float64(value) => {
+                    row_hasher.update([2]);
+                    row_hasher.update(value.to_bits().to_le_bytes());
+                }
+                SemanticValue::Bool(value) => {
+                    row_hasher.update([3]);
+                    row_hasher.update([u8::from(*value)]);
+                }
+                SemanticValue::Text(value) => {
+                    row_hasher.update([4]);
+                    update_bytes(&mut row_hasher, value.as_bytes());
+                }
+                SemanticValue::Blob(value) => {
+                    row_hasher.update([5]);
+                    update_bytes(&mut row_hasher, value);
+                }
+            }
+        }
+        row_digests.push(row_hasher.finalize());
+    }
+    row_digests.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(b"decentdb-rust-baseline-query-evidence-v2\0");
+    hasher.update((row_digests.len() as u64).to_le_bytes());
+    for digest in row_digests {
+        hasher.update(digest);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn semantic_int(row: &[SemanticValue], index: usize, label: &str) -> Result<i64, String> {
+    match row.get(index) {
+        Some(SemanticValue::Int64(value)) => Ok(*value),
+        value => Err(format!("{label} must be Int64, got {value:?}")),
+    }
+}
+
+fn semantic_number(row: &[SemanticValue], index: usize, label: &str) -> Result<f64, String> {
+    match row.get(index) {
+        Some(SemanticValue::Float64(value)) if value.is_finite() => Ok(*value),
+        Some(SemanticValue::Int64(value)) => Ok(*value as f64),
+        value => Err(format!("{label} must be a finite number, got {value:?}")),
+    }
+}
+
+fn semantic_text<'a>(
+    row: &'a [SemanticValue],
+    index: usize,
+    label: &str,
+) -> Result<&'a str, String> {
+    match row.get(index) {
+        Some(SemanticValue::Text(value)) => Ok(value),
+        value => Err(format!("{label} must be Text, got {value:?}")),
+    }
+}
+
+fn require_column_count(row: &[SemanticValue], count: usize, label: &str) -> Result<(), String> {
+    if row.len() != count {
+        return Err(format!(
+            "{label} returned {} columns; expected {count}",
+            row.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_query_semantics(
+    query_name: &str,
+    rows: &SemanticRows,
+    scale: Scale,
+    total_songs: u64,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut extra = serde_json::Map::new();
+    extra.insert("row_count".into(), serde_json::json!(rows.len()));
+
+    match query_name {
+        "query_count_songs" => {
+            if rows.len() != 1 {
+                return Err(format!(
+                    "count query returned {} rows; expected 1",
+                    rows.len()
+                ));
+            }
+            require_column_count(&rows[0], 1, query_name)?;
+            let count = semantic_int(&rows[0], 0, "song count")?;
+            if count != total_songs as i64 {
+                return Err(format!(
+                    "count query returned {count}; expected {total_songs}"
+                ));
+            }
+            extra.insert("count".into(), serde_json::json!(count));
+        }
+        "query_aggregate_durations" => {
+            if rows.len() != 1 {
+                return Err(format!(
+                    "aggregate query returned {} rows; expected 1",
+                    rows.len()
+                ));
+            }
+            let row = &rows[0];
+            require_column_count(row, 5, query_name)?;
+            let count = semantic_int(row, 0, "aggregate count")?;
+            let sum = semantic_int(row, 1, "duration sum")?;
+            let average = semantic_number(row, 2, "duration average")?;
+            let minimum = semantic_int(row, 3, "duration minimum")?;
+            let maximum = semantic_int(row, 4, "duration maximum")?;
+            if count != total_songs as i64
+                || sum <= 0
+                || minimum <= 0
+                || maximum < minimum
+                || average < minimum as f64
+                || average > maximum as f64
+                || ((sum as f64 / count as f64) - average).abs() > 1e-9
+            {
+                return Err(format!(
+                    "invalid aggregate tuple: count={count}, sum={sum}, avg={average}, min={minimum}, max={maximum}"
+                ));
+            }
+            extra.insert("song_count".into(), serde_json::json!(count));
+            extra.insert("duration_sum".into(), serde_json::json!(sum));
+            extra.insert("duration_average".into(), serde_json::json!(average));
+            extra.insert("duration_minimum".into(), serde_json::json!(minimum));
+            extra.insert("duration_maximum".into(), serde_json::json!(maximum));
+        }
+        "query_artist_by_id" => {
+            if rows.len() != 1 {
+                return Err(format!(
+                    "artist lookup returned {} rows; expected 1",
+                    rows.len()
+                ));
+            }
+            let row = &rows[0];
+            require_column_count(row, 4, query_name)?;
+            let target = i64::from(scale.artists) / 2 + 1;
+            let artist_id = semantic_int(row, 0, "artist id")?;
+            let artist_name = semantic_text(row, 1, "artist name")?;
+            let country = semantic_text(row, 2, "artist country")?;
+            let formed_year = semantic_int(row, 3, "artist formed year")?;
+            if artist_id != target
+                || artist_name != format!("Artist {target}")
+                || country.is_empty()
+                || !(1900..=2100).contains(&formed_year)
+            {
+                return Err(format!("invalid artist lookup row: {row:?}"));
+            }
+            extra.insert("target_artist_id".into(), serde_json::json!(target));
+            extra.insert("artist_id".into(), serde_json::json!(artist_id));
+            extra.insert("artist_name".into(), serde_json::json!(artist_name));
+        }
+        "query_top10_artists_by_songs" | "query_top10_albums_by_songs" => {
+            if rows.len() != 10 {
+                return Err(format!(
+                    "{query_name} returned {} rows; expected 10",
+                    rows.len()
+                ));
+            }
+            let label = if query_name == "query_top10_artists_by_songs" {
+                "Artist"
+            } else {
+                "Album"
+            };
+            let mut ids = HashSet::with_capacity(rows.len());
+            let mut previous_count = i64::MAX;
+            for row in rows {
+                require_column_count(row, 3, query_name)?;
+                let id = semantic_int(row, 0, "top10 id")?;
+                let name = semantic_text(row, 1, "top10 name")?;
+                let count = semantic_int(row, 2, "top10 song count")?;
+                if id <= 0
+                    || !ids.insert(id)
+                    || name != format!("{label} {id}")
+                    || count <= 0
+                    || count > previous_count
+                {
+                    return Err(format!("invalid {query_name} row/order: {row:?}"));
+                }
+                previous_count = count;
+            }
+        }
+        "query_view_first_1000" => {
+            let expected_rows = usize::try_from(total_songs.min(1000)).unwrap_or(1000);
+            if rows.len() != expected_rows {
+                return Err(format!(
+                    "view query returned {} rows; expected {expected_rows}",
+                    rows.len()
+                ));
+            }
+            for row in rows {
+                require_column_count(row, 4, query_name)?;
+                let artist_id = semantic_int(row, 0, "view artist id")?;
+                let artist_name = semantic_text(row, 1, "view artist name")?;
+                let album_title = semantic_text(row, 2, "view album title")?;
+                let song_title = semantic_text(row, 3, "view song title")?;
+                if artist_id <= 0
+                    || artist_name != format!("Artist {artist_id}")
+                    || !album_title.starts_with("Album ")
+                    || !song_title.starts_with("Song ")
+                {
+                    return Err(format!("invalid view row: {row:?}"));
+                }
+            }
+        }
+        "query_songs_for_artist_via_view" => {
+            if rows.is_empty() {
+                return Err("filtered view query returned no rows".to_string());
+            }
+            for row in rows {
+                require_column_count(row, 3, query_name)?;
+                let album_title = semantic_text(row, 0, "filtered album title")?;
+                let song_title = semantic_text(row, 1, "filtered song title")?;
+                let duration = semantic_int(row, 2, "filtered song duration")?;
+                if !album_title.starts_with("Album ")
+                    || !song_title.starts_with("Song ")
+                    || duration <= 0
+                {
+                    return Err(format!("invalid filtered view row: {row:?}"));
+                }
+            }
+        }
+        _ => return Err(format!("unknown semantic query {query_name}")),
+    }
+    extra.insert(
+        "semantic_checksum_sha256".into(),
+        serde_json::json!(semantic_checksum(rows)),
+    );
+    Ok(extra)
+}
+
+fn add_query_evidence(
+    recorder: &mut Recorder<'_>,
+    query_name: &str,
+    rows: &SemanticRows,
+    scale: Scale,
+    total_songs: u64,
+) {
+    let evidence = validate_query_semantics(query_name, rows, scale, total_songs)
+        .unwrap_or_else(|error| panic!("{query_name} semantic validation failed: {error}"));
+    for (key, value) in evidence {
+        recorder.add_extra(&key, value);
+    }
+}
+
+#[cfg(feature = "extended-suites")]
 #[derive(Clone, Default, Serialize)]
 struct PlanCacheBenchmarkReport {
     binding: String,
@@ -596,6 +1246,7 @@ struct PlanCacheBenchmarkReport {
     cases: Vec<PlanCacheCaseMetric>,
 }
 
+#[cfg(feature = "extended-suites")]
 #[derive(Clone, Default, Serialize)]
 struct PlanCacheCaseMetric {
     scenario: String,
@@ -611,6 +1262,7 @@ struct PlanCacheCaseMetric {
     total_misses: u64,
 }
 
+#[cfg(feature = "extended-suites")]
 #[derive(Clone, Serialize)]
 struct HistoricalRun {
     file_name: String,
@@ -620,6 +1272,7 @@ struct HistoricalRun {
     report: RunReport,
 }
 
+#[cfg(feature = "extended-suites")]
 #[derive(Serialize)]
 struct ReportScaleSection {
     scale_name: String,
@@ -627,6 +1280,7 @@ struct ReportScaleSection {
     runs: Vec<HistoricalRun>,
 }
 
+#[cfg(feature = "extended-suites")]
 #[derive(Serialize)]
 struct HtmlReportData {
     generated_at_unix: u64,
@@ -636,6 +1290,21 @@ struct HtmlReportData {
     scales: Vec<ReportScaleSection>,
 }
 
+#[cfg(feature = "extended-suites")]
+#[derive(Deserialize)]
+struct ReportHistoryManifest {
+    schema_version: u32,
+    files: Vec<ReportHistoryManifestEntry>,
+}
+
+#[cfg(feature = "extended-suites")]
+#[derive(Deserialize)]
+struct ReportHistoryManifestEntry {
+    path: String,
+    sha256: String,
+}
+
+#[cfg(feature = "extended-suites")]
 #[derive(Serialize, Deserialize)]
 struct ColdHelperOutput {
     duration_ns: u64,
@@ -645,31 +1314,90 @@ struct ColdHelperOutput {
     result_count: Option<u64>,
 }
 
-fn read_rss_bytes() -> u64 {
-    // /proc/self/statm: size resident shared text lib data dt
-    // resident is in pages.
-    if let Ok(s) = fs::read_to_string("/proc/self/statm") {
-        if let Some(resident) = s.split_whitespace().nth(1) {
-            if let Ok(pages) = resident.parse::<u64>() {
-                let page = unsafe { libc_sysconf_pagesize() };
-                return pages * page;
-            }
-        }
-    }
-    0
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MemorySample {
+    rss_bytes: u64,
+    rss_anon_kb: u64,
+    rss_file_kb: u64,
 }
 
-fn read_proc_status_kb(field: &str) -> Option<u64> {
-    let s = fs::read_to_string("/proc/self/status").ok()?;
-    for line in s.lines() {
-        if line.starts_with(field) {
-            let parts: Vec<_> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                return parts[1].parse::<u64>().ok();
+fn parse_ascii_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    bytes.iter().try_fold(0_u64, |value, byte| {
+        byte.is_ascii_digit()
+            .then_some(())
+            .and_then(|()| value.checked_mul(10))
+            .and_then(|value| value.checked_add(u64::from(*byte - b'0')))
+    })
+}
+
+fn parse_statm_resident_pages(bytes: &[u8]) -> Option<u64> {
+    bytes
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .nth(1)
+        .and_then(parse_ascii_u64)
+}
+
+fn parse_status_kb(bytes: &[u8], field: &[u8]) -> Option<u64> {
+    bytes.split(|byte| *byte == b'\n').find_map(|line| {
+        line.strip_prefix(field).and_then(|suffix| {
+            suffix
+                .split(|byte| byte.is_ascii_whitespace())
+                .find(|value| !value.is_empty())
+                .and_then(parse_ascii_u64)
+        })
+    })
+}
+
+fn read_proc_file(path: &str, buffer: &mut [u8]) -> usize {
+    let Ok(mut file) = fs::File::open(path) else {
+        return 0;
+    };
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(bytes_read) => filled += bytes_read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return 0,
+        }
+    }
+
+    // Do not parse a truncated proc record. The benchmark report's zero
+    // fallback is preferable to silently publishing a partial sample.
+    if filled == buffer.len() {
+        let mut extra = [0_u8; 1];
+        loop {
+            match file.read(&mut extra) {
+                Ok(0) => break,
+                Ok(_) => return 0,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return 0,
             }
         }
     }
-    None
+    filled
+}
+
+fn read_memory_sample() -> MemorySample {
+    // Linux proc status records are normally well below one page. If either
+    // record exceeds this bound, read_proc_file rejects it rather than parsing
+    // a truncated metric.
+    let mut buffer = [0_u8; 4 * 1024];
+    let statm_len = read_proc_file("/proc/self/statm", &mut buffer);
+    let resident_pages = parse_statm_resident_pages(&buffer[..statm_len]).unwrap_or(0);
+    let rss_bytes = resident_pages.saturating_mul(unsafe { libc_sysconf_pagesize() });
+
+    let status_len = read_proc_file("/proc/self/status", &mut buffer);
+    let status = &buffer[..status_len];
+    MemorySample {
+        rss_bytes,
+        rss_anon_kb: parse_status_kb(status, b"RssAnon:").unwrap_or(0),
+        rss_file_kb: parse_status_kb(status, b"RssFile:").unwrap_or(0),
+    }
 }
 
 // Tiny inline syscall to avoid pulling libc crate.
@@ -698,6 +1426,7 @@ impl<'a> Recorder<'a> {
             peak_rss: 0,
         }
     }
+    #[cfg(feature = "extended-suites")]
     fn format_duration_ns(ns: u64) -> String {
         if ns < 1_000 {
             format!("{ns} ns")
@@ -717,9 +1446,10 @@ impl<'a> Recorder<'a> {
         let out = body();
         let dur_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0;
         let dur_secs = dur_ns / 1_000_000_000.0;
-        let rss = read_rss_bytes();
-        let rss_anon_kb = read_proc_status_kb("RssAnon:").unwrap_or(0);
-        let rss_file_kb = read_proc_status_kb("RssFile:").unwrap_or(0);
+        let memory = read_memory_sample();
+        let rss = memory.rss_bytes;
+        let rss_anon_kb = memory.rss_anon_kb;
+        let rss_file_kb = memory.rss_file_kb;
         if rss > self.peak_rss {
             self.peak_rss = rss;
         }
@@ -730,6 +1460,7 @@ impl<'a> Recorder<'a> {
                 0.0
             }
         });
+        #[cfg(feature = "extended-suites")]
         println!(
             "  [Rust    ] {:<38} {:>12}  {:>14}  {:>14}  RSS={:>9}",
             name,
@@ -758,6 +1489,7 @@ impl<'a> Recorder<'a> {
     }
 }
 
+#[cfg(feature = "extended-suites")]
 fn format_bytes(b: u64) -> String {
     const U: &[&str] = &["B", "KB", "MB", "GB"];
     let mut v = b as f64;
@@ -779,9 +1511,11 @@ fn now_unix() -> u64 {
 
 fn delete_db_files(path: &Path) {
     let _ = fs::remove_file(path);
-    // DecentDB writes <db>.wal as the WAL companion (per the engine's WAL
-    // suffix convention used elsewhere in the workspace).
-    let _ = fs::remove_file(decentdb_wal_path(path));
+    // Remove every companion file used by the benchmark's supported
+    // DecentDB profiles so each measured create starts from clean storage.
+    for suffix in [".wal", ".coord", ".wal-idx"] {
+        let _ = fs::remove_file(decentdb_companion_path(path, suffix));
+    }
     // Belt-and-suspenders: the .NET tests use both -wal and .wal historically.
     if let Some(stem) = path.file_name().and_then(|s| s.to_str()) {
         if let Some(parent) = path.parent() {
@@ -795,21 +1529,60 @@ fn file_size(path: &Path) -> u64 {
     fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
-fn decentdb_wal_path(path: &Path) -> PathBuf {
-    let mut wal = path.as_os_str().to_owned();
-    wal.push(".wal");
-    PathBuf::from(wal)
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn finalize_runner_provenance(report: &mut RunReport, seed: u64) -> anyhow::Result<()> {
+    let invocation_argv = std::env::args_os()
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("benchmark argv contains non-UTF-8 bytes"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    report.runner_contract_version = RUNNER_CONTRACT_VERSION;
+    report.seed = seed;
+    report.invocation_argv = invocation_argv;
+    let executable = std::env::current_exe()?;
+    report.executable_sha256 = sha256_file(&executable)?;
+    Ok(())
+}
+
+fn decentdb_wal_path(path: &Path) -> PathBuf {
+    decentdb_companion_path(path, ".wal")
+}
+
+fn decentdb_companion_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut companion = path.as_os_str().to_owned();
+    companion.push(suffix);
+    PathBuf::from(companion)
+}
+
+#[cfg(feature = "extended-suites")]
 fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+#[cfg(feature = "extended-suites")]
 fn helper_output_dir(preferred: &Path) -> anyhow::Result<PathBuf> {
     let fallback = PathBuf::from(".tmp");
     for candidate in [preferred, fallback.as_path()] {
         if let Ok(()) = fs::create_dir_all(candidate) {
-            return Ok(candidate.canonicalize().unwrap_or_else(|_| candidate.to_path_buf()));
+            return Ok(candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.to_path_buf()));
         }
     }
     bail!(
@@ -819,23 +1592,36 @@ fn helper_output_dir(preferred: &Path) -> anyhow::Result<PathBuf> {
     );
 }
 
+#[cfg(feature = "extended-suites")]
 fn resolve_cold_helper_executable() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     Ok(exe.canonicalize().unwrap_or(exe))
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
+    #[cfg(feature = "extended-suites")]
     if cli.cold_helper {
         return run_cold_helper(cli);
     }
 
+    #[cfg(feature = "extended-suites")]
     if cli.plan_cache_benchmark && (cli.benchmark || cli.report) {
         bail!("--plan-cache-benchmark cannot be combined with --benchmark or --report");
     }
+    #[cfg(feature = "extended-suites")]
     if cli.report_file.is_some() && !cli.report && !cli.benchmark {
         bail!("--report-file requires --report or --benchmark");
     }
 
+    #[cfg(feature = "extended-suites")]
+    if cli.report && !cli.benchmark && !cli.plan_cache_benchmark {
+        generate_report_from_cli(&cli)?;
+        return Ok(());
+    }
+
+    validate_engine_profile(&cli)?;
+
+    #[cfg(feature = "extended-suites")]
     if cli.plan_cache_benchmark {
         if cli.latency_suite || cli.concurrency_suite || cli.write_suite || cli.cold_suite {
             bail!("--plan-cache-benchmark cannot be combined with --latency-suite, --concurrency-suite, --write-suite, or --cold-suite");
@@ -843,56 +1629,53 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         return run_plan_cache_benchmark(&cli);
     }
 
+    #[cfg(feature = "extended-suites")]
     if cli.benchmark {
-        if cli.engine == BenchmarkEngine::DuckDb {
-            // DuckDB benchmark suite: only smoke and medium by default
-            eprintln!("Note: DuckDB benchmark defaults to smoke,medium; huge is extremely large for columnar storage.");
-        }
         return run_benchmark_suite(&cli);
     }
 
-    if cli.report {
-        generate_report_from_cli(&cli)?;
-        return Ok(());
-    }
-
-    if cli.engine == BenchmarkEngine::Sqlite && cli.profile != BenchmarkProfile::Default {
-        bail!("--profile is only supported for --engine decentdb");
-    }
-
+    #[cfg(feature = "duckdb")]
     if cli.engine == BenchmarkEngine::DuckDb {
-        return run_duckdb_benchmark(&cli);
+        return run_duckdb_benchmark(&cli, parse_scale(&cli.scale));
     }
 
     let scale = parse_scale(&cli.scale);
     run_single_benchmark(&cli, scale)
 }
 
+#[cfg(feature = "extended-suites")]
 fn run_benchmark_suite(cli: &Cli) -> anyhow::Result<()> {
     if cli.db_path.is_some() {
         bail!("--db-path is not supported with --benchmark; each scale uses its own database path");
     }
-    if cli.engine == BenchmarkEngine::Sqlite && cli.profile != BenchmarkProfile::Default {
-        bail!("--profile is only supported for --engine decentdb");
-    }
+    validate_engine_profile(cli)?;
 
+    #[cfg(feature = "sqlite")]
+    let suite_profile = if cli.engine == BenchmarkEngine::Sqlite {
+        "sqlite-wal-full"
+    } else {
+        cli.profile.as_str()
+    };
+    #[cfg(not(feature = "sqlite"))]
+    let suite_profile = cli.profile.as_str();
     println!(
         "Running rust-baseline benchmark suite: engine={:?} profile={} scales=smoke,medium,full,huge",
-        cli.engine,
-        if cli.engine == BenchmarkEngine::Sqlite {
-            "sqlite-wal-full"
-        } else {
-            cli.profile.as_str()
-        }
+        cli.engine, suite_profile
     );
     for scale in BENCHMARK_SCALES {
         println!("\n=== scale: {} ===", scale.name);
+        #[cfg(feature = "duckdb")]
+        if cli.engine == BenchmarkEngine::DuckDb {
+            run_duckdb_benchmark(cli, scale)?;
+            continue;
+        }
         run_single_benchmark(cli, scale)?;
     }
     generate_report_from_cli(cli)?;
     Ok(())
 }
 
+#[cfg(feature = "extended-suites")]
 fn generate_report_from_cli(cli: &Cli) -> anyhow::Result<()> {
     let report_file = cli
         .report_file
@@ -903,13 +1686,20 @@ fn generate_report_from_cli(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "extended-suites")]
 const PLAN_CACHE_BENCH_ROWS: i64 = 10_000;
+#[cfg(feature = "extended-suites")]
 const PLAN_CACHE_REPEATED_ITERS: u64 = 20_000;
+#[cfg(feature = "extended-suites")]
 const PLAN_CACHE_ONE_SHOT_ITERS: u64 = 1_000;
+#[cfg(feature = "extended-suites")]
 const PLAN_CACHE_CHURN_ITERS: u64 = 20_000;
+#[cfg(feature = "extended-suites")]
 const PLAN_CACHE_CHURN_VARIANTS: usize = 1_000;
+#[cfg(feature = "extended-suites")]
 const PLAN_CACHE_CHURN_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(feature = "extended-suites")]
 fn run_plan_cache_benchmark(cli: &Cli) -> anyhow::Result<()> {
     if cli.engine != BenchmarkEngine::DecentDb {
         bail!("--plan-cache-benchmark is DecentDB-only");
@@ -961,6 +1751,7 @@ fn run_plan_cache_benchmark(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "extended-suites")]
 fn record_enabled_delta(enabled: &mut PlanCacheCaseMetric, disabled: &PlanCacheCaseMetric) {
     if enabled.plan_cache_enabled && disabled.duration_seconds > 0.0 {
         enabled.enabled_delta_vs_disabled_percent = Some(
@@ -970,6 +1761,7 @@ fn record_enabled_delta(enabled: &mut PlanCacheCaseMetric, disabled: &PlanCacheC
     }
 }
 
+#[cfg(feature = "extended-suites")]
 fn create_plan_cache_fixture(
     path: &Path,
     plan_cache_enabled: bool,
@@ -1003,6 +1795,7 @@ fn create_plan_cache_fixture(
     Ok(db)
 }
 
+#[cfg(feature = "extended-suites")]
 fn measure_plan_cache_repeated_prepare(
     base_path: &Path,
     plan_cache_enabled: bool,
@@ -1042,6 +1835,7 @@ fn measure_plan_cache_repeated_prepare(
     ))
 }
 
+#[cfg(feature = "extended-suites")]
 fn measure_plan_cache_one_shot(
     base_path: &Path,
     plan_cache_enabled: bool,
@@ -1081,6 +1875,7 @@ fn measure_plan_cache_one_shot(
     ))
 }
 
+#[cfg(feature = "extended-suites")]
 fn measure_plan_cache_churn(
     base_path: &Path,
     plan_cache_enabled: bool,
@@ -1133,6 +1928,7 @@ fn measure_plan_cache_churn(
     ))
 }
 
+#[cfg(feature = "extended-suites")]
 fn build_plan_cache_point_lookup_statements() -> Vec<String> {
     (0..PLAN_CACHE_CHURN_VARIANTS)
         .map(|idx| {
@@ -1142,6 +1938,7 @@ fn build_plan_cache_point_lookup_statements() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "extended-suites")]
 fn plan_cache_case_metric(
     scenario: &str,
     plan_cache_enabled: bool,
@@ -1186,10 +1983,12 @@ fn plan_cache_case_metric(
     }
 }
 
+#[cfg(feature = "extended-suites")]
 fn elapsed_ns(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+#[cfg(feature = "extended-suites")]
 fn percentile_ns(samples: &mut [u64], percentile: u32) -> u64 {
     if samples.is_empty() {
         return 0;
@@ -1200,9 +1999,7 @@ fn percentile_ns(samples: &mut [u64], percentile: u32) -> u64 {
 }
 
 fn run_single_benchmark(cli: &Cli, scale: Scale) -> anyhow::Result<()> {
-    if cli.engine == BenchmarkEngine::Sqlite && cli.profile != BenchmarkProfile::Default {
-        bail!("--profile is only supported for --engine decentdb");
-    }
+    validate_engine_profile(cli)?;
     let db_path = cli
         .db_path
         .clone()
@@ -1217,16 +2014,19 @@ fn run_single_benchmark_with_path(cli: &Cli, scale: Scale, db_path: PathBuf) -> 
     let profile = cli.profile;
     let seed = cli.seed;
 
+    #[cfg(feature = "extended-suites")]
     println!(
         "Summarizing seed plan: engine={:?} scale={} artists={} albums(target)={} songs_cap={}",
         engine, scale.name, scale.artists, scale.albums, scale.songs_cap
     );
     let summary = summarize_seed_plan(scale, seed);
+    #[cfg(feature = "extended-suites")]
     println!(
         "Plan: artists={} total_albums={} total_songs={}",
         scale.artists, summary.total_albums, summary.total_songs
     );
 
+    #[cfg(feature = "sqlite")]
     if engine == BenchmarkEngine::Sqlite {
         return run_sqlite_benchmark(scale, seed, summary, db_path, out_dir, cli);
     }
@@ -1234,20 +2034,12 @@ fn run_single_benchmark_with_path(cli: &Cli, scale: Scale, db_path: PathBuf) -> 
     delete_db_files(&db_path);
 
     let mut report = RunReport {
-        binding: engine.binding_name().to_string(),
-        scale_name: scale.name.to_string(),
-        benchmark_profile: profile.as_str().to_string(),
-        target_artists: scale.artists,
-        target_albums: scale.albums,
-        target_songs_cap: scale.songs_cap,
         started_unix: now_unix(),
-        engine_version: decentdb::version().to_string(),
-        database_path: db_path.display().to_string(),
         ..Default::default()
     };
-    populate_run_report_metadata(&mut report, engine, profile);
     let db;
     let peak_rss;
+    #[cfg(feature = "extended-suites")]
     let total_songs;
     {
         let mut rec = Recorder::new(&mut report);
@@ -1256,7 +2048,9 @@ fn run_single_benchmark_with_path(cli: &Cli, scale: Scale, db_path: PathBuf) -> 
             decentdb::Db::create(&db_path, profile.db_config()).expect("Db::create")
         });
 
+        #[cfg(feature = "extended-suites")]
         let needs_write_events = cli.write_suite || cli.concurrency_suite;
+        #[cfg(feature = "extended-suites")]
         let ddl_batch = if needs_write_events {
             let mut batch = build_schema_ddl_batch();
             batch.push('\n');
@@ -1266,199 +2060,289 @@ fn run_single_benchmark_with_path(cli: &Cli, scale: Scale, db_path: PathBuf) -> 
         } else {
             build_schema_ddl_batch()
         };
+        #[cfg(not(feature = "extended-suites"))]
+        let ddl_batch = build_schema_ddl_batch();
         rec.measure("schema_create", None, || {
             db.execute_batch(&ddl_batch).expect("ddl batch");
         });
 
-    let insert_artist: PreparedStatement = db
-        .prepare(
-            "INSERT INTO artists (id, name, country, formed_year) \
+        let insert_artist: PreparedStatement = db
+            .prepare(
+                "INSERT INTO artists (id, name, country, formed_year) \
              VALUES ($1, $2, $3, $4)",
-        )
-        .expect("prepare artists");
-    // ── Seed artists ──────────────────────────────────────────────
-    rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
-        let mut txn = db.transaction().expect("begin");
-        let params: &mut [Value] = &mut [
-            Value::Int64(0),
-            Value::Text(String::new()),
-            Value::Text(String::new()),
-            Value::Int64(0),
-        ];
-        let mut artist_name = String::with_capacity(32);
-        {
-            let mut batch = txn
-                .prepared_batch(&insert_artist, params.len())
-                .expect("prepare artist batch");
-            walk_seed_plan_select(
-                scale,
-                seed,
-                SeedWalkEmit::ARTISTS,
-                |a| {
-                    params[0] = Value::Int64(a.id);
-                    artist_name.clear();
-                    artist_name.push_str("Artist ");
-                    write!(&mut artist_name, "{}", a.id).expect("write artist name");
-                    params[1] = Value::Text(artist_name.clone());
-                    params[2] = Value::Text(a.country.to_string());
-                    params[3] = Value::Int64(a.formed_year as i64);
-                    batch.execute_mut(params).expect("ins artist");
-                },
-                |_| {},
-                |_| {},
-            );
-        }
-        txn.commit().expect("commit artists");
-    });
+            )
+            .expect("prepare artists");
+        // ── Seed artists ──────────────────────────────────────────────
+        rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
+            let mut txn = db.transaction().expect("begin");
+            let params: &mut [Value] = &mut [
+                Value::Int64(0),
+                Value::Text(String::new()),
+                Value::Text(String::new()),
+                Value::Int64(0),
+            ];
+            let mut artist_name = String::with_capacity(32);
+            {
+                let mut batch = txn
+                    .prepared_batch(&insert_artist, params.len())
+                    .expect("prepare artist batch");
+                walk_seed_plan_select(
+                    scale,
+                    seed,
+                    SeedWalkEmit::ARTISTS,
+                    |a| {
+                        params[0] = Value::Int64(a.id);
+                        artist_name.clear();
+                        artist_name.push_str("Artist ");
+                        write!(&mut artist_name, "{}", a.id).expect("write artist name");
+                        params[1] = Value::Text(artist_name.clone());
+                        params[2] = Value::Text(a.country.to_string());
+                        params[3] = Value::Int64(a.formed_year as i64);
+                        batch.execute_mut(params).expect("ins artist");
+                    },
+                    |_| {},
+                    |_| {},
+                );
+            }
+            txn.commit().expect("commit artists");
+        });
 
-    let insert_album: PreparedStatement = db
-        .prepare(
-            "INSERT INTO albums (id, artist_id, title, release_year) \
+        let insert_album: PreparedStatement = db
+            .prepare(
+                "INSERT INTO albums (id, artist_id, title, release_year) \
              VALUES ($1, $2, $3, $4)",
-        )
-        .expect("prepare albums");
-    // ── Seed albums ───────────────────────────────────────────────
-    rec.measure("seed_albums", Some(summary.total_albums), || {
-        seed_albums(&db, &insert_album, scale, seed);
-    });
+            )
+            .expect("prepare albums");
+        // ── Seed albums ───────────────────────────────────────────────
+        rec.measure("seed_albums", Some(summary.total_albums), || {
+            seed_albums(&db, &insert_album, scale, seed);
+        });
 
-    let insert_song: PreparedStatement = db
-        .prepare(
-            "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) \
+        let insert_song: PreparedStatement = db
+            .prepare(
+                "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) \
              VALUES ($1, $2, $3, $4, $5)",
-        )
-        .expect("prepare songs");
-    // ── Seed songs ────────────────────────────────────────────────
-    rec.measure("seed_songs", Some(summary.total_songs), || {
-        seed_songs(&db, &insert_song, scale, seed);
-    });
+            )
+            .expect("prepare songs");
+        // ── Seed songs ────────────────────────────────────────────────
+        rec.measure("seed_songs", Some(summary.total_songs), || {
+            seed_songs(&db, &insert_song, scale, seed);
+        });
 
-    let wal_bytes_before = file_size(&decentdb_wal_path(&db_path));
-    let database_bytes_before = file_size(&db_path);
-    rec.measure("checkpoint_after_seed", None, || {
-        db.checkpoint_wal().expect("checkpoint wal after seed");
-    });
-    let wal_bytes_after = file_size(&decentdb_wal_path(&db_path));
-    let database_bytes_after = file_size(&db_path);
-    rec.add_extra("checkpoint_mode", serde_json::json!("wal"));
-    rec.add_extra("wal_bytes_before", serde_json::json!(wal_bytes_before));
-    rec.add_extra("wal_bytes_after", serde_json::json!(wal_bytes_after));
-    rec.add_extra(
-        "database_bytes_before",
-        serde_json::json!(database_bytes_before),
-    );
-    rec.add_extra(
-        "database_bytes_after",
-        serde_json::json!(database_bytes_after),
-    );
+        let wal_bytes_before = file_size(&decentdb_wal_path(&db_path));
+        let database_bytes_before = file_size(&db_path);
+        rec.measure("checkpoint_after_seed", None, || {
+            db.checkpoint_wal().expect("checkpoint wal after seed");
+        });
+        let wal_bytes_after = file_size(&decentdb_wal_path(&db_path));
+        let database_bytes_after = file_size(&db_path);
+        rec.add_extra("checkpoint_mode", serde_json::json!("wal"));
+        rec.add_extra("wal_bytes_before", serde_json::json!(wal_bytes_before));
+        rec.add_extra("wal_bytes_after", serde_json::json!(wal_bytes_after));
+        rec.add_extra(
+            "database_bytes_before",
+            serde_json::json!(database_bytes_before),
+        );
+        rec.add_extra(
+            "database_bytes_after",
+            serde_json::json!(database_bytes_after),
+        );
 
-    // ── Queries ───────────────────────────────────────────────────
-    rec.measure("query_count_songs", None, || {
-        let r = db.execute("SELECT COUNT(*) FROM songs").expect("count");
-        let v = first_value(&r);
-        println!("    count={v:?}");
-    });
-    let v = scalar_int(&db.execute("SELECT COUNT(*) FROM songs").unwrap());
-    rec.add_extra("count", serde_json::json!(v));
+        // ── Queries ───────────────────────────────────────────────────
+        let count_result = rec.measure("query_count_songs", None, || {
+            let r = db.execute("SELECT COUNT(*) FROM songs").expect("count");
+            let v = first_value(&r);
+            println!("    count={v:?}");
+            r
+        });
+        let count_rows = semantic_rows_from_decentdb(&count_result)
+            .expect("convert count result to semantic rows");
+        add_query_evidence(
+            &mut rec,
+            "query_count_songs",
+            &count_rows,
+            scale,
+            summary.total_songs,
+        );
+        #[cfg(feature = "extended-suites")]
+        {
+            total_songs = u64::try_from(scalar_int(&count_result)).unwrap_or(0);
+        }
+        drop(count_rows);
+        drop(count_result);
 
-    rec.measure("query_aggregate_durations", None, || {
-        let r = db
-            .execute(
-                "SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), \
+        let aggregate_result = rec.measure("query_aggregate_durations", None, || {
+            let r = db
+                .execute(
+                    "SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), \
                        MIN(duration_ms), MAX(duration_ms) FROM songs",
-            )
-            .expect("agg");
-        if let Some(row) = r.rows().first() {
-            println!("    agg_row={row:?}");
-        }
-    });
+                )
+                .expect("agg");
+            if let Some(row) = r.rows().first() {
+                println!("    agg_row={row:?}");
+            }
+            r
+        });
+        let aggregate_rows = semantic_rows_from_decentdb(&aggregate_result)
+            .expect("convert aggregate result to semantic rows");
+        add_query_evidence(
+            &mut rec,
+            "query_aggregate_durations",
+            &aggregate_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(aggregate_rows);
+        drop(aggregate_result);
 
-    rec.measure("query_artist_by_id", None, || {
-        let target = i64::from(scale.artists) / 2 + 1;
-        let r = db
-            .execute_with_params(
-                "SELECT id, name, country, formed_year FROM artists WHERE id = $1",
-                &[Value::Int64(target)],
-            )
-            .expect("by id");
-        if let Some(row) = r.rows().first() {
-            println!("    artist={row:?}");
-        }
-    });
+        let artist_result = rec.measure("query_artist_by_id", None, || {
+            let target = i64::from(scale.artists) / 2 + 1;
+            let r = db
+                .execute_with_params(
+                    "SELECT id, name, country, formed_year FROM artists WHERE id = $1",
+                    &[Value::Int64(target)],
+                )
+                .expect("by id");
+            if let Some(row) = r.rows().first() {
+                println!("    artist={row:?}");
+            }
+            r
+        });
+        let artist_rows = semantic_rows_from_decentdb(&artist_result)
+            .expect("convert artist result to semantic rows");
+        add_query_evidence(
+            &mut rec,
+            "query_artist_by_id",
+            &artist_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(artist_rows);
+        drop(artist_result);
 
-    rec.measure("query_top10_artists_by_songs", None, || {
-        let r = db
-            .execute(
-                "SELECT a.id, a.name, COUNT(s.id) AS song_count
+        let top_artists_result = rec.measure("query_top10_artists_by_songs", None, || {
+            let r = db
+                .execute(
+                    "SELECT a.id, a.name, COUNT(s.id) AS song_count
                  FROM artists a
                  JOIN songs s ON s.artist_id = a.id
                  GROUP BY a.id, a.name
                  ORDER BY song_count DESC
                  LIMIT 10",
-            )
-            .expect("top10 artists");
-        println!("    rows={}", r.rows().len());
-    });
+                )
+                .expect("top10 artists");
+            println!("    rows={}", r.rows().len());
+            r
+        });
+        let top_artist_rows = semantic_rows_from_decentdb(&top_artists_result)
+            .expect("convert top artists result to semantic rows");
+        add_query_evidence(
+            &mut rec,
+            "query_top10_artists_by_songs",
+            &top_artist_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(top_artist_rows);
+        drop(top_artists_result);
 
-    rec.measure("query_top10_albums_by_songs", None, || {
-        let r = db
-            .execute(
-                "SELECT al.id, al.title, COUNT(s.id) AS song_count
+        let top_albums_result = rec.measure("query_top10_albums_by_songs", None, || {
+            let r = db
+                .execute(
+                    "SELECT al.id, al.title, COUNT(s.id) AS song_count
                  FROM albums al
                  JOIN songs s ON s.album_id = al.id
                  GROUP BY al.id, al.title
                  ORDER BY song_count DESC
                  LIMIT 10",
-            )
-            .expect("top10 albums");
-        println!("    rows={}", r.rows().len());
-    });
+                )
+                .expect("top10 albums");
+            println!("    rows={}", r.rows().len());
+            r
+        });
+        let top_album_rows = semantic_rows_from_decentdb(&top_albums_result)
+            .expect("convert top albums result to semantic rows");
+        add_query_evidence(
+            &mut rec,
+            "query_top10_albums_by_songs",
+            &top_album_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(top_album_rows);
+        drop(top_albums_result);
 
-    rec.measure("query_view_first_1000", None, || {
-        let r = db
-            .execute(
-                "SELECT artist_id, artist_name, album_title, song_title \
+        let view_result = rec.measure("query_view_first_1000", None, || {
+            let r = db
+                .execute(
+                    "SELECT artist_id, artist_name, album_title, song_title \
                  FROM v_artist_songs LIMIT 1000",
-            )
-            .expect("view 1000");
-        println!("    rows={}", r.rows().len());
-    });
+                )
+                .expect("view 1000");
+            println!("    rows={}", r.rows().len());
+            r
+        });
+        let view_rows = semantic_rows_from_decentdb(&view_result)
+            .expect("convert view result to semantic rows");
+        add_query_evidence(
+            &mut rec,
+            "query_view_first_1000",
+            &view_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(view_rows);
+        drop(view_result);
 
-    rec.measure("query_songs_for_artist_via_view", None, || {
-        let r = db
-            .execute_with_params(
-                "SELECT album_title, song_title, duration_ms \
+        let filtered_view_result = rec.measure("query_songs_for_artist_via_view", None, || {
+            let r = db
+                .execute_with_params(
+                    "SELECT album_title, song_title, duration_ms \
                  FROM v_artist_songs WHERE artist_id = $1",
-                &[Value::Int64(1)],
-            )
-            .expect("artist 1 view");
-        println!("    rows={}", r.rows().len());
-    });
+                    &[Value::Int64(1)],
+                )
+                .expect("artist 1 view");
+            println!("    rows={}", r.rows().len());
+            r
+        });
+        let filtered_view_rows = semantic_rows_from_decentdb(&filtered_view_result)
+            .expect("convert filtered view result to semantic rows");
+        add_query_evidence(
+            &mut rec,
+            "query_songs_for_artist_via_view",
+            &filtered_view_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(filtered_view_rows);
+        drop(filtered_view_result);
 
         // Release mutable borrow of report from rec before suite calls.
         peak_rss = rec.peak_rss;
-        total_songs =
-            u64::try_from(scalar_int(&db.execute("SELECT COUNT(*) FROM songs").unwrap()))
-                .unwrap_or(0);
     }
 
     // Suite modes after queries
-    if cli.latency_suite {
-        run_latency_suite_decentdb(&db, &mut report, scale, total_songs, cli)?;
+    #[cfg(feature = "extended-suites")]
+    {
+        if cli.latency_suite {
+            run_latency_suite_decentdb(&db, &mut report, scale, total_songs, cli)?;
+        }
+        if cli.concurrency_suite {
+            run_concurrency_suite_decentdb(&db, &mut report, scale, cli)?;
+        }
+        if cli.write_suite {
+            run_write_suite_decentdb(&db, &mut report, cli)?;
+        }
+        if cli.cold_suite {
+            let db_path = db_path.clone();
+            drop(db);
+            run_cold_suite_decentdb(&db_path, &mut report, scale, profile, total_songs, cli)?;
+        } else {
+            drop(db);
+        }
     }
-    if cli.concurrency_suite {
-        run_concurrency_suite_decentdb(&db, &mut report, scale, cli)?;
-    }
-    if cli.write_suite {
-        run_write_suite_decentdb(&db, &mut report, cli)?;
-    }
-    if cli.cold_suite {
-        let db_path = db_path.clone();
-        drop(db);
-        run_cold_suite_decentdb(&db_path, &mut report, scale, profile, total_songs, cli)?;
-    } else {
-        drop(db);
-    }
+    #[cfg(not(feature = "extended-suites"))]
+    drop(db);
 
     report.peak_rss_bytes = peak_rss;
     if let Ok(meta) = fs::metadata(&db_path) {
@@ -1466,6 +2350,16 @@ fn run_single_benchmark_with_path(cli: &Cli, scale: Scale, db_path: PathBuf) -> 
     }
     report.wal_size_bytes = file_size(&decentdb_wal_path(&db_path));
     report.finished_unix = now_unix();
+    report.binding = engine.binding_name().to_string();
+    report.scale_name = scale.name.to_string();
+    report.benchmark_profile = profile.as_str().to_string();
+    report.target_artists = scale.artists;
+    report.target_albums = scale.albums;
+    report.target_songs_cap = scale.songs_cap;
+    report.engine_version = decentdb::version().to_string();
+    report.database_path = db_path.display().to_string();
+    populate_run_report_metadata(&mut report, engine, profile);
+    finalize_runner_provenance(&mut report, seed)?;
 
     fs::create_dir_all(&out_dir)?;
     let datetime_stamp = format_unix_filename_stamp(report.finished_unix);
@@ -1483,6 +2377,7 @@ fn run_single_benchmark_with_path(cli: &Cli, scale: Scale, db_path: PathBuf) -> 
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
 fn run_sqlite_benchmark(
     scale: Scale,
     seed: u64,
@@ -1493,8 +2388,9 @@ fn run_sqlite_benchmark(
 ) -> anyhow::Result<()> {
     delete_db_files(&db_path);
 
+    #[cfg(feature = "extended-suites")]
     let needs_write_events = cli.write_suite || cli.concurrency_suite;
-    let needs_wal_normal = cli.sqlite_profile.as_deref() == Some("wal-normal");
+    let needs_wal_normal = matches!(cli.sqlite_profile, Some(SqliteProfile::WalNormal));
 
     let mut report = RunReport {
         binding: BenchmarkEngine::Sqlite.binding_name().to_string(),
@@ -1511,15 +2407,8 @@ fn run_sqlite_benchmark(
         database_path: db_path.display().to_string(),
         ..Default::default()
     };
-    populate_run_report_metadata(
-        &mut report,
-        BenchmarkEngine::Sqlite,
-        BenchmarkProfile::Default,
-    );
-    if needs_wal_normal {
-        report.durability_profile = "sqlite_wal_normal".to_string();
-    }
     let conn;
+    #[cfg(feature = "extended-suites")]
     let database_path;
     let peak_rss;
     {
@@ -1535,194 +2424,338 @@ fn run_sqlite_benchmark(
         rec.report.engine_version =
             sqlite_engine_version(&conn).unwrap_or_else(|_| "unknown".into());
 
+        #[cfg(feature = "extended-suites")]
         let mut ddl_batch = build_schema_ddl_batch();
+        #[cfg(feature = "extended-suites")]
         if needs_write_events {
             ddl_batch.push('\n');
             ddl_batch.push_str(write_events_ddl());
             ddl_batch.push(';');
         }
+        #[cfg(not(feature = "extended-suites"))]
+        let ddl_batch = build_schema_ddl_batch();
         rec.measure("schema_create", None, || {
             conn.execute_batch(&ddl_batch).expect("sqlite ddl batch");
         });
 
-    let mut insert_artist = conn
-        .prepare(
-            "INSERT INTO artists (id, name, country, formed_year) \
+        let mut insert_artist = conn
+            .prepare(
+                "INSERT INTO artists (id, name, country, formed_year) \
              VALUES (?1, ?2, ?3, ?4)",
-        )
-        .expect("prepare sqlite artists");
-    rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
-        seed_sqlite_artists(&conn, &mut insert_artist, scale, seed);
-    });
-    drop(insert_artist);
-
-    let mut insert_album = conn
-        .prepare(
-            "INSERT INTO albums (id, artist_id, title, release_year) \
-             VALUES (?1, ?2, ?3, ?4)",
-        )
-        .expect("prepare sqlite albums");
-    rec.measure("seed_albums", Some(summary.total_albums), || {
-        seed_sqlite_albums(&conn, &mut insert_album, scale, seed);
-    });
-    drop(insert_album);
-
-    let mut insert_song = conn
-        .prepare(
-            "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .expect("prepare sqlite songs");
-    rec.measure("seed_songs", Some(summary.total_songs), || {
-        seed_sqlite_songs(&conn, &mut insert_song, scale, seed);
-    });
-    drop(insert_song);
-
-    let wal_bytes_before = file_size(&sqlite_wal_path(&db_path));
-    let database_bytes_before = file_size(&db_path);
-    let (busy, log_frames, checkpointed_frames) =
-        rec.measure("checkpoint_after_seed", None, || {
-            sqlite_checkpoint_truncate(&conn).expect("sqlite checkpoint after seed")
+            )
+            .expect("prepare sqlite artists");
+        rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
+            seed_sqlite_artists(&conn, &mut insert_artist, scale, seed);
         });
-    let wal_bytes_after = file_size(&sqlite_wal_path(&db_path));
-    let database_bytes_after = file_size(&db_path);
-    rec.add_extra("checkpoint_mode", serde_json::json!("truncate"));
-    rec.add_extra("wal_bytes_before", serde_json::json!(wal_bytes_before));
-    rec.add_extra("wal_bytes_after", serde_json::json!(wal_bytes_after));
-    rec.add_extra(
-        "database_bytes_before",
-        serde_json::json!(database_bytes_before),
-    );
-    rec.add_extra(
-        "database_bytes_after",
-        serde_json::json!(database_bytes_after),
-    );
-    rec.add_extra("sqlite_busy", serde_json::json!(busy));
-    rec.add_extra("sqlite_log_frames", serde_json::json!(log_frames));
-    rec.add_extra(
-        "sqlite_checkpointed_frames",
-        serde_json::json!(checkpointed_frames),
-    );
+        drop(insert_artist);
 
-    rec.measure("query_count_songs", None, || {
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
-            .expect("sqlite count");
-        println!("    count=Some(Int64({count}))");
-    });
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
-        .expect("sqlite count extra");
-    rec.add_extra("count", serde_json::json!(count));
+        let mut insert_album = conn
+            .prepare(
+                "INSERT INTO albums (id, artist_id, title, release_year) \
+             VALUES (?1, ?2, ?3, ?4)",
+            )
+            .expect("prepare sqlite albums");
+        rec.measure("seed_albums", Some(summary.total_albums), || {
+            seed_sqlite_albums(&conn, &mut insert_album, scale, seed);
+        });
+        drop(insert_album);
 
-    rec.measure("query_aggregate_durations", None, || {
-        let row: (i64, i64, f64, i64, i64) = conn
-            .query_row(
-                "SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), \
+        let mut insert_song = conn
+            .prepare(
+                "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .expect("prepare sqlite songs");
+        rec.measure("seed_songs", Some(summary.total_songs), || {
+            seed_sqlite_songs(&conn, &mut insert_song, scale, seed);
+        });
+        drop(insert_song);
+
+        let wal_bytes_before = file_size(&sqlite_wal_path(&db_path));
+        let database_bytes_before = file_size(&db_path);
+        let (busy, log_frames, checkpointed_frames) =
+            rec.measure("checkpoint_after_seed", None, || {
+                sqlite_checkpoint_truncate(&conn).expect("sqlite checkpoint after seed")
+            });
+        let wal_bytes_after = file_size(&sqlite_wal_path(&db_path));
+        let database_bytes_after = file_size(&db_path);
+        rec.add_extra("checkpoint_mode", serde_json::json!("truncate"));
+        rec.add_extra("wal_bytes_before", serde_json::json!(wal_bytes_before));
+        rec.add_extra("wal_bytes_after", serde_json::json!(wal_bytes_after));
+        rec.add_extra(
+            "database_bytes_before",
+            serde_json::json!(database_bytes_before),
+        );
+        rec.add_extra(
+            "database_bytes_after",
+            serde_json::json!(database_bytes_after),
+        );
+        rec.add_extra("sqlite_busy", serde_json::json!(busy));
+        rec.add_extra("sqlite_log_frames", serde_json::json!(log_frames));
+        rec.add_extra(
+            "sqlite_checkpointed_frames",
+            serde_json::json!(checkpointed_frames),
+        );
+
+        let count = rec.measure("query_count_songs", None, || {
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
+                .expect("sqlite count");
+            println!("    count=Some(Int64({count}))");
+            count
+        });
+        let count_rows = vec![vec![SemanticValue::Int64(count)]];
+        add_query_evidence(
+            &mut rec,
+            "query_count_songs",
+            &count_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(count_rows);
+
+        let aggregate = rec.measure("query_aggregate_durations", None, || {
+            let row: (i64, i64, f64, i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), \
                         MIN(duration_ms), MAX(duration_ms) FROM songs",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .expect("sqlite aggregate durations");
-        println!("    agg_row={row:?}");
-    });
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .expect("sqlite aggregate durations");
+            println!("    agg_row={row:?}");
+            row
+        });
+        let aggregate_rows = vec![vec![
+            SemanticValue::Int64(aggregate.0),
+            SemanticValue::Int64(aggregate.1),
+            SemanticValue::Float64(aggregate.2),
+            SemanticValue::Int64(aggregate.3),
+            SemanticValue::Int64(aggregate.4),
+        ]];
+        add_query_evidence(
+            &mut rec,
+            "query_aggregate_durations",
+            &aggregate_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(aggregate_rows);
 
-    rec.measure("query_artist_by_id", None, || {
-        let target = i64::from(scale.artists) / 2 + 1;
-        let row: (i64, String, String, i64) = conn
-            .query_row(
-                "SELECT id, name, country, formed_year FROM artists WHERE id = ?1",
-                params![target],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("sqlite artist by id");
-        println!("    artist={row:?}");
-    });
+        let artist = rec.measure("query_artist_by_id", None, || {
+            let target = i64::from(scale.artists) / 2 + 1;
+            let row: (i64, String, String, i64) = conn
+                .query_row(
+                    "SELECT id, name, country, formed_year FROM artists WHERE id = ?1",
+                    params![target],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("sqlite artist by id");
+            println!("    artist={row:?}");
+            row
+        });
+        let artist_rows = vec![vec![
+            SemanticValue::Int64(artist.0),
+            SemanticValue::Text(artist.1),
+            SemanticValue::Text(artist.2),
+            SemanticValue::Int64(artist.3),
+        ]];
+        add_query_evidence(
+            &mut rec,
+            "query_artist_by_id",
+            &artist_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(artist_rows);
 
-    rec.measure("query_top10_artists_by_songs", None, || {
-        let rows = sqlite_query_row_count(
-            &conn,
-            "SELECT a.id, a.name, COUNT(s.id) AS song_count
+        let top_artists = rec.measure("query_top10_artists_by_songs", None, || {
+            let mut statement = conn
+                .prepare(
+                    "SELECT a.id, a.name, COUNT(s.id) AS song_count
              FROM artists a
              JOIN songs s ON s.artist_id = a.id
              GROUP BY a.id, a.name
              ORDER BY song_count DESC
              LIMIT 10",
-            [],
-        )
-        .expect("sqlite top10 artists");
-        println!("    rows={rows}");
-    });
+                )
+                .expect("prepare sqlite top10 artists");
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("query sqlite top10 artists")
+                .collect::<rusqlite::Result<Vec<(i64, String, i64)>>>()
+                .expect("materialize sqlite top10 artists");
+            println!("    rows={}", rows.len());
+            rows
+        });
+        let top_artist_rows = top_artists
+            .into_iter()
+            .map(|(id, name, count)| {
+                vec![
+                    SemanticValue::Int64(id),
+                    SemanticValue::Text(name),
+                    SemanticValue::Int64(count),
+                ]
+            })
+            .collect();
+        add_query_evidence(
+            &mut rec,
+            "query_top10_artists_by_songs",
+            &top_artist_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(top_artist_rows);
 
-    rec.measure("query_top10_albums_by_songs", None, || {
-        let rows = sqlite_query_row_count(
-            &conn,
-            "SELECT al.id, al.title, COUNT(s.id) AS song_count
+        let top_albums = rec.measure("query_top10_albums_by_songs", None, || {
+            let mut statement = conn
+                .prepare(
+                    "SELECT al.id, al.title, COUNT(s.id) AS song_count
              FROM albums al
              JOIN songs s ON s.album_id = al.id
              GROUP BY al.id, al.title
              ORDER BY song_count DESC
              LIMIT 10",
-            [],
-        )
-        .expect("sqlite top10 albums");
-        println!("    rows={rows}");
-    });
+                )
+                .expect("prepare sqlite top10 albums");
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("query sqlite top10 albums")
+                .collect::<rusqlite::Result<Vec<(i64, String, i64)>>>()
+                .expect("materialize sqlite top10 albums");
+            println!("    rows={}", rows.len());
+            rows
+        });
+        let top_album_rows = top_albums
+            .into_iter()
+            .map(|(id, name, count)| {
+                vec![
+                    SemanticValue::Int64(id),
+                    SemanticValue::Text(name),
+                    SemanticValue::Int64(count),
+                ]
+            })
+            .collect();
+        add_query_evidence(
+            &mut rec,
+            "query_top10_albums_by_songs",
+            &top_album_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(top_album_rows);
 
-    rec.measure("query_view_first_1000", None, || {
-        let rows = sqlite_query_row_count(
-            &conn,
-            "SELECT artist_id, artist_name, album_title, song_title \
+        let view_rows = rec.measure("query_view_first_1000", None, || {
+            let mut statement = conn
+                .prepare(
+                    "SELECT artist_id, artist_name, album_title, song_title \
              FROM v_artist_songs LIMIT 1000",
-            [],
-        )
-        .expect("sqlite view 1000");
-        println!("    rows={rows}");
-    });
+                )
+                .expect("prepare sqlite view 1000");
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .expect("query sqlite view 1000")
+                .collect::<rusqlite::Result<Vec<(i64, String, String, String)>>>()
+                .expect("materialize sqlite view 1000");
+            println!("    rows={}", rows.len());
+            rows
+        });
+        let view_semantic_rows = view_rows
+            .into_iter()
+            .map(|(artist_id, artist_name, album_title, song_title)| {
+                vec![
+                    SemanticValue::Int64(artist_id),
+                    SemanticValue::Text(artist_name),
+                    SemanticValue::Text(album_title),
+                    SemanticValue::Text(song_title),
+                ]
+            })
+            .collect();
+        add_query_evidence(
+            &mut rec,
+            "query_view_first_1000",
+            &view_semantic_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(view_semantic_rows);
 
-    rec.measure("query_songs_for_artist_via_view", None, || {
-        let rows = sqlite_query_row_count(
-            &conn,
-            "SELECT album_title, song_title, duration_ms \
+        let filtered_rows = rec.measure("query_songs_for_artist_via_view", None, || {
+            let mut statement = conn
+                .prepare(
+                    "SELECT album_title, song_title, duration_ms \
              FROM v_artist_songs WHERE artist_id = ?1",
-            params![1_i64],
-        )
-        .expect("sqlite artist 1 view");
-        println!("    rows={rows}");
-    });
+                )
+                .expect("prepare sqlite artist 1 view");
+            let rows = statement
+                .query_map(params![1_i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .expect("query sqlite artist 1 view")
+                .collect::<rusqlite::Result<Vec<(String, String, i64)>>>()
+                .expect("materialize sqlite artist 1 view");
+            println!("    rows={}", rows.len());
+            rows
+        });
+        let filtered_semantic_rows = filtered_rows
+            .into_iter()
+            .map(|(album_title, song_title, duration)| {
+                vec![
+                    SemanticValue::Text(album_title),
+                    SemanticValue::Text(song_title),
+                    SemanticValue::Int64(duration),
+                ]
+            })
+            .collect();
+        add_query_evidence(
+            &mut rec,
+            "query_songs_for_artist_via_view",
+            &filtered_semantic_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(filtered_semantic_rows);
 
-        database_path = rec.report.database_path.clone();
+        #[cfg(feature = "extended-suites")]
+        {
+            database_path = rec.report.database_path.clone();
+        }
         peak_rss = rec.peak_rss;
     }
 
     // Suite modes after queries
-    let total_songs = conn
-        .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get::<_, i64>(0))
-        .expect("sqlite count for suites") as u64;
-    if cli.latency_suite {
-        run_latency_suite_sqlite(&conn, &mut report, scale, total_songs, cli)?;
+    #[cfg(feature = "extended-suites")]
+    {
+        let total_songs = u64::try_from(count).unwrap_or(0);
+        if cli.latency_suite {
+            run_latency_suite_sqlite(&conn, &mut report, scale, total_songs, cli)?;
+        }
+        if cli.concurrency_suite {
+            run_concurrency_suite_sqlite(&database_path, &mut report, scale, cli)?;
+        }
+        if cli.write_suite {
+            run_write_suite_sqlite(&conn, &mut report, cli)?;
+        }
+        if cli.cold_suite {
+            let db_clone_path = PathBuf::from(&database_path);
+            drop(conn);
+            run_cold_suite_sqlite(&db_clone_path, &mut report, scale, total_songs, cli)?;
+        } else {
+            drop(conn);
+        }
     }
-    if cli.concurrency_suite {
-        run_concurrency_suite_sqlite(&database_path, &mut report, scale, cli)?;
-    }
-    if cli.write_suite {
-        run_write_suite_sqlite(&conn, &mut report, cli)?;
-    }
-    if cli.cold_suite {
-        let db_clone_path = PathBuf::from(&database_path);
-        drop(conn);
-        run_cold_suite_sqlite(&db_clone_path, &mut report, scale, total_songs, cli)?;
-    } else {
-        drop(conn);
-    }
+    #[cfg(not(feature = "extended-suites"))]
+    drop(conn);
 
     report.peak_rss_bytes = peak_rss;
     if let Ok(meta) = fs::metadata(&db_path) {
@@ -1730,6 +2763,15 @@ fn run_sqlite_benchmark(
     }
     report.wal_size_bytes = file_size(&sqlite_wal_path(&db_path));
     report.finished_unix = now_unix();
+    populate_run_report_metadata(
+        &mut report,
+        BenchmarkEngine::Sqlite,
+        BenchmarkProfile::Default,
+    );
+    if needs_wal_normal {
+        report.durability_profile = "sqlite_wal_normal".to_string();
+    }
+    finalize_runner_provenance(&mut report, seed)?;
 
     fs::create_dir_all(&out_dir)?;
     let datetime_stamp = format_unix_filename_stamp(report.finished_unix);
@@ -1747,6 +2789,7 @@ fn run_sqlite_benchmark(
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
 fn open_sqlite_wal_full(path: &Path) -> rusqlite::Result<SqliteConnection> {
     let conn = SqliteConnection::open(path)?;
     let journal_mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
@@ -1766,22 +2809,26 @@ fn open_sqlite_wal_full(path: &Path) -> rusqlite::Result<SqliteConnection> {
     Ok(conn)
 }
 
+#[cfg(feature = "sqlite")]
 fn sqlite_engine_version(conn: &SqliteConnection) -> rusqlite::Result<String> {
     conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))
 }
 
+#[cfg(feature = "sqlite")]
 fn sqlite_checkpoint_truncate(conn: &SqliteConnection) -> rusqlite::Result<(i64, i64, i64)> {
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     })
 }
 
+#[cfg(feature = "sqlite")]
 fn sqlite_wal_path(path: &Path) -> PathBuf {
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
     PathBuf::from(wal)
 }
 
+#[cfg(feature = "sqlite")]
 fn seed_sqlite_artists(
     conn: &SqliteConnection,
     stmt: &mut rusqlite::Statement<'_>,
@@ -1814,6 +2861,7 @@ fn seed_sqlite_artists(
         .expect("commit sqlite artists");
 }
 
+#[cfg(feature = "sqlite")]
 fn seed_sqlite_albums(
     conn: &SqliteConnection,
     stmt: &mut rusqlite::Statement<'_>,
@@ -1845,6 +2893,7 @@ fn seed_sqlite_albums(
     conn.execute_batch("COMMIT;").expect("commit sqlite albums");
 }
 
+#[cfg(feature = "sqlite")]
 fn seed_sqlite_songs(
     conn: &SqliteConnection,
     stmt: &mut rusqlite::Statement<'_>,
@@ -1875,24 +2924,6 @@ fn seed_sqlite_songs(
         },
     );
     conn.execute_batch("COMMIT;").expect("commit sqlite songs");
-}
-
-fn sqlite_query_row_count<P: rusqlite::Params>(
-    conn: &SqliteConnection,
-    sql: &str,
-    params: P,
-) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare(sql)?;
-    let column_count = stmt.column_count();
-    let mut rows = stmt.query(params)?;
-    let mut count = 0usize;
-    while let Some(row) = rows.next()? {
-        for index in 0..column_count {
-            let _: rusqlite::types::Value = row.get(index)?;
-        }
-        count += 1;
-    }
-    Ok(count)
 }
 
 fn seed_albums(db: &decentdb::Db, prepared: &PreparedStatement, scale: Scale, seed: u64) {
@@ -1981,6 +3012,7 @@ fn first_value(r: &decentdb::QueryResult) -> Option<Value> {
         .first()
         .and_then(|row| row.values().first().cloned())
 }
+#[cfg(feature = "extended-suites")]
 fn scalar_int(r: &decentdb::QueryResult) -> i64 {
     match first_value(r) {
         Some(Value::Int64(i)) => i,
@@ -1988,6 +3020,7 @@ fn scalar_int(r: &decentdb::QueryResult) -> i64 {
     }
 }
 
+#[cfg(feature = "extended-suites")]
 fn generate_html_report(results_dir: &Path, report_file: &Path) -> anyhow::Result<()> {
     let data = load_report_data(results_dir)?;
     let html = build_report_html(&data)?;
@@ -2005,30 +3038,11 @@ fn generate_html_report(results_dir: &Path, report_file: &Path) -> anyhow::Resul
     Ok(())
 }
 
+#[cfg(feature = "extended-suites")]
 fn load_report_data(results_dir: &Path) -> anyhow::Result<HtmlReportData> {
     let mut runs = Vec::new();
-    let dir = fs::read_dir(results_dir)
-        .with_context(|| format!("failed to read results directory {}", results_dir.display()))?;
-
-    for entry in dir {
-        let entry = entry
-            .with_context(|| format!("failed to read an entry in {}", results_dir.display()))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-
-        let file_name = entry.file_name().to_string_lossy().into_owned();
-        if !file_name.contains("rust-baseline") {
-            continue;
-        }
-
-        let json = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let report: RunReport = serde_json::from_str(&json)
+    for (file_name, path, json) in report_inputs(results_dir)? {
+        let report: RunReport = serde_json::from_slice(&json)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         runs.push(HistoricalRun::new(file_name, report));
     }
@@ -2076,6 +3090,101 @@ fn load_report_data(results_dir: &Path) -> anyhow::Result<HtmlReportData> {
     })
 }
 
+#[cfg(feature = "extended-suites")]
+fn report_inputs(results_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf, Vec<u8>)>> {
+    let manifest_path = results_dir.join("history-manifest.json");
+    if manifest_path.exists() {
+        let manifest_json = fs::read(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        let manifest: ReportHistoryManifest = serde_json::from_slice(&manifest_json)
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        if manifest.schema_version != 1 {
+            bail!(
+                "unsupported history manifest schema version {} in {}",
+                manifest.schema_version,
+                manifest_path.display()
+            );
+        }
+        if manifest.files.is_empty() {
+            bail!("history manifest {} is empty", manifest_path.display());
+        }
+
+        let mut seen = HashSet::with_capacity(manifest.files.len());
+        let mut inputs = Vec::with_capacity(manifest.files.len());
+        for entry in manifest.files {
+            let relative_path = Path::new(&entry.path);
+            let mut components = relative_path.components();
+            let is_plain_file_name = matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none();
+            if !is_plain_file_name
+                || relative_path.extension().and_then(|extension| extension.to_str())
+                    != Some("json")
+                || !entry.path.contains("rust-baseline")
+            {
+                bail!(
+                    "invalid history manifest result path {:?} in {}",
+                    entry.path,
+                    manifest_path.display()
+                );
+            }
+            if !seen.insert(entry.path.clone()) {
+                bail!(
+                    "duplicate history manifest result path {:?} in {}",
+                    entry.path,
+                    manifest_path.display()
+                );
+            }
+            if entry.sha256.len() != 64
+                || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!(
+                    "invalid SHA-256 for {:?} in {}",
+                    entry.path,
+                    manifest_path.display()
+                );
+            }
+
+            let path = results_dir.join(relative_path);
+            let json = fs::read(&path)
+                .with_context(|| format!("failed to read manifested result {}", path.display()))?;
+            let actual_sha256 = format!("{:x}", Sha256::digest(&json));
+            if actual_sha256 != entry.sha256.to_ascii_lowercase() {
+                bail!(
+                    "SHA-256 mismatch for manifested result {}: expected {}, found {}",
+                    path.display(),
+                    entry.sha256,
+                    actual_sha256
+                );
+            }
+            inputs.push((entry.path, path, json));
+        }
+        return Ok(inputs);
+    }
+
+    let dir = fs::read_dir(results_dir)
+        .with_context(|| format!("failed to read results directory {}", results_dir.display()))?;
+    let mut inputs = Vec::new();
+    for entry in dir {
+        let entry = entry
+            .with_context(|| format!("failed to read an entry in {}", results_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file()
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !file_name.contains("rust-baseline") {
+            continue;
+        }
+        let json = fs::read(&path)
+            .with_context(|| format!("failed to read result {}", path.display()))?;
+        inputs.push((file_name, path, json));
+    }
+    Ok(inputs)
+}
+
+#[cfg(feature = "extended-suites")]
 impl HistoricalRun {
     fn new(file_name: String, report: RunReport) -> Self {
         let timestamp_unix = report.started_unix;
@@ -2090,6 +3199,7 @@ impl HistoricalRun {
     }
 }
 
+#[cfg(feature = "extended-suites")]
 fn ordered_step_names(runs: &[HistoricalRun]) -> Vec<String> {
     const KNOWN_ORDER: &[&str] = &[
         "connect_open",
@@ -2127,6 +3237,7 @@ fn ordered_step_names(runs: &[HistoricalRun]) -> Vec<String> {
     names
 }
 
+#[cfg(feature = "extended-suites")]
 fn scale_rank(name: &str) -> usize {
     match name {
         "smoke" => 0,
@@ -2137,6 +3248,7 @@ fn scale_rank(name: &str) -> usize {
     }
 }
 
+#[cfg(feature = "extended-suites")]
 fn format_unix_label(unix: u64) -> String {
     let (year, month, day, hour, minute, second) = unix_utc_parts(unix);
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
@@ -2172,6 +3284,7 @@ fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
     (year as i32, month as u32, day as u32)
 }
 
+#[cfg(feature = "extended-suites")]
 fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
     let report_json = safe_json_for_html(serde_json::to_string(data)?);
     let html = format!(
@@ -3007,6 +4120,7 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
     Ok(html)
 }
 
+#[cfg(feature = "extended-suites")]
 fn safe_json_for_html(json: String) -> String {
     json.replace("</", "<\\/")
 }
@@ -3015,6 +4129,7 @@ fn safe_json_for_html(json: String) -> String {
 
 // Phase 2 helpers first (moved up for compilation)
 
+#[cfg(feature = "extended-suites")]
 fn compute_latency_stats(
     samples: &mut [u64],
     iterations: u64,
@@ -3049,6 +4164,7 @@ fn compute_latency_stats(
     (p50, p95, p99, max, mean, stddev, ops_per_sec)
 }
 
+#[cfg(feature = "extended-suites")]
 fn percentile_ns_sorted(sorted: &[u64], percentile: u32) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -3060,20 +4176,24 @@ fn percentile_ns_sorted(sorted: &[u64], percentile: u32) -> u64 {
     sorted[idx]
 }
 
+#[cfg(feature = "extended-suites")]
 fn artist_id_for_iter(i: u64, scale: Scale) -> i64 {
     (1 + ((i * 8191) % scale.artists as u64)) as i64
 }
 
+#[cfg(feature = "extended-suites")]
 fn song_id_for_iter(i: u64, total_songs: u64) -> i64 {
     (1 + ((i * 4099) % total_songs)) as i64
 }
 
+#[cfg(feature = "extended-suites")]
 fn song_range_start(i: u64, total_songs: u64) -> i64 {
     (1 + ((i * 1019) % total_songs.max(1).saturating_sub(100).max(1))) as i64
 }
 
 // --- latency suite implementations -----------------------------------------
 
+#[cfg(feature = "extended-suites")]
 fn run_latency_suite_decentdb(
     db: &decentdb::Db,
     report: &mut RunReport,
@@ -3402,6 +4522,8 @@ fn run_latency_suite_decentdb(
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
+#[cfg(feature = "extended-suites")]
 fn run_latency_suite_sqlite(
     conn: &SqliteConnection,
     report: &mut RunReport,
@@ -3742,6 +4864,7 @@ fn run_latency_suite_sqlite(
 
 // --- open_sqlite_wal_normal -------------------------------------------------
 
+#[cfg(feature = "sqlite")]
 fn open_sqlite_wal_normal(path: &Path) -> rusqlite::Result<SqliteConnection> {
     let conn = SqliteConnection::open(path)?;
     let journal_mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
@@ -3755,6 +4878,7 @@ fn open_sqlite_wal_normal(path: &Path) -> rusqlite::Result<SqliteConnection> {
 
 // --- concurrency suite implementations -------------------------------------
 
+#[cfg(feature = "extended-suites")]
 fn run_concurrency_suite_decentdb(
     db: &decentdb::Db,
     report: &mut RunReport,
@@ -3903,6 +5027,8 @@ fn run_concurrency_suite_decentdb(
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
+#[cfg(feature = "extended-suites")]
 fn run_concurrency_suite_sqlite(
     db_path: &str,
     report: &mut RunReport,
@@ -4057,6 +5183,7 @@ fn run_concurrency_suite_sqlite(
 // --- write suite implementations --------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "extended-suites")]
 fn latency_metric(
     name: &str,
     qs: &str,
@@ -4088,6 +5215,7 @@ fn latency_metric(
     }
 }
 
+#[cfg(feature = "extended-suites")]
 fn run_write_suite_decentdb(
     db: &decentdb::Db,
     report: &mut RunReport,
@@ -4278,6 +5406,8 @@ fn run_write_suite_decentdb(
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
+#[cfg(feature = "extended-suites")]
 fn run_write_suite_sqlite(
     conn: &SqliteConnection,
     report: &mut RunReport,
@@ -4443,6 +5573,7 @@ fn run_write_suite_sqlite(
 
 // --- cold suite implementations ---------------------------------------------
 
+#[cfg(feature = "extended-suites")]
 fn run_cold_suite_decentdb(
     db_path: &Path,
     report: &mut RunReport,
@@ -4658,6 +5789,8 @@ fn run_cold_suite_decentdb(
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
+#[cfg(feature = "extended-suites")]
 fn run_cold_suite_sqlite(
     db_path: &Path,
     report: &mut RunReport,
@@ -4798,18 +5931,8 @@ fn run_cold_suite_sqlite(
                 let mut song_stmt = conn.prepare(
                     "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
                 )?;
-                artist_stmt.execute(rusqlite::params![
-                    1_i64,
-                    "Recovery Artist 1",
-                    "XX",
-                    2000
-                ])?;
-                album_stmt.execute(rusqlite::params![
-                    1_i64,
-                    1_i64,
-                    "Recovery Album 1",
-                    2000
-                ])?;
+                artist_stmt.execute(rusqlite::params![1_i64, "Recovery Artist 1", "XX", 2000])?;
+                album_stmt.execute(rusqlite::params![1_i64, 1_i64, "Recovery Album 1", 2000])?;
                 for s in 1..=i64::try_from(recovery_expected_count).unwrap_or(0) {
                     song_stmt.execute(rusqlite::params![
                         s,
@@ -4866,6 +5989,7 @@ fn run_cold_suite_sqlite(
 
 // --- cold helper mode -------------------------------------------------------
 
+#[cfg(feature = "extended-suites")]
 fn run_cold_helper_child(
     helper_exe: &Path,
     db_path: &Path,
@@ -4875,7 +5999,9 @@ fn run_cold_helper_child(
     query: &str,
     expected_count: Option<u64>,
 ) -> anyhow::Result<ColdHelperOutput> {
-    let output_parent = output.parent().context("cold helper output path has no parent")?;
+    let output_parent = output
+        .parent()
+        .context("cold helper output path has no parent")?;
     fs::create_dir_all(output_parent)?;
     let mut command = std::process::Command::new(helper_exe);
     command
@@ -4889,18 +6015,20 @@ fn run_cold_helper_child(
         .arg("--engine")
         .arg(match engine {
             BenchmarkEngine::DecentDb => "decentdb",
+            #[cfg(feature = "sqlite")]
             BenchmarkEngine::Sqlite => "sqlite",
+            #[cfg(feature = "duckdb")]
             BenchmarkEngine::DuckDb => "duckdb",
         });
     if engine == BenchmarkEngine::DecentDb {
         command.arg("--profile").arg(profile.as_str());
     }
     if let Some(expected_count) = expected_count {
-        command.arg("--cold-helper-expected-count").arg(expected_count.to_string());
+        command
+            .arg("--cold-helper-expected-count")
+            .arg(expected_count.to_string());
     }
-    let output_status = command
-        .output()
-        .context("failed to spawn cold helper")?;
+    let output_status = command.output().context("failed to spawn cold helper")?;
     if !output_status.status.success() {
         let stderr = String::from_utf8_lossy(&output_status.stderr);
         bail!("cold helper failed: {stderr}");
@@ -4911,6 +6039,7 @@ fn run_cold_helper_child(
     Ok(parsed)
 }
 
+#[cfg(feature = "extended-suites")]
 fn run_cold_helper(cli: Cli) -> anyhow::Result<()> {
     let db_path = cli
         .db_path
@@ -4967,6 +6096,7 @@ fn run_cold_helper(cli: Cli) -> anyhow::Result<()> {
             };
             let _ = db;
         }
+        #[cfg(feature = "sqlite")]
         BenchmarkEngine::Sqlite => {
             let conn = open_sqlite_wal_full(&db_path)?;
             match query {
@@ -4993,6 +6123,7 @@ fn run_cold_helper(cli: Cli) -> anyhow::Result<()> {
                 _ => bail!("unknown cold helper query: {query}"),
             };
         }
+        #[cfg(feature = "duckdb")]
         BenchmarkEngine::DuckDb => bail!("cold helper not implemented for DuckDB"),
     };
     let duration_ns = elapsed_ns(start);
@@ -5007,10 +6138,10 @@ fn run_cold_helper(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-// --- DuckDB benchmark stubs (non-feature-gated) ----------------------------
+// --- DuckDB benchmark implementation ---------------------------------------
 
-fn run_duckdb_benchmark(cli: &Cli) -> anyhow::Result<()> {
-    let scale = parse_scale(&cli.scale);
+#[cfg(feature = "duckdb")]
+fn run_duckdb_benchmark(cli: &Cli, scale: Scale) -> anyhow::Result<()> {
     let seed = cli.seed;
     let out_dir = cli.out_dir.clone();
     let db_path = cli
@@ -5043,199 +6174,302 @@ fn run_duckdb_benchmark(cli: &Cli) -> anyhow::Result<()> {
         database_path: db_path.display().to_string(),
         ..Default::default()
     };
-    populate_run_report_metadata(
-        &mut report,
-        BenchmarkEngine::DuckDb,
-        BenchmarkProfile::Default,
-    );
     let peak_rss;
+    #[cfg(feature = "extended-suites")]
+    let total_songs;
     {
         let mut rec = Recorder::new(&mut report);
 
-    rec.measure("connect_open", None, || {});
-    rec.report.engine_version = conn
-        .query_row("SELECT version()", [], |row| row.get::<_, String>(0))
-        .unwrap_or_else(|_| "unknown".into());
+        rec.measure("connect_open", None, || {});
+        rec.report.engine_version = conn
+            .query_row("SELECT version()", [], |row| row.get::<_, String>(0))
+            .unwrap_or_else(|_| "unknown".into());
 
-    let needs_write_events = cli.write_suite || cli.concurrency_suite;
-    let mut ddl_batch = build_schema_ddl_batch();
-    if needs_write_events {
-        ddl_batch.push('\n');
-        ddl_batch.push_str(write_events_ddl());
-        ddl_batch.push(';');
-    }
-    rec.measure("schema_create", None, || {
-        conn.execute_batch(&ddl_batch).expect("duckdb ddl");
-    });
+        #[cfg(feature = "extended-suites")]
+        let needs_write_events = cli.write_suite || cli.concurrency_suite;
+        #[cfg(feature = "extended-suites")]
+        let mut ddl_batch = build_schema_ddl_batch();
+        #[cfg(feature = "extended-suites")]
+        if needs_write_events {
+            ddl_batch.push('\n');
+            ddl_batch.push_str(write_events_ddl());
+            ddl_batch.push(';');
+        }
+        #[cfg(not(feature = "extended-suites"))]
+        let ddl_batch = build_schema_ddl_batch();
+        rec.measure("schema_create", None, || {
+            conn.execute_batch(&ddl_batch).expect("duckdb ddl");
+        });
 
-    conn.execute_batch("BEGIN TRANSACTION;")?;
-    let mut ins_a =
-        conn.prepare("INSERT INTO artists (id, name, country, formed_year) VALUES (?, ?, ?, ?)")?;
-    rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
-        let mut an = String::with_capacity(32);
-        walk_seed_plan_select(
-            scale,
-            seed,
-            SeedWalkEmit::ARTISTS,
-            |a| {
-                an.clear();
-                an.push_str("Artist ");
-                write!(&mut an, "{}", a.id).ok();
-                ins_a
-                    .execute(duckdb::params![a.id, an.as_str(), a.country, a.formed_year])
-                    .expect("duckdb ins a");
-            },
-            |_| {},
-            |_| {},
-        );
-    });
-    drop(ins_a);
-    conn.execute_batch("COMMIT;")?;
+        conn.execute_batch("BEGIN TRANSACTION;")?;
+        let mut ins_a = conn
+            .prepare("INSERT INTO artists (id, name, country, formed_year) VALUES (?, ?, ?, ?)")?;
+        rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
+            let mut an = String::with_capacity(32);
+            walk_seed_plan_select(
+                scale,
+                seed,
+                SeedWalkEmit::ARTISTS,
+                |a| {
+                    an.clear();
+                    an.push_str("Artist ");
+                    write!(&mut an, "{}", a.id).ok();
+                    ins_a
+                        .execute(duckdb::params![a.id, an.as_str(), a.country, a.formed_year])
+                        .expect("duckdb ins a");
+                },
+                |_| {},
+                |_| {},
+            );
+        });
+        drop(ins_a);
+        conn.execute_batch("COMMIT;")?;
 
-    conn.execute_batch("BEGIN TRANSACTION;")?;
-    let mut ins_al = conn
-        .prepare("INSERT INTO albums (id, artist_id, title, release_year) VALUES (?, ?, ?, ?)")?;
-    rec.measure("seed_albums", Some(summary.total_albums), || {
-        let mut at = String::with_capacity(32);
-        walk_seed_plan_select(
-            scale,
-            seed,
-            SeedWalkEmit::ALBUMS,
-            |_| {},
-            |al| {
-                at.clear();
-                at.push_str("Album ");
-                write!(&mut at, "{}", al.id).ok();
-                ins_al
-                    .execute(duckdb::params![
-                        al.id,
-                        al.artist_id,
-                        at.as_str(),
-                        al.release_year
-                    ])
-                    .expect("duckdb ins al");
-            },
-            |_| {},
-        );
-    });
-    drop(ins_al);
-    conn.execute_batch("COMMIT;")?;
+        conn.execute_batch("BEGIN TRANSACTION;")?;
+        let mut ins_al = conn.prepare(
+            "INSERT INTO albums (id, artist_id, title, release_year) VALUES (?, ?, ?, ?)",
+        )?;
+        rec.measure("seed_albums", Some(summary.total_albums), || {
+            let mut at = String::with_capacity(32);
+            walk_seed_plan_select(
+                scale,
+                seed,
+                SeedWalkEmit::ALBUMS,
+                |_| {},
+                |al| {
+                    at.clear();
+                    at.push_str("Album ");
+                    write!(&mut at, "{}", al.id).ok();
+                    ins_al
+                        .execute(duckdb::params![
+                            al.id,
+                            al.artist_id,
+                            at.as_str(),
+                            al.release_year
+                        ])
+                        .expect("duckdb ins al");
+                },
+                |_| {},
+            );
+        });
+        drop(ins_al);
+        conn.execute_batch("COMMIT;")?;
 
-    conn.execute_batch("BEGIN TRANSACTION;")?;
-    let mut ins_s = conn.prepare(
+        conn.execute_batch("BEGIN TRANSACTION;")?;
+        let mut ins_s = conn.prepare(
         "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) VALUES (?, ?, ?, ?, ?)",
     )?;
-    rec.measure("seed_songs", Some(summary.total_songs), || {
-        let mut st = String::with_capacity(32);
-        walk_seed_plan_select(
+        rec.measure("seed_songs", Some(summary.total_songs), || {
+            let mut st = String::with_capacity(32);
+            walk_seed_plan_select(
+                scale,
+                seed,
+                SeedWalkEmit::SONGS,
+                |_| {},
+                |_| {},
+                |s| {
+                    st.clear();
+                    st.push_str("Song ");
+                    write!(&mut st, "{}", s.id).ok();
+                    ins_s
+                        .execute(duckdb::params![
+                            s.id,
+                            s.album_id,
+                            s.artist_id,
+                            st.as_str(),
+                            s.duration_ms
+                        ])
+                        .expect("duckdb ins s");
+                },
+            );
+        });
+        drop(ins_s);
+        conn.execute_batch("COMMIT;")?;
+
+        rec.measure("checkpoint_after_seed", None, || {
+            let _ = conn.execute_batch("CHECKPOINT;");
+        });
+
+        let count = rec.measure("query_count_songs", None, || {
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
+                .expect("duckdb cnt");
+            println!("    count={count}");
+            count
+        });
+        let count_rows = vec![vec![SemanticValue::Int64(count)]];
+        add_query_evidence(
+            &mut rec,
+            "query_count_songs",
+            &count_rows,
             scale,
-            seed,
-            SeedWalkEmit::SONGS,
-            |_| {},
-            |_| {},
-            |s| {
-                st.clear();
-                st.push_str("Song ");
-                write!(&mut st, "{}", s.id).ok();
-                ins_s
-                    .execute(duckdb::params![
-                        s.id,
-                        s.album_id,
-                        s.artist_id,
-                        st.as_str(),
-                        s.duration_ms
-                    ])
-                    .expect("duckdb ins s");
-            },
+            summary.total_songs,
         );
-    });
-    drop(ins_s);
-    conn.execute_batch("COMMIT;")?;
+        drop(count_rows);
+        #[cfg(feature = "extended-suites")]
+        {
+            total_songs = u64::try_from(count).unwrap_or(0);
+        }
 
-    rec.measure("checkpoint_after_seed", None, || {
-        let _ = conn.execute_batch("CHECKPOINT;");
-    });
+        let aggregate = rec.measure("query_aggregate_durations", None, || {
+            let row: (i64, i64, f64, i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), \
+                     MIN(duration_ms), MAX(duration_ms) FROM songs",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .expect("duckdb agg");
+            println!("    agg_row={row:?}");
+            row
+        });
+        let aggregate_rows = vec![vec![
+            SemanticValue::Int64(aggregate.0),
+            SemanticValue::Int64(aggregate.1),
+            SemanticValue::Float64(aggregate.2),
+            SemanticValue::Int64(aggregate.3),
+            SemanticValue::Int64(aggregate.4),
+        ]];
+        add_query_evidence(
+            &mut rec,
+            "query_aggregate_durations",
+            &aggregate_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(aggregate_rows);
 
-    rec.measure("query_count_songs", None, || {
-        let c: i64 = conn
-            .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
-            .expect("duckdb cnt");
-        println!("    count={c}");
-    });
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))?;
-    rec.add_extra("count", serde_json::json!(count));
+        let artist = rec.measure("query_artist_by_id", None, || {
+            let target = i64::from(scale.artists) / 2 + 1;
+            let row: (i64, String, String, i64) = conn
+                .query_row(
+                    "SELECT id, name, country, formed_year FROM artists WHERE id = ?",
+                    [target],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("duckdb art");
+            println!("    artist={row:?}");
+            row
+        });
+        let artist_rows = vec![vec![
+            SemanticValue::Int64(artist.0),
+            SemanticValue::Text(artist.1),
+            SemanticValue::Text(artist.2),
+            SemanticValue::Int64(artist.3),
+        ]];
+        add_query_evidence(
+            &mut rec,
+            "query_artist_by_id",
+            &artist_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(artist_rows);
 
-    rec.measure("query_aggregate_durations", None, || {
-        let row: (i64, i64, f64, i64, i64) = conn.query_row("SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), MIN(duration_ms), MAX(duration_ms) FROM songs", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).expect("duckdb agg");
-        println!("    agg_row={row:?}");
-    });
-
-    rec.measure("query_artist_by_id", None, || {
-        let target = i64::from(scale.artists) / 2 + 1;
-        let row: (i64, String, String, i64) = conn
-            .query_row(
-                "SELECT id, name, country, formed_year FROM artists WHERE id = ?",
-                [target],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        let top_artist_rows = rec.measure("query_top10_artists_by_songs", None, || {
+            let rows = duckdb_top10_rows(
+                &conn,
+                "SELECT a.id, a.name, COUNT(s.id) AS song_count FROM artists a \
+                 JOIN songs s ON s.artist_id = a.id GROUP BY a.id, a.name \
+                 ORDER BY song_count DESC LIMIT 10",
             )
-            .expect("duckdb art");
-        println!("    artist={row:?}");
-    });
+            .expect("duckdb top10 artists");
+            println!("    rows={}", rows.len());
+            rows
+        });
+        add_query_evidence(
+            &mut rec,
+            "query_top10_artists_by_songs",
+            &top_artist_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(top_artist_rows);
 
-    rec.measure("query_top10_artists_by_songs", None, || {
-        let n = duckdb_query_row_count(&conn, "SELECT a.id, a.name, COUNT(s.id) AS song_count FROM artists a JOIN songs s ON s.artist_id = a.id GROUP BY a.id, a.name ORDER BY song_count DESC LIMIT 10").expect("duckdb t10a");
-        println!("    rows={n}");
-    });
+        let top_album_rows = rec.measure("query_top10_albums_by_songs", None, || {
+            let rows = duckdb_top10_rows(
+                &conn,
+                "SELECT al.id, al.title, COUNT(s.id) AS song_count FROM albums al \
+                 JOIN songs s ON s.album_id = al.id GROUP BY al.id, al.title \
+                 ORDER BY song_count DESC LIMIT 10",
+            )
+            .expect("duckdb top10 albums");
+            println!("    rows={}", rows.len());
+            rows
+        });
+        add_query_evidence(
+            &mut rec,
+            "query_top10_albums_by_songs",
+            &top_album_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(top_album_rows);
 
-    rec.measure("query_top10_albums_by_songs", None, || {
-        let n = duckdb_query_row_count(&conn, "SELECT al.id, al.title, COUNT(s.id) AS song_count FROM albums al JOIN songs s ON s.album_id = al.id GROUP BY al.id, al.title ORDER BY song_count DESC LIMIT 10").expect("duckdb t10al");
-        println!("    rows={n}");
-    });
+        let view_rows = rec.measure("query_view_first_1000", None, || {
+            let rows = duckdb_view_rows(&conn).expect("duckdb view 1000");
+            println!("    rows={}", rows.len());
+            rows
+        });
+        add_query_evidence(
+            &mut rec,
+            "query_view_first_1000",
+            &view_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(view_rows);
 
-    rec.measure("query_view_first_1000", None, || {
-        let n = duckdb_query_row_count(
-            &conn,
-            "SELECT artist_id, artist_name, album_title, song_title FROM v_artist_songs LIMIT 1000",
-        )
-        .expect("duckdb v1000");
-        println!("    rows={n}");
-    });
-
-    rec.measure("query_songs_for_artist_via_view", None, || {
-        let n = duckdb_query_row_count(
-            &conn,
-            "SELECT album_title, song_title, duration_ms FROM v_artist_songs WHERE artist_id = 1",
-        )
-        .expect("duckdb v");
-        println!("    rows={n}");
-    });
+        let filtered_rows = rec.measure("query_songs_for_artist_via_view", None, || {
+            let rows = duckdb_filtered_view_rows(&conn).expect("duckdb filtered view");
+            println!("    rows={}", rows.len());
+            rows
+        });
+        add_query_evidence(
+            &mut rec,
+            "query_songs_for_artist_via_view",
+            &filtered_rows,
+            scale,
+            summary.total_songs,
+        );
+        drop(filtered_rows);
 
         peak_rss = rec.peak_rss;
     }
 
-    if cli.latency_suite {
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))?;
-        run_latency_suite_duckdb(&conn, &mut report, scale, count as u64, cli)?;
-    }
-    if cli.write_suite {
-        run_write_suite_duckdb(&conn, &mut report, cli)?;
-    }
-    if cli.concurrency_suite {
-        // DuckDB Connection is not Send; record fallback
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "concurrent_mode".into(),
-            serde_json::json!("single_thread_fallback"),
-        );
-        report.concurrency_cases.push(ConcurrencyCaseMetric {
-            name: "duckdb_concurrent_fallback".into(),
-            reader_threads: 1,
-            reads_per_thread: 0,
-            writer_commits: 0,
-            extra,
-            ..Default::default()
-        });
-        println!("--- Concurrency Suite (DuckDB) --- note: single-thread fallback, DuckDB Connection is not Send");
+    #[cfg(feature = "extended-suites")]
+    {
+        if cli.latency_suite {
+            run_latency_suite_duckdb(&conn, &mut report, scale, total_songs, cli)?;
+        }
+        if cli.write_suite {
+            run_write_suite_duckdb(&conn, &mut report, cli)?;
+        }
+        if cli.concurrency_suite {
+            // DuckDB Connection is not Send; record fallback
+            let mut extra = serde_json::Map::new();
+            extra.insert(
+                "concurrent_mode".into(),
+                serde_json::json!("single_thread_fallback"),
+            );
+            report.concurrency_cases.push(ConcurrencyCaseMetric {
+                name: "duckdb_concurrent_fallback".into(),
+                reader_threads: 1,
+                reads_per_thread: 0,
+                writer_commits: 0,
+                extra,
+                ..Default::default()
+            });
+            println!("--- Concurrency Suite (DuckDB) --- note: single-thread fallback, DuckDB Connection is not Send");
+        }
     }
 
     drop(conn);
@@ -5247,6 +6481,12 @@ fn run_duckdb_benchmark(cli: &Cli) -> anyhow::Result<()> {
     let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
     report.wal_size_bytes = file_size(&wal_path);
     report.finished_unix = now_unix();
+    populate_run_report_metadata(
+        &mut report,
+        BenchmarkEngine::DuckDb,
+        BenchmarkProfile::Default,
+    );
+    finalize_runner_provenance(&mut report, seed)?;
 
     fs::create_dir_all(&out_dir)?;
     let datetime_stamp = format_unix_filename_stamp(report.finished_unix);
@@ -5262,16 +6502,60 @@ fn run_duckdb_benchmark(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn duckdb_query_row_count(conn: &duckdb::Connection, sql: &str) -> anyhow::Result<usize> {
+#[cfg(feature = "duckdb")]
+fn duckdb_top10_rows(conn: &duckdb::Connection, sql: &str) -> anyhow::Result<SemanticRows> {
     let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([])?;
-    let mut count = 0usize;
-    while let Some(_row) = rows.next()? {
-        count += 1;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        result.push(vec![
+            SemanticValue::Int64(row.get(0)?),
+            SemanticValue::Text(row.get(1)?),
+            SemanticValue::Int64(row.get(2)?),
+        ]);
     }
-    Ok(count)
+    Ok(result)
 }
 
+#[cfg(feature = "duckdb")]
+fn duckdb_view_rows(conn: &duckdb::Connection) -> anyhow::Result<SemanticRows> {
+    let mut stmt = conn.prepare(
+        "SELECT artist_id, artist_name, album_title, song_title \
+         FROM v_artist_songs LIMIT 1000",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        result.push(vec![
+            SemanticValue::Int64(row.get(0)?),
+            SemanticValue::Text(row.get(1)?),
+            SemanticValue::Text(row.get(2)?),
+            SemanticValue::Text(row.get(3)?),
+        ]);
+    }
+    Ok(result)
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_filtered_view_rows(conn: &duckdb::Connection) -> anyhow::Result<SemanticRows> {
+    let mut stmt = conn.prepare(
+        "SELECT album_title, song_title, duration_ms \
+         FROM v_artist_songs WHERE artist_id = 1",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        result.push(vec![
+            SemanticValue::Text(row.get(0)?),
+            SemanticValue::Text(row.get(1)?),
+            SemanticValue::Int64(row.get(2)?),
+        ]);
+    }
+    Ok(result)
+}
+
+#[cfg(feature = "duckdb")]
+#[cfg(feature = "extended-suites")]
 fn run_latency_suite_duckdb(
     conn: &duckdb::Connection,
     report: &mut RunReport,
@@ -5437,6 +6721,8 @@ fn run_latency_suite_duckdb(
     Ok(())
 }
 
+#[cfg(feature = "duckdb")]
+#[cfg(feature = "extended-suites")]
 fn run_write_suite_duckdb(
     conn: &duckdb::Connection,
     report: &mut RunReport,
@@ -5559,7 +6845,7 @@ fn run_write_suite_duckdb(
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     if let Err(e) = run(cli) {
         eprintln!("Error: {e:?}");
         std::process::exit(1);
@@ -5569,10 +6855,562 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_unix_filename_stamp, format_unix_label, ordered_step_names, parse_scale,
-        summarize_seed_plan, walk_seed_plan_select, HistoricalRun, RunReport, SeedWalkEmit,
-        StepMetric, BENCHMARK_SCALES, HUGE, SMOKE,
+        compiled_optional_features, decentdb_companion_path, delete_db_files,
+        finalize_runner_provenance, format_unix_filename_stamp, parse_scale,
+        parse_statm_resident_pages, parse_status_kb, populate_run_report_metadata,
+        semantic_checksum, summarize_seed_plan, validate_query_semantics, walk_seed_plan_select,
+        BenchmarkEngine, BenchmarkProfile, Cli, RunReport, SeedWalkEmit, SemanticValue,
+        BENCHMARK_SCALES, DECENTDB_CHECKPOINT_DURABILITY_CONTRACT, HUGE, SMOKE,
     };
+    #[cfg(feature = "extended-suites")]
+    use super::{
+        format_unix_label, load_report_data, ordered_step_names, HistoricalRun, StepMetric,
+    };
+    #[cfg(feature = "extended-suites")]
+    use clap::{CommandFactory as _, Parser as _};
+    #[cfg(feature = "extended-suites")]
+    use sha2::{Digest as _, Sha256};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(feature = "extended-suites")]
+    fn parse_cli_from<const N: usize>(arguments: [&str; N]) -> Result<Cli, String> {
+        Cli::try_parse_from(arguments).map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(feature = "extended-suites"))]
+    fn parse_cli_from<const N: usize>(arguments: [&str; N]) -> Result<Cli, String> {
+        match super::parse_canonical_cli_from(arguments)? {
+            super::CanonicalCliAction::Run(cli) => Ok(cli),
+            super::CanonicalCliAction::Help => Err("help requested".to_string()),
+            super::CanonicalCliAction::Version => Err("version requested".to_string()),
+        }
+    }
+
+    #[test]
+    fn runner_provenance_is_finalized_together_after_measurement() {
+        let mut report = RunReport::default();
+        assert_eq!(report.seed, 0);
+        assert!(report.invocation_argv.is_empty());
+        assert!(report.executable_sha256.is_empty());
+
+        finalize_runner_provenance(&mut report, 42).expect("finalize runner provenance");
+        assert_eq!(report.seed, 42);
+        assert!(!report.invocation_argv.is_empty());
+        assert_eq!(report.executable_sha256.len(), 64);
+        assert!(report
+            .executable_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn statm_parser_accepts_linux_whitespace_and_multi_digit_values() {
+        assert_eq!(
+            parse_statm_resident_pages(b"123456 98765 4321 7 8 9 10\n"),
+            Some(98_765)
+        );
+        assert_eq!(
+            parse_statm_resident_pages(b"\t123456\t  98765\r\n"),
+            Some(98_765)
+        );
+    }
+
+    #[test]
+    fn statm_parser_rejects_missing_malformed_and_overflow_values() {
+        assert_eq!(parse_statm_resident_pages(b"123456\n"), None);
+        assert_eq!(parse_statm_resident_pages(b"123456 resident\n"), None);
+        assert_eq!(
+            parse_statm_resident_pages(b"123456 18446744073709551616\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn status_parser_finds_exact_fields_independent_of_order() {
+        let first = b"Name:\trust-baseline\nRssFile:\t12345 kB\nRssAnon:      6789 kB\n";
+        let second = b"RssAnon:\t6789 kB\nVmRSS:\t99999 kB\nRssFile: 12345 kB\n";
+        for fixture in [first.as_slice(), second.as_slice()] {
+            assert_eq!(parse_status_kb(fixture, b"RssAnon:"), Some(6_789));
+            assert_eq!(parse_status_kb(fixture, b"RssFile:"), Some(12_345));
+        }
+        assert_eq!(parse_status_kb(first, b"VmRSS:"), None);
+        assert_eq!(parse_status_kb(b"RssAnon: unknown kB\n", b"RssAnon:"), None);
+        assert_eq!(
+            parse_status_kb(b"RssAnon: 18446744073709551616 kB\n", b"RssAnon:"),
+            None
+        );
+    }
+
+    #[test]
+    fn semantic_checksum_is_row_order_insensitive_and_type_aware() {
+        let rows = vec![
+            vec![SemanticValue::Int64(1), SemanticValue::Text("one".into())],
+            vec![SemanticValue::Int64(2), SemanticValue::Text("two".into())],
+        ];
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        assert_eq!(semantic_checksum(&rows), semantic_checksum(&reversed));
+
+        let mut different_type = rows;
+        different_type[0][0] = SemanticValue::Float64(1.0);
+        assert_ne!(
+            semantic_checksum(&reversed),
+            semantic_checksum(&different_type)
+        );
+    }
+
+    #[test]
+    fn top10_semantic_invariants_reject_duplicates_and_bad_order() {
+        let mut rows = (1_i64..=10)
+            .map(|id| {
+                vec![
+                    SemanticValue::Int64(id),
+                    SemanticValue::Text(format!("Artist {id}")),
+                    SemanticValue::Int64(20 - id),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            validate_query_semantics("query_top10_artists_by_songs", &rows, SMOKE, 27_783,).is_ok()
+        );
+
+        rows[1][0] = SemanticValue::Int64(1);
+        rows[1][1] = SemanticValue::Text("Artist 1".into());
+        assert!(
+            validate_query_semantics("query_top10_artists_by_songs", &rows, SMOKE, 27_783,)
+                .is_err()
+        );
+
+        rows[1][0] = SemanticValue::Int64(2);
+        rows[1][1] = SemanticValue::Text("Artist 2".into());
+        rows[1][2] = SemanticValue::Int64(99);
+        assert!(
+            validate_query_semantics("query_top10_artists_by_songs", &rows, SMOKE, 27_783,)
+                .is_err()
+        );
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let id = NEXT_TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "decentdb-rust-baseline-{label}-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create benchmark runner test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn delete_db_files_removes_stale_decentdb_sidecars() {
+        let directory = TestDirectory::new("cleanup-sidecars");
+        let db_path = directory.path().join("benchmark.ddb");
+        let artifacts = [
+            db_path.clone(),
+            decentdb_companion_path(&db_path, ".wal"),
+            decentdb_companion_path(&db_path, ".coord"),
+            decentdb_companion_path(&db_path, ".wal-idx"),
+            directory.path().join("benchmark.ddb-wal"),
+            directory.path().join("benchmark.ddb-shm"),
+        ];
+        for artifact in &artifacts {
+            std::fs::write(artifact, b"stale").expect("create stale database artifact");
+        }
+
+        delete_db_files(&db_path);
+
+        for artifact in artifacts {
+            assert!(
+                !artifact.exists(),
+                "stale artifact was not removed: {}",
+                artifact.display()
+            );
+        }
+    }
+
+    #[cfg(feature = "extended-suites")]
+    #[test]
+    fn html_report_uses_only_checksum_verified_manifest_results() {
+        let directory = TestDirectory::new("manifest-report-inputs");
+        let accepted_name = "accepted-rust-baseline-default-smoke.json";
+        let provisional_name = "provisional-rust-baseline-default-smoke.json";
+
+        let accepted = RunReport {
+            scale_name: "smoke".into(),
+            started_unix: 1,
+            ..RunReport::default()
+        };
+        let accepted_json = serde_json::to_vec_pretty(&accepted).expect("serialize accepted run");
+        std::fs::write(directory.path().join(accepted_name), &accepted_json)
+            .expect("write accepted run");
+
+        let mut provisional = accepted;
+        provisional.started_unix = 2;
+        std::fs::write(
+            directory.path().join(provisional_name),
+            serde_json::to_vec_pretty(&provisional).expect("serialize provisional run"),
+        )
+        .expect("write provisional run");
+
+        let accepted_sha256 = format!("{:x}", Sha256::digest(&accepted_json));
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "files": [{"path": accepted_name, "sha256": accepted_sha256}],
+        });
+        std::fs::write(
+            directory.path().join("history-manifest.json"),
+            serde_json::to_vec_pretty(&manifest).expect("serialize history manifest"),
+        )
+        .expect("write history manifest");
+
+        let report = load_report_data(directory.path()).expect("load manifested report data");
+        assert_eq!(report.total_runs, 1);
+        assert_eq!(report.scales[0].runs.len(), 1);
+        assert_eq!(report.scales[0].runs[0].file_name, accepted_name);
+
+        std::fs::write(directory.path().join(accepted_name), b"tampered")
+            .expect("tamper accepted run");
+        let error = match load_report_data(directory.path()) {
+            Ok(_) => panic!("checksum mismatch must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("SHA-256 mismatch"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn delete_db_files_preserves_unrelated_files() {
+        let directory = TestDirectory::new("cleanup-preserves-unrelated");
+        let db_path = directory.path().join("benchmark.ddb");
+        let unrelated = [
+            directory.path().join("benchmark.ddb.backup"),
+            directory.path().join("benchmark.ddb.coord.backup"),
+            directory.path().join("other.ddb.coord"),
+        ];
+        std::fs::write(&db_path, b"database").expect("create database artifact");
+        for file in &unrelated {
+            std::fs::write(file, b"keep").expect("create unrelated file");
+        }
+
+        delete_db_files(&db_path);
+
+        assert!(!db_path.exists(), "database artifact should be removed");
+        for file in unrelated {
+            assert_eq!(
+                std::fs::read(&file).expect("read preserved unrelated file"),
+                b"keep",
+                "unrelated file was modified: {}",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn engine_cli_always_accepts_decentdb() {
+        let cli = parse_cli_from(["rust-baseline", "--engine", "decentdb"])
+            .expect("DecentDB must be available in the canonical binary");
+
+        assert_eq!(cli.engine, BenchmarkEngine::DecentDb);
+    }
+
+    #[cfg(feature = "extended-suites")]
+    #[test]
+    fn extended_cli_uses_canonical_command_name() {
+        assert_eq!(Cli::command().get_name(), "rust-baseline");
+    }
+
+    #[cfg(all(unix, not(feature = "extended-suites")))]
+    #[test]
+    fn canonical_cli_preserves_non_utf8_database_paths() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let raw_path = std::ffi::OsString::from_vec(b"database-\xff.ddb".to_vec());
+        let arguments = vec![
+            std::ffi::OsString::from("rust-baseline"),
+            std::ffi::OsString::from("--db-path"),
+            raw_path.clone(),
+        ];
+        let super::CanonicalCliAction::Run(cli) =
+            super::parse_canonical_cli_from(arguments).expect("parse non-UTF-8 path")
+        else {
+            panic!("expected a runnable CLI action");
+        };
+        assert_eq!(
+            cli.db_path.expect("database path").as_os_str().as_bytes(),
+            raw_path.as_os_str().as_bytes()
+        );
+    }
+
+    #[cfg(not(feature = "extended-suites"))]
+    #[test]
+    fn extended_cli_flags_are_rejected_without_feature() {
+        for flag in [
+            "--report",
+            "--benchmark",
+            "--plan-cache-benchmark",
+            "--latency-suite",
+            "--concurrency-suite",
+            "--write-suite",
+            "--cold-suite",
+        ] {
+            let error = parse_cli_from(["rust-baseline", flag])
+                .expect_err("extended flag must not be exposed by the canonical binary");
+            assert!(
+                error.to_string().contains("unexpected argument"),
+                "unexpected error for {flag}: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "extended-suites")]
+    #[test]
+    fn extended_cli_flags_are_accepted_with_feature() {
+        for flag in [
+            "--report",
+            "--benchmark",
+            "--plan-cache-benchmark",
+            "--latency-suite",
+            "--concurrency-suite",
+            "--write-suite",
+            "--cold-suite",
+        ] {
+            parse_cli_from(["rust-baseline", flag])
+                .unwrap_or_else(|error| panic!("extended flag {flag} was rejected: {error}"));
+        }
+    }
+
+    #[test]
+    fn canonical_json_keeps_empty_optional_suite_arrays() {
+        let json = serde_json::to_value(RunReport::default()).expect("serialize run report");
+
+        for field in [
+            "latency_cases",
+            "concurrency_cases",
+            "write_cases",
+            "cold_cases",
+        ] {
+            assert_eq!(json[field], serde_json::json!([]), "field {field}");
+        }
+    }
+
+    #[test]
+    fn report_records_exact_sorted_compiled_optional_features() {
+        let features = compiled_optional_features();
+        let mut sorted = features.clone();
+        sorted.sort_unstable();
+
+        assert_eq!(features, sorted, "feature provenance must be sorted");
+        assert_eq!(
+            features.len(),
+            cfg!(feature = "duckdb") as usize
+                + cfg!(feature = "extended-suites") as usize
+                + cfg!(feature = "lua-extensions") as usize
+                + cfg!(feature = "sqlite") as usize,
+            "only enabled optional benchmark features may be reported"
+        );
+        assert_eq!(
+            features.iter().any(|feature| feature == "duckdb"),
+            cfg!(feature = "duckdb")
+        );
+        assert_eq!(
+            features.iter().any(|feature| feature == "extended-suites"),
+            cfg!(feature = "extended-suites")
+        );
+        assert_eq!(
+            features.iter().any(|feature| feature == "lua-extensions"),
+            cfg!(feature = "lua-extensions")
+        );
+        assert_eq!(
+            features.iter().any(|feature| feature == "sqlite"),
+            cfg!(feature = "sqlite")
+        );
+
+        let mut report = RunReport::default();
+        populate_run_report_metadata(
+            &mut report,
+            BenchmarkEngine::DecentDb,
+            BenchmarkProfile::Default,
+        );
+        assert_eq!(report.compiled_optional_features, features);
+        assert_eq!(
+            report.checkpoint_durability_contract,
+            DECENTDB_CHECKPOINT_DURABILITY_CONTRACT
+        );
+    }
+
+    #[cfg(not(any(
+        feature = "duckdb",
+        feature = "extended-suites",
+        feature = "lua-extensions",
+        feature = "sqlite"
+    )))]
+    #[test]
+    fn canonical_default_report_has_no_compiled_optional_features() {
+        let mut report = RunReport::default();
+        populate_run_report_metadata(
+            &mut report,
+            BenchmarkEngine::DecentDb,
+            BenchmarkProfile::Default,
+        );
+
+        let json = serde_json::to_value(report).expect("serialize canonical report");
+        assert_eq!(json["compiled_optional_features"], serde_json::json!([]));
+        assert_eq!(
+            json["checkpoint_durability_contract"],
+            DECENTDB_CHECKPOINT_DURABILITY_CONTRACT
+        );
+    }
+
+    #[test]
+    fn reports_without_build_and_durability_provenance_remain_parseable() {
+        let mut json = serde_json::to_value(RunReport::default()).expect("serialize old report");
+        let object = json
+            .as_object_mut()
+            .expect("run report must serialize as an object");
+        object.remove("compiled_optional_features");
+        object.remove("checkpoint_durability_contract");
+
+        let report: RunReport = serde_json::from_value(json).expect("parse old report JSON");
+        assert!(report.compiled_optional_features.is_empty());
+        assert!(report.checkpoint_durability_contract.is_empty());
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn engine_cli_rejects_sqlite_without_feature() {
+        let error = parse_cli_from(["rust-baseline", "--engine", "sqlite"])
+            .expect_err("SQLite must not be exposed without the sqlite feature");
+
+        assert!(error.to_string().contains("invalid value 'sqlite'"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn engine_cli_accepts_sqlite_with_feature() {
+        let cli = parse_cli_from(["rust-baseline", "--engine", "sqlite"])
+            .expect("SQLite must be exposed by the sqlite feature");
+
+        assert_eq!(cli.engine, BenchmarkEngine::Sqlite);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_profile_accepts_known_values_with_feature() {
+        let cli = parse_cli_from([
+            "rust-baseline",
+            "--engine",
+            "sqlite",
+            "--sqlite-profile",
+            "wal-normal",
+        ])
+        .expect("SQLite wal-normal profile must be accepted by the sqlite feature");
+
+        assert_eq!(cli.sqlite_profile, Some(super::SqliteProfile::WalNormal));
+        super::validate_engine_profile(&cli).expect("sqlite wal-normal profile should validate");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_profile_rejects_unknown_values_with_feature() {
+        let error = parse_cli_from([
+            "rust-baseline",
+            "--engine",
+            "sqlite",
+            "--sqlite-profile",
+            "wal-nromal",
+        ])
+        .expect_err("unknown SQLite profiles must fail at parse time");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid value"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("wal-normal"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_profile_rejects_non_sqlite_engine_with_feature() {
+        let cli = parse_cli_from([
+            "rust-baseline",
+            "--engine",
+            "decentdb",
+            "--sqlite-profile",
+            "wal-normal",
+        ])
+        .expect("known SQLite profile should parse before validation");
+
+        let error = super::validate_engine_profile(&cli)
+            .expect_err("SQLite profile must be scoped to the SQLite engine");
+        assert!(
+            error
+                .to_string()
+                .contains("--sqlite-profile is only supported for --engine sqlite"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(not(feature = "duckdb"))]
+    #[test]
+    fn engine_cli_rejects_duckdb_without_feature() {
+        let error = parse_cli_from(["rust-baseline", "--engine", "duckdb"])
+            .expect_err("DuckDB must not be exposed without the duckdb feature");
+
+        assert!(error.to_string().contains("invalid value 'duckdb'"));
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn engine_cli_accepts_duckdb_with_feature() {
+        let cli = parse_cli_from(["rust-baseline", "--engine", "duckdb"])
+            .expect("DuckDB must be exposed by the duckdb feature");
+
+        assert_eq!(cli.engine, BenchmarkEngine::DuckDb);
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn duckdb_rejects_decentdb_profile_with_feature() {
+        let cli = parse_cli_from([
+            "rust-baseline",
+            "--engine",
+            "duckdb",
+            "--profile",
+            "resident-hot-read",
+        ])
+        .expect("DuckDB profile rejection happens after CLI parsing");
+
+        let error = super::validate_engine_profile(&cli)
+            .expect_err("DuckDB must reject DecentDB-only profiles");
+        assert!(
+            error
+                .to_string()
+                .contains("--profile is only supported for --engine decentdb"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn parse_scale_supports_huge() {
@@ -5654,9 +7492,15 @@ mod tests {
     #[test]
     fn unix_timestamp_formatting_is_utc() {
         assert_eq!(format_unix_filename_stamp(1_779_193_075), "2026-05-19-1217");
+    }
+
+    #[cfg(feature = "extended-suites")]
+    #[test]
+    fn report_timestamp_formatting_is_utc() {
         assert_eq!(format_unix_label(1_779_193_075), "2026-05-19 12:17:55 UTC");
     }
 
+    #[cfg(feature = "extended-suites")]
     #[test]
     fn ordered_step_names_uses_benchmark_order() {
         let run = HistoricalRun::new(

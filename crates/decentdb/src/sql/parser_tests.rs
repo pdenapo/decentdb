@@ -1,6 +1,62 @@
 #[cfg(test)]
 mod tests {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    use crate::sql::parser::parse_plain_sql_batch_single_dispatch;
     use crate::sql::parser::parse_sql_statement;
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn plain_batch_parser_normalizes_multiple_statements_in_one_dispatch() {
+        let statements = vec![
+            "CREATE TABLE users (id INT64 PRIMARY KEY)".to_string(),
+            "CREATE INDEX users_id ON users(id)".to_string(),
+            "CREATE VIEW user_ids AS SELECT id FROM users".to_string(),
+        ];
+        let parsed = parse_plain_sql_batch_single_dispatch(&statements)
+            .expect("parse plain batch")
+            .expect("plain batch should use one parser dispatch");
+        assert_eq!(parsed.len(), statements.len());
+        assert!(matches!(
+            parsed[0],
+            crate::sql::ast::Statement::CreateTable(_)
+        ));
+        assert!(matches!(
+            parsed[1],
+            crate::sql::ast::Statement::CreateIndex(_)
+        ));
+        assert!(matches!(
+            parsed[2],
+            crate::sql::ast::Statement::CreateView(_)
+        ));
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn plain_batch_parser_declines_compatibility_rewrites() {
+        for statement in [
+            "CREATE TABLE products (price FLOAT64, total FLOAT64 GENERATED ALWAYS AS (price) VIRTUAL)",
+            "CREATE VIEW IF NOT EXISTS user_ids AS SELECT 1",
+            "CREATE TRIGGER log_insert AFTER INSERT ON users FOR EACH ROW BEGIN SELECT decentdb_exec_sql('SELECT 1'); END",
+        ] {
+            let statements = vec![statement.to_string()];
+            assert!(
+                parse_plain_sql_batch_single_dispatch(&statements)
+                    .expect("classify rewritten batch")
+                    .is_none(),
+                "compatibility syntax should retain the general parser path: {statement}"
+            );
+        }
+
+        let ordinary = parse_sql_statement("CREATE VIEW ordinary_view AS SELECT 1")
+            .expect("parse ordinary view after declined batch");
+        let crate::sql::ast::Statement::CreateView(ordinary) = ordinary else {
+            panic!("expected CREATE VIEW statement");
+        };
+        assert!(
+            !ordinary.if_not_exists,
+            "declining the batch path must not leak rewrite state"
+        );
+    }
 
     #[test]
     fn parse_matrix_tests_for_supported_syntax() {

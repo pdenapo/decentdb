@@ -30,8 +30,8 @@ use crate::config::{DbConfig, WalSyncMode};
 use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
 use crate::storage::PagerHandle;
-use crate::vfs::VfsFile;
 use crate::vfs::VfsHandle;
+use crate::vfs::{read_exact_at, VfsFile};
 
 #[cfg(feature = "bench-internals")]
 use crate::benchmark::{
@@ -46,11 +46,103 @@ use self::coordination::{
 };
 use self::delta::apply_page_delta_in_place;
 use self::format::{FrameEncoding, WalFrame};
-use self::index::{WalIndex, WalVersion};
+use self::index::{WalIndex, WalVersion, WalVersionPayload};
 use self::index_sidecar::WalIndexSidecar;
 use self::reader_registry::{ReaderGuard, ReaderRegistry};
 
 const NO_RETAINED_SNAPSHOT_LSN: u64 = u64::MAX;
+const CHECKPOINT_WAL_READ_AHEAD_BYTES: usize = 256 * 1024;
+
+/// Bounded, checkpoint-local WAL read-ahead window.
+///
+/// Checkpoint copyback orders output by page id. Bulk-load WAL offsets follow
+/// that order closely, so one window commonly serves dozens of consecutive
+/// full-page versions. Non-monotonic offsets remain correct: a miss simply
+/// refills the window at the requested frame.
+#[derive(Debug, Default)]
+pub(crate) struct CheckpointWalReadAhead {
+    start_offset: u64,
+    bytes: Vec<u8>,
+    last_request_end: Option<u64>,
+}
+
+impl CheckpointWalReadAhead {
+    fn frame_bytes<'a>(
+        &'a mut self,
+        file: &dyn VfsFile,
+        wal_offset: u64,
+        frame_len: u32,
+        logical_end: u64,
+    ) -> Result<&'a [u8]> {
+        let frame_len = usize::try_from(frame_len)
+            .map_err(|_| DbError::corruption("WAL frame length does not fit this platform"))?;
+        let frame_end = wal_offset
+            .checked_add(frame_len as u64)
+            .ok_or_else(|| DbError::corruption("WAL frame end offset overflows"))?;
+        if frame_end > logical_end {
+            return Err(DbError::corruption(format!(
+                "WAL frame at offset {wal_offset} is truncated at logical end {logical_end}"
+            )));
+        }
+
+        let cached_end = self.start_offset.saturating_add(self.bytes.len() as u64);
+        let cached = wal_offset >= self.start_offset && frame_end <= cached_end;
+        if !cached {
+            let available = logical_end.saturating_sub(wal_offset);
+            // A page-id ordered checkpoint can encounter WAL offsets in any
+            // order. Prefetch only for the first request or a nearby forward
+            // continuation; a backward/random miss reads just its frame so a
+            // 256 KiB window is not repeatedly discarded unused.
+            let nearby_forward = self.last_request_end.is_some_and(|previous_end| {
+                wal_offset >= previous_end
+                    && wal_offset.saturating_sub(previous_end)
+                        <= (frame_len as u64).saturating_mul(4)
+            });
+            let desired = if self.last_request_end.is_none() || nearby_forward {
+                CHECKPOINT_WAL_READ_AHEAD_BYTES as u64
+            } else {
+                frame_len as u64
+            };
+            let read_len_u64 = available.min(desired);
+            let read_len = usize::try_from(read_len_u64).map_err(|_| {
+                DbError::corruption("checkpoint WAL read-ahead length does not fit this platform")
+            })?;
+            if read_len < frame_len {
+                return Err(DbError::corruption(format!(
+                    "WAL frame at offset {wal_offset} is truncated: needs {frame_len} bytes, has {read_len}"
+                )));
+            }
+            self.bytes.clear();
+            if self.bytes.capacity() < read_len {
+                self.bytes
+                    .try_reserve_exact(read_len - self.bytes.capacity())
+                    .map_err(|error| {
+                        DbError::internal(format!(
+                            "allocate checkpoint WAL read-ahead ({read_len} bytes): {error}"
+                        ))
+                    })?;
+            }
+            self.bytes.resize(read_len, 0);
+            self.start_offset = wal_offset;
+            read_exact_at(file, wal_offset, &mut self.bytes)?;
+        }
+
+        self.last_request_end = Some(frame_end);
+
+        let relative =
+            usize::try_from(wal_offset.saturating_sub(self.start_offset)).map_err(|_| {
+                DbError::corruption("cached WAL frame offset does not fit this platform")
+            })?;
+        let relative_end = relative
+            .checked_add(frame_len)
+            .ok_or_else(|| DbError::corruption("cached WAL frame end overflows"))?;
+        self.bytes.get(relative..relative_end).ok_or_else(|| {
+            DbError::corruption(format!(
+                "cached WAL frame at offset {wal_offset} is outside the read-ahead window"
+            ))
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct WalHandle {
@@ -73,6 +165,8 @@ pub(crate) struct SharedWalInner {
     reader_registry: ReaderRegistry,
     retained_snapshot_lsn: AtomicU64,
     checkpoint_pending: AtomicBool,
+    checkpoint_tail_sync_needed: AtomicBool,
+    checkpoint_tail_locally_synced: AtomicBool,
     checkpoint_epoch: AtomicU64,
     /// `Some` when `sync_mode` is `WalSyncMode::AsyncCommit { .. }`; owns the
     /// background flusher thread and durability watermark. Constructed lazily
@@ -135,12 +229,46 @@ impl AutoCheckpointConfig {
     }
 }
 
-pub(crate) type WalBasePage = Option<(Arc<[u8]>, bool)>;
+/// Provenance for a materialized page used as a WAL delta base.
+///
+/// A main-database page is stable until checkpoint, and a resident WAL page
+/// carries a complete materialized image. An on-disk WAL version may itself
+/// be a delta whose earlier version is about to leave the index, so it must
+/// not become the sole base for a newly published delta.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalBaseSource {
+    MainDatabase,
+    ResidentWal,
+    OnDiskWal,
+}
+
+pub(crate) type WalBasePage = Option<(Arc<[u8]>, WalBaseSource)>;
+
+#[derive(Debug)]
+pub(crate) enum PreparedWalPayload {
+    /// The full page is self-contained in the just-written WAL frame. Its
+    /// input vector was released after the bounded preparation batch.
+    OnDiskFullPage,
+    /// The materialized image must remain resident. Delta frames need it for
+    /// direct reads and active-reader commits retain full images as well.
+    Resident {
+        data: Vec<u8>,
+        encoding: format::FrameEncoding,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedWalPage {
+    pub(crate) page_id: PageId,
+    pub(crate) encoded_len: usize,
+    pub(crate) frame_offset: u64,
+    pub(crate) payload: PreparedWalPayload,
+}
 
 #[derive(Debug)]
 pub(crate) struct WalWriteState {
     pub(crate) page_batch: Vec<u8>,
-    pub(crate) prepared_pages: Vec<(PageId, Vec<u8>, usize, format::FrameEncoding, u64)>,
+    pub(crate) prepared_pages: Vec<PreparedWalPage>,
     pub(crate) base_pages: Vec<WalBasePage>,
     /// Reusable scratch buffer for the per-page delta payload (slice M6).
     /// `encode_page_delta_into` clears and refills this buffer on every
@@ -170,6 +298,22 @@ impl WalHandle {
         process_coordinator: Option<ProcessCoordinator>,
     ) -> Result<Self> {
         shared::acquire(vfs, db_path, config, pager, process_coordinator)
+    }
+
+    /// Acquires a WAL only when this call can atomically create its sidecar.
+    ///
+    /// `Ok(None)` means either the WAL path or a same-process shared handle
+    /// already exists. Fresh-database bootstrap uses that result to finish its
+    /// main-file durability barrier before retrying the normal recovery-aware
+    /// acquisition path.
+    pub(crate) fn acquire_fresh(
+        vfs: &VfsHandle,
+        db_path: &Path,
+        config: &DbConfig,
+        pager: &PagerHandle,
+        process_coordinator: Option<ProcessCoordinator>,
+    ) -> Result<Option<Self>> {
+        shared::acquire_fresh(vfs, db_path, config, pager, process_coordinator)
     }
 
     pub(crate) fn evict(vfs: &VfsHandle, db_path: &Path) -> Result<()> {
@@ -255,6 +399,65 @@ impl WalHandle {
         self.materialize_version_locked(&index, pager, page_id, version)
     }
 
+    /// Append one checkpoint page image directly to the copyback buffer.
+    ///
+    /// Self-contained on-disk Page frames use the bounded read-ahead window
+    /// and are validated in place. Resident images avoid an unnecessary Arc
+    /// clone. On-disk deltas retain the existing recursive materialization
+    /// path because they may require an indexed predecessor or main-file base.
+    pub(crate) fn append_checkpoint_version_to(
+        &self,
+        pager: &PagerHandle,
+        page_id: PageId,
+        version: &WalVersion,
+        logical_end: u64,
+        read_ahead: &mut CheckpointWalReadAhead,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        let page_size = self.inner.page_size as usize;
+        match &version.payload {
+            WalVersionPayload::Resident { data, .. } => {
+                if data.len() != page_size {
+                    return Err(DbError::corruption(format!(
+                        "checkpoint page {page_id} has {} bytes; expected {page_size}",
+                        data.len()
+                    )));
+                }
+                output.extend_from_slice(data);
+            }
+            WalVersionPayload::OnDisk {
+                wal_offset,
+                frame_len,
+                encoding: FrameEncoding::Page,
+            } => {
+                let frame = read_ahead.frame_bytes(
+                    self.inner.file.as_ref(),
+                    *wal_offset,
+                    *frame_len,
+                    logical_end,
+                )?;
+                let payload = WalFrame::page_payload_from_encoded_with_len(
+                    frame,
+                    page_id,
+                    *frame_len,
+                    self.inner.page_size,
+                )?;
+                output.extend_from_slice(payload);
+            }
+            WalVersionPayload::OnDisk { .. } => {
+                let payload = self.materialize_checkpoint_version(pager, page_id, version)?;
+                if payload.len() != page_size {
+                    return Err(DbError::corruption(format!(
+                        "checkpoint page {page_id} has {} bytes; expected {page_size}",
+                        payload.len()
+                    )));
+                }
+                output.extend_from_slice(&payload);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn latest_snapshot(&self) -> u64 {
         self.inner.wal_end_lsn.load(Ordering::Acquire)
     }
@@ -263,16 +466,48 @@ impl WalHandle {
         self.inner.checkpoint_epoch.load(Ordering::Acquire)
     }
 
+    pub(crate) fn observed_current_snapshot_lsn(&self) -> Result<Option<u64>> {
+        let snapshot_lsn = self.latest_snapshot();
+        let Some(coordinator) = &self.inner.process_coordinator else {
+            return Ok(Some(snapshot_lsn));
+        };
+        let snapshot = coordinator.snapshot()?;
+        let observed_wal = self
+            .inner
+            .observed_coord_wal_generation
+            .load(Ordering::Acquire);
+        let observed_checkpoint = self
+            .inner
+            .observed_coord_checkpoint_generation
+            .load(Ordering::Acquire);
+        if snapshot.wal_generation == observed_wal
+            && snapshot.checkpoint_generation == observed_checkpoint
+            && snapshot.wal_end_lsn == snapshot_lsn
+        {
+            Ok(Some(snapshot_lsn))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub(crate) fn begin_reader(&self) -> Result<ReaderGuard> {
         self.begin_reader_with_process_guard(None)
     }
 
     pub(crate) fn begin_reader_with_pager(&self, pager: &PagerHandle) -> Result<ReaderGuard> {
-        if self.inner.process_coordinator.is_none() {
+        let Some(coordinator) = self.inner.process_coordinator.as_ref() else {
             return self.begin_reader();
-        }
+        };
+        let started = std::time::Instant::now();
         let mut delay = std::time::Duration::from_micros(100);
-        for _ in 0..8 {
+        let mut attempts = 0_u8;
+        loop {
+            // The shared process gate closes the scan-to-publication hole:
+            // a checkpoint cannot begin its retention scan until this reader
+            // has either published a slot or abandoned this attempt. It stays
+            // held across refresh, snapshot capture, slot registration, and
+            // the generation validation below.
+            let _admission = coordinator.lock_reader_admission()?;
             self.refresh_from_coordination(pager)?;
             let before = self.coordination_header_snapshot()?;
             let guard = self.begin_reader_with_process_slot()?;
@@ -288,11 +523,27 @@ impl WalHandle {
                 return Ok(guard);
             }
             drop(guard);
-            std::thread::sleep(delay);
-            delay = (delay * 2).min(std::time::Duration::from_millis(5));
+            drop(_admission);
+            attempts = attempts.saturating_add(1);
+            if coordinator.reader_registration_timed_out(started.elapsed()) {
+                if coordinator.reader_registration_timeout_is_zero() {
+                    return Err(DbError::busy(
+                        "process reader registration observed continuous WAL publication",
+                    ));
+                }
+                return Err(DbError::timeout(
+                    "timed out waiting for a stable process reader snapshot",
+                ));
+            }
+            // Preserve the bounded fast retry phase from ADR 0178, then keep
+            // polling at the capped delay until the configured busy timeout.
+            if attempts < 8 {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(5));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
-        self.refresh_from_coordination(pager)?;
-        self.begin_reader_with_process_slot()
     }
 
     fn begin_reader_with_process_slot(&self) -> Result<ReaderGuard> {
@@ -347,7 +598,7 @@ impl WalHandle {
 
     pub(crate) fn lock_process_checkpoint(
         &self,
-    ) -> Result<Option<coordination::ProcessWriterGuard>> {
+    ) -> Result<Option<coordination::ProcessCheckpointGuard>> {
         self.inner
             .process_coordinator
             .as_ref()
@@ -434,6 +685,7 @@ impl WalHandle {
             if let Some(sidecar) = sidecar.as_mut() {
                 sidecar.clear()?;
             }
+            let previous_end_lsn = self.latest_snapshot();
             let (index, end_lsn, recovered_max_page_id) =
                 crate::wal::recovery::initialize_or_recover(
                     &self.inner.file,
@@ -442,6 +694,11 @@ impl WalHandle {
                     self.inner.wal_index_hot_set_pages,
                     sidecar.as_deref_mut(),
                 )?;
+            // Normal reads/writes acquire index then sidecar. Release the
+            // refresh-side sidecar guard before replacing the index to keep
+            // that global lock order and avoid a cross-handle deadlock.
+            drop(sidecar);
+            let allocated_len = self.inner.file.file_size()?;
             {
                 let mut current = self
                     .inner
@@ -452,8 +709,23 @@ impl WalHandle {
             }
             self.inner.wal_end_lsn.store(end_lsn, Ordering::Release);
             self.inner
+                .allocated_len
+                .store(allocated_len, Ordering::Release);
+            self.inner
                 .max_page_count
                 .fetch_max(recovered_max_page_id, Ordering::AcqRel);
+            if end_lsn < previous_end_lsn {
+                if let Some(async_commit) = self.inner.async_commit.as_ref() {
+                    async_commit.rebase_clean_lsn(end_lsn)?;
+                }
+            }
+            let nonempty_tail = end_lsn > 0;
+            self.inner
+                .checkpoint_tail_sync_needed
+                .store(nonempty_tail, Ordering::Release);
+            self.inner
+                .checkpoint_tail_locally_synced
+                .store(!nonempty_tail, Ordering::Release);
             self.inner
                 .observed_coord_wal_generation
                 .store(snapshot.wal_generation, Ordering::Release);
@@ -649,7 +921,14 @@ impl WalHandle {
         if version.lsn > snapshot_lsn {
             return Ok(());
         }
-        sidecar.clear_latest(page_id)?;
+        if let Err(error) = sidecar.clear_latest(page_id) {
+            // The sidecar clear is only cache maintenance. Preserve the
+            // authoritative version in the hot index when its publication
+            // byte could not be cleared so a later lookup never falls back to
+            // a stale main-database image.
+            index.seed_latest(page_id, version);
+            return Err(error);
+        }
         index.seed_latest(page_id, version);
         if self.inner.reader_registry.active_reader_count()? == 0 {
             self.spill_excess_hot_pages_locked(index, &mut sidecar)?;
@@ -667,7 +946,14 @@ impl WalHandle {
             return Ok(());
         }
         while let Some((page_id, version)) = index.spill_one_cold_latest(hot_set_pages) {
-            sidecar.write_latest(page_id, &version)?;
+            if let Err(error) = sidecar.write_latest(page_id, &version) {
+                // `spill_one_cold_latest` transfers the only current version
+                // out of the hot index. Restore it if cache publication (or a
+                // required post-reset clear) fails; the committed WAL remains
+                // authoritative and must stay reachable on this handle.
+                index.seed_latest(page_id, version);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -709,9 +995,10 @@ impl WalHandle {
         encoding: FrameEncoding,
     ) -> Result<Arc<[u8]>> {
         let logical_end = self.latest_snapshot();
-        let frame = WalFrame::decode_from_file(
+        let frame = WalFrame::decode_from_file_with_len(
             self.inner.file.as_ref(),
             wal_offset,
+            frame_len,
             self.inner.page_size,
             logical_end,
         )?
@@ -724,12 +1011,6 @@ impl WalHandle {
             return Err(DbError::corruption(format!(
                 "WAL frame at offset {wal_offset} belongs to page {}, expected {page_id}",
                 frame.page_id
-            )));
-        }
-        let expected_len = frame.encoded_len(self.inner.page_size) as u32;
-        if expected_len != frame_len {
-            return Err(DbError::corruption(format!(
-                "WAL frame length mismatch at offset {wal_offset}: index has {frame_len}, decoded {expected_len}"
             )));
         }
         if frame.frame_type != encoding.frame_type() {
@@ -814,12 +1095,37 @@ impl WalHandle {
             .store(pending, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(crate) fn checkpoint_tail_state_for_tests(&self) -> (u64, bool, bool, bool) {
+        (
+            self.latest_snapshot(),
+            self.inner.process_coordinator.is_some(),
+            self.inner
+                .checkpoint_tail_sync_needed
+                .load(Ordering::Acquire),
+            self.inner
+                .checkpoint_tail_locally_synced
+                .load(Ordering::Acquire),
+        )
+    }
+
     /// Blocks until every commit acknowledged before this call is durable on
     /// disk. For sync modes other than `AsyncCommit` this is a no-op because
     /// commits are already synchronously durable.
     pub(crate) fn flush_to_durable(&self) -> Result<()> {
         match self.inner.async_commit.as_ref() {
-            Some(state) => state.flush_to_durable(),
+            Some(state) => {
+                let flushed = state.flush_to_durable()?;
+                if flushed && state.durable_lsn() >= self.latest_snapshot() {
+                    self.inner
+                        .checkpoint_tail_sync_needed
+                        .store(false, Ordering::Release);
+                    self.inner
+                        .checkpoint_tail_locally_synced
+                        .store(true, Ordering::Release);
+                }
+                Ok(())
+            }
             None => Ok(()),
         }
     }
@@ -828,14 +1134,18 @@ impl WalHandle {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
 
     use crate::config::{DbConfig, WalSyncMode};
+    use crate::error::DbError;
     use crate::storage::page;
     use crate::storage::{write_database_bootstrap_vfs, DatabaseHeader, PagerHandle};
     use crate::vfs::mem::MemVfs;
-    use crate::vfs::{FileKind, OpenMode, Vfs, VfsHandle};
+    use crate::vfs::{FileKind, OpenMode, Vfs, VfsFile, VfsHandle};
 
+    use super::format::FrameEncoding;
+    use super::index::WalVersionPayload;
     use super::WalHandle;
 
     fn test_pager(vfs: &VfsHandle, path: &Path) -> PagerHandle {
@@ -858,8 +1168,155 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SidecarClearFailureVfs {
+        inner: MemVfs,
+        fail_sidecar_clear: Arc<AtomicUsize>,
+        fail_sidecar_header_write: Arc<AtomicUsize>,
+        fail_sidecar_record_clear: Arc<AtomicUsize>,
+    }
+
+    impl Vfs for SidecarClearFailureVfs {
+        fn open(
+            &self,
+            path: &Path,
+            mode: OpenMode,
+            kind: FileKind,
+        ) -> crate::Result<Arc<dyn VfsFile>> {
+            let inner = self.inner.open(path, mode, kind)?;
+            let is_sidecar = path
+                .extension()
+                .is_some_and(|extension| extension == "wal-idx");
+            Ok(Arc::new(SidecarClearFailureFile {
+                inner,
+                fail_sidecar_clear: Arc::clone(&self.fail_sidecar_clear),
+                fail_sidecar_header_write: Arc::clone(&self.fail_sidecar_header_write),
+                fail_sidecar_record_clear: Arc::clone(&self.fail_sidecar_record_clear),
+                is_sidecar,
+            }))
+        }
+
+        fn file_exists(&self, path: &Path) -> crate::Result<bool> {
+            self.inner.file_exists(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> crate::Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn canonicalize_path(&self, path: &Path) -> crate::Result<std::path::PathBuf> {
+            self.inner.canonicalize_path(path)
+        }
+
+        fn is_memory(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct SidecarClearFailureFile {
+        inner: Arc<dyn VfsFile>,
+        fail_sidecar_clear: Arc<AtomicUsize>,
+        fail_sidecar_header_write: Arc<AtomicUsize>,
+        fail_sidecar_record_clear: Arc<AtomicUsize>,
+        is_sidecar: bool,
+    }
+
+    impl VfsFile for SidecarClearFailureFile {
+        fn kind(&self) -> FileKind {
+            self.inner.kind()
+        }
+
+        fn path(&self) -> &Path {
+            self.inner.path()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> crate::Result<usize> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_at(&self, offset: u64, buf: &[u8]) -> crate::Result<usize> {
+            if self.is_sidecar
+                && offset >= super::index_sidecar::WAL_INDEX_SIDECAR_HEADER_LEN
+                && buf == [0]
+                && consume_atomic_failure(&self.fail_sidecar_record_clear)
+            {
+                let written = self.inner.write_at(offset, buf)?;
+                if written != buf.len() {
+                    return Err(DbError::internal(
+                        "sidecar record-clear fault setup produced a short write",
+                    ));
+                }
+                return Err(DbError::io(
+                    "fault injected after wal-index-sidecar record clear",
+                    std::io::Error::other("fault injected sidecar record-clear error"),
+                ));
+            }
+            if self.is_sidecar
+                && offset == 0
+                && buf.len() == super::index_sidecar::WAL_INDEX_SIDECAR_HEADER_LEN as usize
+                && consume_atomic_failure(&self.fail_sidecar_header_write)
+            {
+                let partial_len = buf.len() / 2;
+                let written = self.inner.write_at(offset, &buf[..partial_len])?;
+                if written != partial_len {
+                    return Err(DbError::internal(
+                        "sidecar header fault setup produced a short partial write",
+                    ));
+                }
+                return Err(DbError::io(
+                    "fault injected during wal-index-sidecar header rewrite",
+                    std::io::Error::other("fault injected sidecar header write error"),
+                ));
+            }
+            self.inner.write_at(offset, buf)
+        }
+
+        fn advise_sequential(&self) -> crate::Result<()> {
+            self.inner.advise_sequential()
+        }
+
+        fn sync_data(&self) -> crate::Result<()> {
+            self.inner.sync_data()
+        }
+
+        fn sync_metadata(&self) -> crate::Result<()> {
+            self.inner.sync_metadata()
+        }
+
+        fn file_size(&self) -> crate::Result<u64> {
+            self.inner.file_size()
+        }
+
+        fn set_len(&self, len: u64) -> crate::Result<()> {
+            if self.is_sidecar
+                && len == super::index_sidecar::WAL_INDEX_SIDECAR_HEADER_LEN
+                && consume_atomic_failure(&self.fail_sidecar_clear)
+            {
+                // The replacement header was already written. Failing the
+                // shrink now leaves a deterministic partial clear: valid old
+                // record bytes remain physically beyond the new header.
+                return Err(DbError::io(
+                    "fault injected after wal-index-sidecar header rewrite",
+                    std::io::Error::other("fault injected sidecar truncate error"),
+                ));
+            }
+            self.inner.set_len(len)
+        }
+    }
+
+    fn consume_atomic_failure(counter: &AtomicUsize) -> bool {
+        counter
+            .fetch_update(
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+    }
+
     #[test]
-    fn read_page_at_snapshot_shares_backing_allocation() {
+    fn resident_delta_reads_share_backing_allocation() {
         let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
         let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
         let db_path = Path::new(":memory:");
@@ -867,10 +1324,20 @@ mod tests {
         let cfg = test_config();
         let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
         let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
-        let payload = vec![0x5A; page::DEFAULT_PAGE_SIZE as usize];
+        let base = vec![0x5A; page::DEFAULT_PAGE_SIZE as usize];
+        pager
+            .write_page_direct(page_id, &base)
+            .expect("seed delta base");
+        let mut payload = base;
+        payload[64..68].copy_from_slice(b"arc!");
         let snapshot_lsn = wal
             .commit_pages(&pager, vec![(page_id, payload)], page_id)
             .expect("commit page");
+        assert_eq!(
+            wal.version_counts_by_payload().expect("payload counts"),
+            (1, 0),
+            "delta materializations stay resident"
+        );
 
         let first = wal
             .read_page_at_snapshot(&pager, page_id, snapshot_lsn)
@@ -887,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn read_page_at_snapshot_materializes_demoted_delta_versions() {
+    fn active_old_reader_keeps_history_while_new_full_page_stays_resident() {
         let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
         let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
         let db_path = Path::new(":memory:");
@@ -916,8 +1383,18 @@ mod tests {
         assert_eq!(
             wal.version_counts_by_payload().expect("payload counts"),
             (1, 1),
-            "reader-visible delta bases stay resident until snapshots drain"
+            "old on-disk history and the active-reader full image must coexist"
         );
+        let old_during_reader = wal
+            .read_page_at_snapshot(&pager, page_id, reader.snapshot_lsn())
+            .expect("read active old snapshot")
+            .expect("old page visible to reader");
+        let new_during_reader = wal
+            .read_page_at_snapshot(&pager, page_id, second_snapshot)
+            .expect("read latest during old reader")
+            .expect("new page visible at latest snapshot");
+        assert_eq!(old_during_reader.as_ref(), first_payload.as_slice());
+        assert_eq!(new_during_reader.as_ref(), second_payload.as_slice());
         drop(reader);
 
         let other_page_id = page_id + 1;
@@ -1049,7 +1526,7 @@ mod tests {
         assert_eq!(wal.version_count().expect("version count"), 2);
         assert_eq!(
             wal.version_counts_by_payload().expect("payload counts"),
-            (1, 1)
+            (0, 2)
         );
 
         let spilled = wal
@@ -1095,7 +1572,7 @@ mod tests {
         assert_eq!(wal.version_count().expect("version count"), 2);
         assert_eq!(
             wal.version_counts_by_payload().expect("payload counts"),
-            (1, 1)
+            (0, 2)
         );
 
         let spilled = wal
@@ -1144,6 +1621,290 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_partial_sidecar_clear_failure_invalidates_stale_generation() {
+        let fail_sidecar_clear = Arc::new(AtomicUsize::new(0));
+        let fail_sidecar_header_write = Arc::new(AtomicUsize::new(0));
+        let fail_sidecar_record_clear = Arc::new(AtomicUsize::new(0));
+        let vfs = VfsHandle::from_vfs(Arc::new(SidecarClearFailureVfs {
+            inner: MemVfs::default(),
+            fail_sidecar_clear: Arc::clone(&fail_sidecar_clear),
+            fail_sidecar_header_write: Arc::clone(&fail_sidecar_header_write),
+            fail_sidecar_record_clear: Arc::clone(&fail_sidecar_record_clear),
+        }));
+        let db_path = Path::new("spill-checkpoint-clear-failure.ddb");
+        let pager = test_pager(&vfs, db_path);
+        let mut cfg = test_config();
+        cfg.wal_index_hot_set_pages = 1;
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
+
+        let page_one = page::CATALOG_ROOT_PAGE_ID + 1;
+        let page_two = page_one + 1;
+        let payload_one = vec![0x57; page::DEFAULT_PAGE_SIZE as usize];
+        let payload_two = vec![0x68; page::DEFAULT_PAGE_SIZE as usize];
+        wal.commit_pages(&pager, vec![(page_one, payload_one.clone())], page_two)
+            .expect("commit page one");
+        wal.commit_pages(&pager, vec![(page_two, payload_two.clone())], page_two)
+            .expect("commit page two");
+
+        assert_eq!(wal.version_count().expect("version count"), 2);
+        fail_sidecar_clear.store(1, AtomicOrdering::Release);
+        let error = wal
+            .checkpoint(&pager, 0)
+            .expect_err("sidecar clear failure should be reported after local cleanup");
+        assert!(matches!(error, DbError::Io { .. }));
+        assert_eq!(
+            wal.latest_snapshot(),
+            0,
+            "logical WAL reset should be visible after truncate header write"
+        );
+        let local_index_versions = wal.inner.index.lock().expect("wal index").version_count();
+        assert_eq!(
+            local_index_versions, 0,
+            "local in-memory index must be cleared even when sidecar cleanup fails"
+        );
+        assert_eq!(
+            wal.version_count().expect("combined version count"),
+            0,
+            "partially cleared sidecar records must be invalid immediately"
+        );
+        assert_eq!(
+            pager.read_page(page_one).expect("read page one").as_ref(),
+            payload_one.as_slice()
+        );
+        assert_eq!(
+            pager.read_page(page_two).expect("read page two").as_ref(),
+            payload_two.as_slice()
+        );
+
+        // The failed clear was one-shot. Reuse the low WAL offsets with a
+        // different page first: the stale page-one sidecar record previously
+        // pointed into this new frame and could be promoted as an unrelated
+        // OnDisk version.
+        let new_payload_two = vec![0x79; page::DEFAULT_PAGE_SIZE as usize];
+        let low_offset_snapshot = wal
+            .commit_pages(&pager, vec![(page_two, new_payload_two.clone())], page_two)
+            .expect("commit at reused low WAL offset");
+        assert!(
+            wal.read_page_at_snapshot(&pager, page_one, low_offset_snapshot)
+                .expect("stale sidecar lookup must be ignored")
+                .is_none(),
+            "page one should fall back to its checkpointed database image"
+        );
+        assert_eq!(
+            pager
+                .read_page(page_one)
+                .expect("checkpointed page one")
+                .as_ref(),
+            payload_one.as_slice()
+        );
+        assert_eq!(
+            wal.read_page_at_snapshot(&pager, page_two, low_offset_snapshot)
+                .expect("read new page two")
+                .expect("page two in WAL")
+                .as_ref(),
+            new_payload_two.as_slice()
+        );
+
+        // Repeatedly fail the first post-reset spill's required clear. Each WAL
+        // commit is already logically published when cache spill runs, so the
+        // popped version must be restored to the hot index and the committed
+        // API result must remain successful despite the cache-maintenance
+        // error.
+        fail_sidecar_clear.store(2, AtomicOrdering::Release);
+        let page_three = page_two + 1;
+        let payload_three = vec![0x8A; page::DEFAULT_PAGE_SIZE as usize];
+        let after_first_spill_failure = wal
+            .commit_pages(
+                &pager,
+                vec![(page_three, payload_three.clone())],
+                page_three,
+            )
+            .expect("committed page three despite first sidecar rebuild failure");
+        assert_eq!(after_first_spill_failure, wal.latest_snapshot());
+        assert_eq!(wal.version_count().expect("restored versions"), 2);
+        for (page_id, expected) in [(page_two, &new_payload_two), (page_three, &payload_three)] {
+            assert_eq!(
+                wal.read_page_at_snapshot(&pager, page_id, after_first_spill_failure)
+                    .expect("read after first spill failure")
+                    .expect("published version restored to index")
+                    .as_ref(),
+                expected.as_slice()
+            );
+        }
+
+        let new_payload_one = vec![0x9B; page::DEFAULT_PAGE_SIZE as usize];
+        let after_second_spill_failure = wal
+            .commit_pages(
+                &pager,
+                vec![(page_one, new_payload_one.clone())],
+                page_three,
+            )
+            .expect("committed page one despite second sidecar rebuild failure");
+        assert_eq!(after_second_spill_failure, wal.latest_snapshot());
+        assert_eq!(wal.version_count().expect("restored versions"), 3);
+        assert_eq!(
+            wal.read_page_at_snapshot(&pager, page_one, after_second_spill_failure)
+                .expect("read new page one")
+                .expect("new page one in WAL")
+                .as_ref(),
+            new_payload_one.as_slice()
+        );
+
+        // Once physical cleanup succeeds, exceeding hotset=1 rebuilds a fresh
+        // sidecar and publishes only current-generation records.
+        let page_four = page_three + 1;
+        let payload_four = vec![0xAC; page::DEFAULT_PAGE_SIZE as usize];
+        let final_snapshot = wal
+            .commit_pages(&pager, vec![(page_four, payload_four.clone())], page_four)
+            .expect("commit page four and rebuild fresh sidecar generation");
+        assert!(wal.version_count().expect("current versions") >= 4);
+        assert!(final_snapshot > after_second_spill_failure);
+
+        // Reopen with a non-empty post-reset WAL. Open clears the cache before
+        // recovery. A partial header-write failure must fail closed; retrying
+        // the open clears successfully and rebuilds only current-generation
+        // records.
+        drop(wal);
+        fail_sidecar_header_write.store(1, AtomicOrdering::Release);
+        let reopen_error = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None)
+            .expect_err("partial sidecar header clear must fail open closed");
+        assert!(matches!(reopen_error, DbError::Io { .. }));
+        let reopened = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None)
+            .expect("reopen and recover post-reset WAL");
+        let reopened_snapshot = reopened.latest_snapshot();
+        for (page_id, expected) in [
+            (page_one, &new_payload_one),
+            (page_two, &new_payload_two),
+            (page_three, &payload_three),
+            (page_four, &payload_four),
+        ] {
+            assert_eq!(
+                reopened
+                    .read_page_at_snapshot(&pager, page_id, reopened_snapshot)
+                    .expect("read recovered page")
+                    .expect("recovered page in WAL")
+                    .as_ref(),
+                expected.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_promotion_clear_failure_precedes_wal_publication() {
+        let fail_sidecar_clear = Arc::new(AtomicUsize::new(0));
+        let fail_sidecar_header_write = Arc::new(AtomicUsize::new(0));
+        let fail_sidecar_record_clear = Arc::new(AtomicUsize::new(0));
+        let vfs = VfsHandle::from_vfs(Arc::new(SidecarClearFailureVfs {
+            inner: MemVfs::default(),
+            fail_sidecar_clear,
+            fail_sidecar_header_write,
+            fail_sidecar_record_clear: Arc::clone(&fail_sidecar_record_clear),
+        }));
+        let db_path = Path::new("spill-promotion-clear-failure.ddb");
+        let pager = test_pager(&vfs, db_path);
+        let mut cfg = test_config();
+        cfg.wal_index_hot_set_pages = 1;
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
+
+        let page_one = page::CATALOG_ROOT_PAGE_ID + 1;
+        let page_two = page_one + 1;
+        let old_payload = vec![0x31; page::DEFAULT_PAGE_SIZE as usize];
+        let other_payload = vec![0x42; page::DEFAULT_PAGE_SIZE as usize];
+        wal.commit_pages(&pager, vec![(page_one, old_payload.clone())], page_two)
+            .expect("commit page one");
+        let old_snapshot = wal
+            .commit_pages(&pager, vec![(page_two, other_payload)], page_two)
+            .expect("commit page two and spill page one");
+        assert!(
+            !wal.inner
+                .index
+                .lock()
+                .expect("wal index")
+                .contains_page(page_one),
+            "page one must be sidecar-resident before promotion fault"
+        );
+
+        // Promotion reads the old record and then clears its publication byte.
+        // Even when that one-byte write takes effect and reports an error, the
+        // old version is restored in memory and the final WAL group/header has
+        // not yet been written.
+        fail_sidecar_record_clear.store(1, AtomicOrdering::Release);
+        let new_payload = vec![0x53; page::DEFAULT_PAGE_SIZE as usize];
+        let error = wal
+            .commit_pages(&pager, vec![(page_one, new_payload.clone())], page_two)
+            .expect_err("promotion clear failure must reject before WAL publication");
+        assert!(matches!(error, DbError::Io { .. }));
+        assert_eq!(wal.latest_snapshot(), old_snapshot);
+        assert_eq!(
+            wal.read_page_at_snapshot(&pager, page_one, old_snapshot)
+                .expect("read old page after failed promotion")
+                .expect("old page remains indexed")
+                .as_ref(),
+            old_payload.as_slice()
+        );
+
+        let retry_snapshot = wal
+            .commit_pages(&pager, vec![(page_one, new_payload.clone())], page_two)
+            .expect("retry after sidecar record-clear failure");
+        assert!(retry_snapshot > old_snapshot);
+        assert_eq!(
+            wal.read_page_at_snapshot(&pager, page_one, retry_snapshot)
+                .expect("read retried page")
+                .expect("retried page is visible")
+                .as_ref(),
+            new_payload.as_slice()
+        );
+    }
+
+    #[test]
+    fn async_rebase_failure_precedes_logical_wal_reset() {
+        struct ResetRebaseFailure;
+        impl Drop for ResetRebaseFailure {
+            fn drop(&mut self) {
+                super::async_commit::force_rebase_error_for_current_thread(false);
+            }
+        }
+
+        let vfs = VfsHandle::from_vfs(Arc::new(MemVfs::default()));
+        let db_path = Path::new("async-rebase-before-logical-reset.ddb");
+        let pager = test_pager(&vfs, db_path);
+        let mut cfg = test_config();
+        cfg.wal_sync_mode = WalSyncMode::AsyncCommit {
+            interval_ms: 60_000,
+        };
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire WAL");
+        let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
+        let payload = vec![0xD4; page::DEFAULT_PAGE_SIZE as usize];
+        let old_end = wal
+            .commit_pages(&pager, vec![(page_id, payload.clone())], page_id)
+            .expect("async commit");
+
+        super::async_commit::force_rebase_error_for_current_thread(true);
+        let _reset = ResetRebaseFailure;
+        let error = wal
+            .checkpoint(&pager, 0)
+            .expect_err("injected async rebase failure must abort checkpoint");
+        assert!(matches!(error, DbError::Internal { .. }));
+        assert_eq!(
+            wal.latest_snapshot(),
+            old_end,
+            "fallible async rebase must occur before logical zero publication"
+        );
+        assert_eq!(
+            wal.read_page_at_snapshot(&pager, page_id, old_end)
+                .expect("read retained WAL version")
+                .expect("page remains indexed")
+                .as_ref(),
+            payload.as_slice()
+        );
+
+        super::async_commit::force_rebase_error_for_current_thread(false);
+        wal.checkpoint(&pager, 0)
+            .expect("checkpoint retry after rebase failure");
+        assert_eq!(wal.latest_snapshot(), 0);
+    }
+
+    #[test]
     fn checkpoint_copies_back_spilled_delta_versions_and_clears_sidecar() {
         let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
         let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
@@ -1178,6 +1939,98 @@ mod tests {
         assert_eq!(
             pager.read_page(page_two).expect("read page two").as_ref(),
             payload_two.as_slice()
+        );
+    }
+
+    #[test]
+    fn explicit_demotion_keeps_chained_delta_resident_through_checkpoint_and_reopen() {
+        let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
+        let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
+        let db_path = Path::new("explicit-demote-chained-delta.ddb");
+        let pager = test_pager(&vfs, db_path);
+        let cfg = test_config();
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
+        let delta_page_id = page::CATALOG_ROOT_PAGE_ID + 300;
+        let resident_full_page_id = delta_page_id - 1;
+        let base = vec![0x21; page::DEFAULT_PAGE_SIZE as usize];
+        pager
+            .write_page_direct(delta_page_id, &base)
+            .expect("seed main-database delta base");
+
+        let mut first = base;
+        first[17] = 0x31;
+        wal.commit_pages(&pager, vec![(delta_page_id, first.clone())], delta_page_id)
+            .expect("commit first delta");
+        let mut latest = first;
+        latest[29] = 0x42;
+        let delta_lsn = wal
+            .commit_pages(&pager, vec![(delta_page_id, latest.clone())], delta_page_id)
+            .expect("commit delta against resident WAL base");
+        {
+            let index = wal.inner.index.lock().expect("WAL index");
+            let version = index
+                .latest_visible(delta_page_id, delta_lsn)
+                .expect("latest chained delta");
+            assert!(matches!(
+                version.payload,
+                WalVersionPayload::Resident {
+                    encoding: FrameEncoding::PageDelta,
+                    ..
+                }
+            ));
+        }
+
+        // Force a second resident payload below the delta page ID so the
+        // explicit descending demotion scan crosses the protected delta and
+        // still satisfies its byte target using a self-contained full page.
+        let reader = wal.begin_reader().expect("retain full-page commit");
+        let resident_full = vec![0x53; page::DEFAULT_PAGE_SIZE as usize];
+        let latest_lsn = wal
+            .commit_pages(
+                &pager,
+                vec![(resident_full_page_id, resident_full.clone())],
+                delta_page_id,
+            )
+            .expect("commit active-reader full page");
+        drop(reader);
+        assert_eq!(
+            wal.demote_resident_versions_if_reader_free(1)
+                .expect("explicit demotion"),
+            1,
+            "the full page should satisfy the target while the delta stays resident"
+        );
+        assert_eq!(
+            wal.version_counts_by_payload().expect("payload counts"),
+            (1, 1)
+        );
+        assert_eq!(
+            wal.read_page_at_snapshot(&pager, delta_page_id, latest_lsn)
+                .expect("read chained delta after demotion")
+                .expect("delta page remains visible")
+                .as_ref(),
+            latest.as_slice()
+        );
+
+        wal.checkpoint(&pager, 0)
+            .expect("checkpoint protected chained delta");
+        assert_eq!(
+            pager
+                .read_page(delta_page_id)
+                .expect("read checkpointed delta")
+                .as_ref(),
+            latest.as_slice()
+        );
+        drop(wal);
+
+        let reopened =
+            WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("reopen checkpointed WAL");
+        assert_eq!(reopened.version_count().expect("reopened versions"), 0);
+        assert_eq!(
+            pager
+                .read_page(delta_page_id)
+                .expect("read reopened checkpointed delta")
+                .as_ref(),
+            latest.as_slice()
         );
     }
 }

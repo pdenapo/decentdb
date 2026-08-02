@@ -5,6 +5,8 @@
 
 use std::cmp::Ordering;
 
+use smallvec::SmallVec;
+
 use crate::error::{DbError, Result};
 use crate::record::value::{
     compare_cidr, compare_decimal, compare_interval, compare_ip_addr, compare_mac_addr,
@@ -29,49 +31,80 @@ const TAG_TIMESTAMP_TZ: u8 = 14;
 const TAG_INTERVAL: u8 = 15;
 const TAG_MACADDR: u8 = 16;
 
+/// Owned comparable key used only by in-memory runtime indexes.
+///
+/// The common single-column text keys fit in the inline buffer, avoiding one
+/// allocation per runtime B-tree entry. Longer keys spill to the heap while
+/// retaining the exact byte ordering of the persistent encoding.
+///
+/// The inline capacity is pointer-width specific so the owner never exceeds
+/// the three-word footprint of the `Vec<u8>` it replaces. Sixteen bytes fit in
+/// union-layout `SmallVec` on 64-bit targets; eight bytes is the corresponding
+/// capacity on supported 32-bit targets such as `wasm32-unknown-unknown`.
+#[cfg(target_pointer_width = "64")]
+pub(crate) type RuntimeEncodedKey = SmallVec<[u8; 16]>;
+#[cfg(target_pointer_width = "32")]
+pub(crate) type RuntimeEncodedKey = SmallVec<[u8; 8]>;
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const RUNTIME_ENCODED_KEY_INLINE_BYTES: usize = 16;
+#[cfg(all(test, target_pointer_width = "32"))]
+const RUNTIME_ENCODED_KEY_INLINE_BYTES: usize = 8;
+
+// This is a production invariant, not only a native unit-test expectation.
+// In particular, it fails compilation if a dependency/layout change grows
+// runtime B-tree nodes on wasm32.
+const _: () = assert!(std::mem::size_of::<RuntimeEncodedKey>() == std::mem::size_of::<Vec<u8>>());
+
 pub(crate) fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
+    encode_runtime_index_key(value).map(|key| key.into_vec())
+}
+
+/// Encodes a value using the canonical comparable-key representation while
+/// keeping short keys inline for runtime indexes.
+pub(crate) fn encode_runtime_index_key(value: &Value) -> Result<RuntimeEncodedKey> {
     match value {
-        Value::Null => Ok(vec![TAG_NULL]),
-        Value::Bool(value) => Ok(vec![TAG_BOOL, u8::from(*value)]),
+        Value::Null => Ok(SmallVec::from_slice(&[TAG_NULL])),
+        Value::Bool(value) => Ok(SmallVec::from_slice(&[TAG_BOOL, u8::from(*value)])),
         Value::Int64(value) => {
-            let mut encoded = Vec::with_capacity(9);
+            let mut encoded = RuntimeEncodedKey::with_capacity(9);
             encoded.push(TAG_INT64);
             encoded.extend_from_slice(&sortable_signed_bytes(*value));
             Ok(encoded)
         }
         Value::Float64(value) => {
-            let mut encoded = Vec::with_capacity(9);
+            let mut encoded = RuntimeEncodedKey::with_capacity(9);
             encoded.push(TAG_FLOAT64);
             encoded.extend_from_slice(&sortable_float_bytes(*value));
             Ok(encoded)
         }
         Value::Decimal { scaled, scale } => {
             let decimal = sortable_decimal_bytes(*scaled, *scale);
-            let mut encoded = Vec::with_capacity(1 + decimal.len());
+            let mut encoded = RuntimeEncodedKey::with_capacity(1 + decimal.len());
             encoded.push(TAG_DECIMAL);
             encoded.extend_from_slice(&decimal);
             Ok(encoded)
         }
         Value::TimestampMicros(value) => {
-            let mut encoded = Vec::with_capacity(9);
+            let mut encoded = RuntimeEncodedKey::with_capacity(9);
             encoded.push(TAG_TIMESTAMP);
             encoded.extend_from_slice(&sortable_signed_bytes(*value));
             Ok(encoded)
         }
         Value::Uuid(value) => {
-            let mut encoded = Vec::with_capacity(17);
+            let mut encoded = RuntimeEncodedKey::with_capacity(17);
             encoded.push(TAG_UUID);
             encoded.extend_from_slice(value);
             Ok(encoded)
         }
         Value::Text(value) => {
-            let mut encoded = Vec::with_capacity(1 + value.len());
+            let mut encoded = RuntimeEncodedKey::with_capacity(1 + value.len());
             encoded.push(TAG_TEXT);
             encoded.extend_from_slice(value.as_bytes());
             Ok(encoded)
         }
         Value::Blob(value) => {
-            let mut encoded = Vec::with_capacity(1 + value.len());
+            let mut encoded = RuntimeEncodedKey::with_capacity(1 + value.len());
             encoded.push(TAG_BLOB);
             encoded.extend_from_slice(value);
             Ok(encoded)
@@ -80,14 +113,14 @@ pub(crate) fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
             enum_type_id,
             label_id,
         } => {
-            let mut encoded = Vec::with_capacity(17);
+            let mut encoded = RuntimeEncodedKey::with_capacity(17);
             encoded.push(TAG_ENUM);
             encoded.extend_from_slice(&sortable_unsigned_bytes(*enum_type_id));
             encoded.extend_from_slice(&sortable_unsigned_bytes(*label_id));
             Ok(encoded)
         }
         Value::IpAddr { family, addr } => {
-            let mut encoded = Vec::with_capacity(18);
+            let mut encoded = RuntimeEncodedKey::with_capacity(18);
             encoded.push(TAG_IPADDR);
             encoded.extend_from_slice(&ip_addr_sortable_bytes(*family, addr)?);
             encoded.push(*family);
@@ -98,7 +131,7 @@ pub(crate) fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
             prefix_len,
             network,
         } => {
-            let mut encoded = Vec::with_capacity(20);
+            let mut encoded = RuntimeEncodedKey::with_capacity(20);
             encoded.push(TAG_CIDR);
             encoded.push(*family);
             encoded.push(*prefix_len);
@@ -112,26 +145,26 @@ pub(crate) fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
         Value::MacAddr { len, bytes } => {
             compare_mac_addr(*len, bytes, *len, bytes)?;
             let len = usize::from(*len);
-            let mut encoded = Vec::with_capacity(2 + len);
+            let mut encoded = RuntimeEncodedKey::with_capacity(2 + len);
             encoded.push(TAG_MACADDR);
             encoded.extend_from_slice(&bytes[..len]);
             encoded.push(u8::try_from(len).expect("MACADDR length fits u8"));
             Ok(encoded)
         }
         Value::DateDays(value) => {
-            let mut encoded = Vec::with_capacity(5);
+            let mut encoded = RuntimeEncodedKey::with_capacity(5);
             encoded.push(TAG_DATE);
             encoded.extend_from_slice(&sortable_i32_bytes(*value));
             Ok(encoded)
         }
         Value::TimeMicros(value) => {
-            let mut encoded = Vec::with_capacity(9);
+            let mut encoded = RuntimeEncodedKey::with_capacity(9);
             encoded.push(TAG_TIME);
             encoded.extend_from_slice(&sortable_signed_bytes(*value));
             Ok(encoded)
         }
         Value::TimestampTzMicros(value) => {
-            let mut encoded = Vec::with_capacity(9);
+            let mut encoded = RuntimeEncodedKey::with_capacity(9);
             encoded.push(TAG_TIMESTAMP_TZ);
             encoded.extend_from_slice(&sortable_signed_bytes(*value));
             Ok(encoded)
@@ -141,7 +174,7 @@ pub(crate) fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
             days,
             micros,
         } => {
-            let mut encoded = Vec::with_capacity(17);
+            let mut encoded = RuntimeEncodedKey::with_capacity(17);
             encoded.push(TAG_INTERVAL);
             encoded.extend_from_slice(&sortable_i32_bytes(*months));
             encoded.extend_from_slice(&sortable_i32_bytes(*days));
@@ -326,9 +359,16 @@ fn sortable_decimal_bytes(scaled: i64, scale: u8) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::mem::size_of;
+    use std::ops::Bound;
+
     use crate::record::value::Value;
 
-    use super::{compare_index_values, encode_index_key};
+    use super::{
+        compare_index_values, encode_index_key, encode_runtime_index_key, RuntimeEncodedKey,
+        RUNTIME_ENCODED_KEY_INLINE_BYTES,
+    };
 
     fn assert_order(values: &[Value]) {
         let mut encoded = values
@@ -510,5 +550,244 @@ mod tests {
         let right = encode_index_key(&Value::Blob(vec![0x10, 0x21])).expect("encode");
         assert_ne!(left, right);
         assert!(left < right);
+    }
+
+    #[test]
+    fn runtime_and_canonical_encoders_match_frozen_golden_bytes() {
+        // These vectors are deliberately independent of both encoder paths.
+        // Changing a tag, byte order, normalization rule, or field layout must
+        // therefore be an explicit compatibility decision.
+        let cases = vec![
+            (Value::Null, vec![0x00]),
+            (Value::Bool(true), vec![0x01, 0x01]),
+            (
+                Value::Int64(-123),
+                vec![0x02, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x85],
+            ),
+            (
+                Value::Float64(-12.5),
+                vec![0x03, 0x3F, 0xD6, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            ),
+            (
+                Value::Decimal {
+                    scaled: -123_450,
+                    scale: 3,
+                },
+                vec![0x04, 0x00, 0xFB, 0xFC, 0xCE, 0xCD, 0xCC, 0xCB, 0xCA],
+            ),
+            (
+                Value::TimestampMicros(-456),
+                vec![0x05, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0x38],
+            ),
+            {
+                let mut expected = vec![0x06];
+                expected.extend_from_slice(&[0xAB; 16]);
+                (Value::Uuid([0xAB; 16]), expected)
+            },
+            (
+                Value::Text("Artist 250000".into()),
+                b"\x07Artist 250000".to_vec(),
+            ),
+            (
+                Value::Blob(vec![0, 1, 2, 3]),
+                vec![0x08, 0x00, 0x01, 0x02, 0x03],
+            ),
+            (
+                Value::Enum {
+                    enum_type_id: 9,
+                    label_id: 4,
+                },
+                vec![0x09, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 4],
+            ),
+            (
+                Value::IpAddr {
+                    family: 4,
+                    addr: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                },
+                vec![
+                    0x0A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 127, 0, 0, 1, 4,
+                ],
+            ),
+            (
+                Value::IpAddr {
+                    family: 6,
+                    addr: [0x20, 1, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                },
+                vec![
+                    0x0A, 0x20, 1, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 6,
+                ],
+            ),
+            (
+                Value::Cidr {
+                    family: 4,
+                    prefix_len: 24,
+                    network: [10, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                },
+                vec![0x0B, 4, 24, 10, 1, 2, 0],
+            ),
+            (
+                Value::Cidr {
+                    family: 6,
+                    prefix_len: 64,
+                    network: [0x20, 1, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                },
+                vec![
+                    0x0B, 6, 64, 0x20, 1, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+            (
+                Value::MacAddr {
+                    len: 6,
+                    bytes: [0, 1, 2, 3, 4, 5, 0, 0],
+                },
+                vec![0x10, 0, 1, 2, 3, 4, 5, 6],
+            ),
+            (Value::DateDays(-10), vec![0x0C, 0x7F, 0xFF, 0xFF, 0xF6]),
+            (
+                Value::TimeMicros(123_456),
+                vec![0x0D, 0x80, 0, 0, 0, 0, 1, 0xE2, 0x40],
+            ),
+            (
+                Value::TimestampTzMicros(-789),
+                vec![0x0E, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC, 0xEB],
+            ),
+            (
+                Value::Interval {
+                    months: -2,
+                    days: 3,
+                    micros: 4,
+                },
+                vec![
+                    0x0F, 0x7F, 0xFF, 0xFF, 0xFE, 0x80, 0, 0, 3, 0x80, 0, 0, 0, 0, 0, 0, 4,
+                ],
+            ),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(
+                encode_index_key(&value).expect("canonical encoding"),
+                expected,
+                "canonical value: {value:?}"
+            );
+            assert_eq!(
+                encode_runtime_index_key(&value)
+                    .expect("runtime encoding")
+                    .as_slice(),
+                expected.as_slice(),
+                "runtime value: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_encoding_preserves_spatial_errors() {
+        let geometry = Value::Geometry(vec![1, 2, 3]);
+        let geography = Value::Geography(vec![4, 5, 6]);
+        for value in [geometry, geography] {
+            let expected = "constraint violation: spatial values cannot be encoded as generic BTREE index keys";
+            assert_eq!(
+                encode_index_key(&value)
+                    .expect_err("spatial key must fail")
+                    .to_string(),
+                expected
+            );
+            assert_eq!(
+                encode_runtime_index_key(&value)
+                    .expect_err("spatial runtime key must fail")
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_shaped_runtime_text_keys_stay_inline_and_long_keys_spill() {
+        let inline_text = "a".repeat(RUNTIME_ENCODED_KEY_INLINE_BYTES - 1);
+        let key = encode_runtime_index_key(&Value::Text(inline_text)).expect("encode inline key");
+        assert!(!key.spilled());
+
+        let spilled_text = "a".repeat(RUNTIME_ENCODED_KEY_INLINE_BYTES);
+        let key = encode_runtime_index_key(&Value::Text(spilled_text)).expect("encode spilled key");
+        assert!(key.spilled());
+
+        #[cfg(target_pointer_width = "64")]
+        for text in ["Artist 250000", "Album 2500000"] {
+            let key = encode_runtime_index_key(&Value::Text(text.into())).expect("encode");
+            assert_eq!(key.len(), text.len() + 1);
+            assert!(!key.spilled(), "benchmark key unexpectedly spilled: {text}");
+        }
+    }
+
+    #[test]
+    fn runtime_key_has_vec_sized_inline_storage_and_borrowed_map_lookup() {
+        assert_eq!(size_of::<RuntimeEncodedKey>(), size_of::<Vec<u8>>());
+
+        let short = encode_runtime_index_key(&Value::Text("alpha".into())).expect("short key");
+        let long =
+            encode_runtime_index_key(&Value::Text("a long key beyond inline capacity".into()))
+                .expect("long key");
+        let short_bytes = short.as_slice().to_vec();
+        let long_bytes = long.as_slice().to_vec();
+        let mut map = BTreeMap::new();
+        map.insert(short, 1);
+        map.insert(long, 2);
+
+        assert_eq!(map.get(short_bytes.as_slice()), Some(&1));
+        assert_eq!(map.get(long_bytes.as_slice()), Some(&2));
+        assert_eq!(map.remove(short_bytes.as_slice()), Some(1));
+        assert_eq!(map.remove(long_bytes.as_slice()), Some(2));
+    }
+
+    #[test]
+    fn runtime_key_borrowed_range_crosses_inline_and_spilled_entries() {
+        let values = ["a", "inline", "a key that spills", "zzzzzzzzzzzzzzzzzzzz"];
+        let mut map = BTreeMap::new();
+        for (row_id, value) in values.into_iter().enumerate() {
+            map.insert(
+                encode_runtime_index_key(&Value::Text(value.into())).expect("encode key"),
+                row_id,
+            );
+        }
+        let lower = encode_index_key(&Value::Text("a".into())).expect("lower");
+        let upper = encode_index_key(&Value::Text("zzzzzzzzzzzzzzzzzzzz".into())).expect("upper");
+        let ranged = map
+            .range::<[u8], _>((
+                Bound::Included(lower.as_slice()),
+                Bound::Included(upper.as_slice()),
+            ))
+            .map(|(_, row_id)| *row_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ranged.len(), values.len());
+        assert!(map.keys().any(|key| !key.spilled()));
+        assert!(map.keys().any(|key| key.spilled()));
+    }
+
+    #[test]
+    fn runtime_key_order_matches_canonical_order_across_inline_boundary() {
+        let values = [
+            Value::Text("short".into()),
+            Value::Text("123456789012345".into()),
+            Value::Text("1234567890123456".into()),
+            Value::Text("a much longer text key".into()),
+        ];
+        let mut canonical = values
+            .iter()
+            .map(|value| encode_index_key(value).expect("canonical"))
+            .collect::<Vec<_>>();
+        let mut runtime = values
+            .iter()
+            .map(|value| encode_runtime_index_key(value).expect("runtime"))
+            .collect::<Vec<_>>();
+        canonical.sort();
+        runtime.sort();
+
+        assert_eq!(
+            runtime
+                .iter()
+                .map(RuntimeEncodedKey::as_slice)
+                .collect::<Vec<_>>(),
+            canonical.iter().map(Vec::as_slice).collect::<Vec<_>>()
+        );
     }
 }

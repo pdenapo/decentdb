@@ -55,11 +55,11 @@ use crate::error::{DbError, Result};
 use crate::json::{parse_json, parse_json_path, JsonValue};
 use crate::planner;
 use crate::record::compression::{CompressionMode, AUTO_MIN_PAYLOAD_BYTES};
-use crate::record::key::encode_index_key;
+use crate::record::key::{encode_runtime_index_key, RuntimeEncodedKey};
 use crate::record::overflow::{
     append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
-    read_overflow, read_uncompressed_overflow_tail, rewrite_overflow, rewrite_overflow_cached,
-    rewrite_overflow_cached_with_dirty_byte_ranges,
+    read_overflow, read_overflow_into, read_uncompressed_overflow_tail, rewrite_overflow,
+    rewrite_overflow_cached, rewrite_overflow_cached_with_dirty_byte_ranges,
     rewrite_overflow_cached_with_sparse_byte_patches, write_overflow, OverflowBytePatch,
     OverflowChainCache, OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
@@ -360,6 +360,59 @@ struct CachedPagedRowLocator {
     locator: RowLocatorV1,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CachedPagedChunkSource {
+    pointer: OverflowPointer,
+    checksum: u32,
+}
+
+#[derive(Debug)]
+enum DeferredPagedRowLocators {
+    Dense {
+        directory: DensePagedRowDirectory,
+        chunks: Vec<CachedPagedChunkSource>,
+    },
+    Sparse(Int64Map<CachedPagedRowLocator>),
+}
+
+impl DeferredPagedRowLocators {
+    fn get(&self, row_id: i64) -> Option<CachedPagedRowLocator> {
+        match self {
+            Self::Dense { directory, chunks } => {
+                let position = directory.position_for_row_id(row_id)?;
+                let chunk_index = directory.chunk_index_at(position)?;
+                let source = chunks.get(chunk_index)?;
+                Some(CachedPagedRowLocator {
+                    pointer: source.pointer,
+                    checksum: source.checksum,
+                    locator: *directory.locators.get(position)?,
+                })
+            }
+            Self::Sparse(locators) => locators.get(&row_id).copied(),
+        }
+    }
+
+    fn min_row_id(&self) -> Option<i64> {
+        match self {
+            Self::Dense { directory, .. } => directory.first_row_id(),
+            Self::Sparse(locators) => locators.keys().min().copied(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_dense(&self) -> bool {
+        matches!(self, Self::Dense { .. })
+    }
+
+    #[cfg(test)]
+    fn sparse_len(&self) -> usize {
+        match self {
+            Self::Dense { .. } => 0,
+            Self::Sparse(locators) => locators.len(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct CachedPagedChunkPayloadKey {
     head_page_id: PageId,
@@ -383,7 +436,7 @@ impl CachedPagedChunkPayloadKey {
 struct DeferredPagedRowLocatorCache {
     manifest_pointer: OverflowPointer,
     manifest_checksum: u32,
-    locators: Int64Map<CachedPagedRowLocator>,
+    locators: DeferredPagedRowLocators,
     verified_payloads: HashMap<CachedPagedChunkPayloadKey, Arc<Vec<u8>>>,
 }
 
@@ -408,7 +461,7 @@ impl DeferredPagedRowLocatorCache {
     }
 
     fn min_row_id(&self) -> Option<i64> {
-        self.locators.keys().min().copied()
+        self.locators.min_row_id()
     }
 }
 
@@ -642,6 +695,11 @@ impl TableData {
         Ok(self
             .row_by_id(row_id)
             .map(|row| project_simple_projection_values(&row.values, projection_indexes)))
+    }
+
+    fn full_query_row_by_id(&self, row_id: i64) -> Option<QueryRow> {
+        self.row_by_id(row_id)
+            .map(|row| QueryRow::new(row.values.clone()))
     }
 
     fn projected_query_rows_in_id_range(
@@ -917,6 +975,431 @@ struct TablePageEntry {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct DensePagedRowDirectory {
+    start_row_id: i64,
+    locators: Vec<RowLocatorV1>,
+    /// Cumulative exclusive row positions for each physical chunk.
+    chunk_ends: Vec<usize>,
+}
+
+impl DensePagedRowDirectory {
+    fn empty(chunk_count: usize) -> Result<Self> {
+        let mut chunk_ends = Vec::new();
+        try_reserve_paged_directory(&mut chunk_ends, chunk_count, "dense chunk ranges")?;
+        chunk_ends.resize(chunk_count, 0);
+        Ok(Self {
+            start_row_id: 0,
+            locators: Vec::new(),
+            chunk_ends,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.locators.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.locators.is_empty()
+    }
+
+    fn first_row_id(&self) -> Option<i64> {
+        (!self.is_empty()).then_some(self.start_row_id)
+    }
+
+    fn row_id_at(&self, position: usize) -> Option<i64> {
+        if position >= self.len() {
+            return None;
+        }
+        let position = i128::try_from(position).ok()?;
+        i64::try_from(i128::from(self.start_row_id) + position).ok()
+    }
+
+    fn position_for_row_id(&self, row_id: i64) -> Option<usize> {
+        let offset = i128::from(row_id) - i128::from(self.start_row_id);
+        if offset < 0 {
+            return None;
+        }
+        usize::try_from(offset)
+            .ok()
+            .filter(|position| *position < self.len())
+    }
+
+    fn chunk_index_at(&self, position: usize) -> Option<usize> {
+        if position >= self.len() {
+            return None;
+        }
+        let chunk_index = self.chunk_ends.partition_point(|end| *end <= position);
+        (chunk_index < self.chunk_ends.len()).then_some(chunk_index)
+    }
+
+    fn entry_at(&self, position: usize) -> Result<Option<TablePageEntry>> {
+        let Some(row_id) = self.row_id_at(position) else {
+            return Ok(None);
+        };
+        let chunk_index = self
+            .chunk_index_at(position)
+            .ok_or_else(|| DbError::corruption("dense paged row position has no owning chunk"))?;
+        let locator = *self.locators.get(position).ok_or_else(|| {
+            DbError::corruption("dense paged row locator position exceeded directory length")
+        })?;
+        Ok(Some(TablePageEntry {
+            row_id,
+            chunk_index: u32::try_from(chunk_index)
+                .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?,
+            is_overlay: false,
+            locator,
+        }))
+    }
+
+    fn try_prepare_append(
+        &mut self,
+        row_id: i64,
+        chunk_index: usize,
+        is_overlay: bool,
+    ) -> Result<Option<bool>> {
+        if is_overlay {
+            return Ok(None);
+        }
+        let next_position = self.len();
+        if !self.is_empty()
+            && self
+                .row_id_at(next_position.saturating_sub(1))
+                .and_then(|last| last.checked_add(1))
+                != Some(row_id)
+        {
+            return Ok(None);
+        }
+
+        let add_chunk = if chunk_index >= self.chunk_ends.len() {
+            if chunk_index != self.chunk_ends.len() {
+                return Ok(None);
+            }
+            u32::try_from(chunk_index)
+                .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?;
+            true
+        } else if chunk_index + 1 != self.chunk_ends.len() {
+            return Ok(None);
+        } else {
+            false
+        };
+
+        if self.locators.len() == self.locators.capacity() {
+            try_reserve_paged_directory_amortized(&mut self.locators, 1, "dense row locators")?;
+        }
+        if add_chunk {
+            try_reserve_paged_directory(&mut self.chunk_ends, 1, "dense chunk ranges")?;
+        }
+        Ok(Some(add_chunk))
+    }
+
+    #[cfg(test)]
+    fn try_append(
+        &mut self,
+        row_id: i64,
+        chunk_index: usize,
+        is_overlay: bool,
+        locator: RowLocatorV1,
+    ) -> Result<bool> {
+        let Some(add_chunk) = self.try_prepare_append(row_id, chunk_index, is_overlay)? else {
+            return Ok(false);
+        };
+        self.append_prepared(row_id, chunk_index, add_chunk, locator)?;
+        Ok(true)
+    }
+
+    fn append_prepared(
+        &mut self,
+        row_id: i64,
+        chunk_index: usize,
+        add_chunk: bool,
+        locator: RowLocatorV1,
+    ) -> Result<()> {
+        let next_position = self.len();
+        if self.is_empty() {
+            self.start_row_id = row_id;
+        }
+        if add_chunk {
+            self.chunk_ends.push(next_position);
+        }
+        self.locators.push(locator);
+        let Some(chunk_end) = self.chunk_ends.get_mut(chunk_index) else {
+            return Err(DbError::corruption(
+                "dense paged append chunk range is missing",
+            ));
+        };
+        *chunk_end = self.locators.len();
+        Ok(())
+    }
+
+    fn to_sparse(&self) -> Result<Vec<TablePageEntry>> {
+        let mut entries = Vec::new();
+        try_reserve_paged_directory(&mut entries, self.len(), "sparse paged row entries")?;
+        for position in 0..self.len() {
+            entries.push(self.entry_at(position)?.ok_or_else(|| {
+                DbError::corruption("dense paged row directory ended before its locator count")
+            })?);
+        }
+        Ok(entries)
+    }
+
+    fn approximate_heap_bytes(&self) -> usize {
+        self.locators
+            .capacity()
+            .saturating_mul(std::mem::size_of::<RowLocatorV1>())
+            .saturating_add(
+                self.chunk_ends
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TablePageDirectory {
+    Dense(DensePagedRowDirectory),
+    Sparse(Vec<TablePageEntry>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedTablePageDirectoryAppend {
+    Dense { add_chunk: bool },
+    Sparse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedTablePageAppend {
+    chunk_index: usize,
+    entry_chunk_index: u32,
+    is_overlay: bool,
+    directory: PreparedTablePageDirectoryAppend,
+}
+
+impl TablePageDirectory {
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(directory) => directory.len(),
+            Self::Sparse(entries) => entries.len(),
+        }
+    }
+
+    fn entry_at(&self, position: usize) -> Result<Option<TablePageEntry>> {
+        match self {
+            Self::Dense(directory) => directory.entry_at(position),
+            Self::Sparse(entries) => Ok(entries.get(position).copied()),
+        }
+    }
+
+    fn position_for_row_id(&self, row_id: i64) -> Option<usize> {
+        match self {
+            Self::Dense(directory) => directory.position_for_row_id(row_id),
+            Self::Sparse(entries) => entries
+                .binary_search_by_key(&row_id, |entry| entry.row_id)
+                .ok()
+                .or_else(|| entries.iter().position(|entry| entry.row_id == row_id)),
+        }
+    }
+
+    fn entry_for_row_id(&self, row_id: i64) -> Result<Option<(usize, TablePageEntry)>> {
+        let Some(position) = self.position_for_row_id(row_id) else {
+            return Ok(None);
+        };
+        self.entry_at(position)
+            .map(|entry| entry.map(|entry| (position, entry)))
+    }
+
+    fn row_ids_in_range(&self, low: i64, high: i64) -> Vec<i64> {
+        if low > high {
+            return Vec::new();
+        }
+        match self {
+            Self::Dense(directory) => {
+                let Some(first) = directory.first_row_id() else {
+                    return Vec::new();
+                };
+                let Some(last) = directory.row_id_at(directory.len().saturating_sub(1)) else {
+                    return Vec::new();
+                };
+                let start = low.max(first);
+                let end = high.min(last);
+                if start > end {
+                    return Vec::new();
+                }
+                (start..=end).collect()
+            }
+            Self::Sparse(entries) => {
+                let start = entries.partition_point(|entry| entry.row_id < low);
+                let end = start + entries[start..].partition_point(|entry| entry.row_id <= high);
+                entries[start..end]
+                    .iter()
+                    .map(|entry| entry.row_id)
+                    .collect()
+            }
+        }
+    }
+
+    fn sparse_mut(&mut self) -> Result<&mut Vec<TablePageEntry>> {
+        if let Self::Dense(directory) = self {
+            *self = Self::Sparse(directory.to_sparse()?);
+        }
+        let Self::Sparse(entries) = self else {
+            return Err(DbError::internal(
+                "paged row directory did not convert to sparse storage",
+            ));
+        };
+        Ok(entries)
+    }
+
+    fn try_prepare_append(
+        &mut self,
+        row_id: i64,
+        chunk_index: usize,
+        is_overlay: bool,
+    ) -> Result<PreparedTablePageDirectoryAppend> {
+        if let Self::Dense(directory) = self {
+            if let Some(add_chunk) =
+                directory.try_prepare_append(row_id, chunk_index, is_overlay)?
+            {
+                return Ok(PreparedTablePageDirectoryAppend::Dense { add_chunk });
+            }
+        }
+        let entries = self.sparse_mut()?;
+        if entries.len() == entries.capacity() {
+            try_reserve_paged_directory_amortized(entries, 1, "sparse paged row entries")?;
+        }
+        Ok(PreparedTablePageDirectoryAppend::Sparse)
+    }
+
+    fn iter(&self) -> TablePageEntryIter<'_> {
+        match self {
+            Self::Dense(directory) => TablePageEntryIter::Dense {
+                directory,
+                position: 0,
+            },
+            Self::Sparse(entries) => TablePageEntryIter::Sparse(entries.iter()),
+        }
+    }
+
+    fn approximate_heap_bytes(&self) -> usize {
+        match self {
+            Self::Dense(directory) => directory.approximate_heap_bytes(),
+            Self::Sparse(entries) => entries
+                .capacity()
+                .saturating_mul(std::mem::size_of::<TablePageEntry>()),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_dense(&self) -> bool {
+        matches!(self, Self::Dense(_))
+    }
+}
+
+enum TablePageEntryIter<'a> {
+    Dense {
+        directory: &'a DensePagedRowDirectory,
+        position: usize,
+    },
+    Sparse(std::slice::Iter<'a, TablePageEntry>),
+}
+
+impl Iterator for TablePageEntryIter<'_> {
+    type Item = Result<TablePageEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense {
+                directory,
+                position,
+            } => {
+                if *position >= directory.len() {
+                    return None;
+                }
+                let entry = directory.entry_at(*position);
+                *position += 1;
+                Some(entry.and_then(|entry| {
+                    entry.ok_or_else(|| {
+                        DbError::corruption(
+                            "dense paged row directory ended before its locator count",
+                        )
+                    })
+                }))
+            }
+            Self::Sparse(entries) => entries.next().copied().map(Ok),
+        }
+    }
+}
+
+fn try_reserve_paged_directory<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    allocation_name: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    if should_force_paged_row_directory_reservation_failure(allocation_name) {
+        return Err(DbError::internal(format!(
+            "injected paged row directory reservation failure for {allocation_name}"
+        )));
+    }
+    values.try_reserve_exact(additional).map_err(|error| {
+        DbError::internal(format!(
+            "failed to reserve {additional} entries for {allocation_name}: {error}"
+        ))
+    })
+}
+
+fn try_reserve_paged_directory_amortized<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    allocation_name: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    if should_force_paged_row_directory_reservation_failure(allocation_name) {
+        return Err(DbError::internal(format!(
+            "injected paged row directory reservation failure for {allocation_name}"
+        )));
+    }
+    values.try_reserve(additional).map_err(|error| {
+        DbError::internal(format!(
+            "failed to reserve {additional} entries for {allocation_name}: {error}"
+        ))
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_NEXT_PAGED_ROW_DIRECTORY_RESERVATION_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    static PAGED_ROW_APPEND_PLAN_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn should_force_paged_row_directory_reservation_failure(allocation_name: &str) -> bool {
+    FORCE_NEXT_PAGED_ROW_DIRECTORY_RESERVATION_FAILURE.with(|force| {
+        if force.get().is_some_and(|target| target == allocation_name) {
+            force.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn force_next_paged_row_directory_reservation_failure(allocation_name: &'static str) {
+    FORCE_NEXT_PAGED_ROW_DIRECTORY_RESERVATION_FAILURE
+        .with(|force| force.set(Some(allocation_name)));
+}
+
+#[cfg(test)]
+fn reset_paged_row_append_plan_count() {
+    PAGED_ROW_APPEND_PLAN_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn paged_row_append_plan_count() -> u64 {
+    PAGED_ROW_APPEND_PLAN_COUNT.with(std::cell::Cell::get)
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TablePageManifestChunk {
     pub(crate) pointer: OverflowPointer,
     pub(crate) checksum: u32,
@@ -931,7 +1414,7 @@ pub(crate) struct TablePageManifestChunk {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TablePageManifest {
     chunks: Arc<Vec<TablePageManifestChunk>>,
-    rows: Arc<Vec<TablePageEntry>>,
+    rows: Arc<TablePageDirectory>,
     tombstoned_row_ids: Arc<BTreeSet<i64>>,
 }
 
@@ -940,6 +1423,89 @@ struct EncodedPagedTableChunk {
     payload: Vec<u8>,
     checksum: u32,
     row_count: usize,
+}
+
+fn try_build_dense_paged_row_directory(
+    chunks: &[TablePageManifestChunk],
+) -> Result<Option<DensePagedRowDirectory>> {
+    if chunks
+        .iter()
+        .any(|chunk| !table_page_manifest_chunk_is_plain(chunk))
+    {
+        return Ok(None);
+    }
+
+    let expected_rows = chunks.iter().try_fold(0usize, |total, chunk| {
+        total
+            .checked_add(chunk.row_count)
+            .ok_or_else(|| DbError::constraint("paged table row count overflow"))
+    })?;
+    let mut directory = DensePagedRowDirectory::empty(0)?;
+    try_reserve_paged_directory(&mut directory.locators, expected_rows, "dense row locators")?;
+    try_reserve_paged_directory(
+        &mut directory.chunk_ends,
+        chunks.len(),
+        "dense chunk ranges",
+    )?;
+
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        u32::try_from(chunk_index)
+            .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?;
+        if chunk.payload.is_empty() {
+            if chunk.row_count != 0 {
+                return Ok(None);
+            }
+            directory.chunk_ends.push(directory.locators.len());
+            continue;
+        }
+
+        let mut cursor = Cursor::new(chunk.payload.as_slice());
+        let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+        if magic != TABLE_PAYLOAD_MAGIC {
+            return Err(DbError::corruption("table payload magic is invalid"));
+        }
+        let physical_row_count = cursor.read_u32()? as usize;
+        if physical_row_count != chunk.row_count {
+            return Ok(None);
+        }
+        for _ in 0..physical_row_count {
+            let row_id = cursor.read_i64()?;
+            let (is_tombstone, row_bytes_len) = split_table_payload_row_len(cursor.read_u32()?);
+            let row_bytes_offset = cursor.offset;
+            if is_tombstone {
+                cursor.read_slice(row_bytes_len)?;
+                return Ok(None);
+            }
+            #[cfg(debug_assertions)]
+            {
+                let row_bytes = cursor.read_slice(row_bytes_len)?;
+                Row::decode(row_bytes)?;
+            }
+            #[cfg(not(debug_assertions))]
+            cursor.read_slice(row_bytes_len)?;
+
+            if directory.locators.is_empty() {
+                directory.start_row_id = row_id;
+            } else {
+                let expected_row_id = i128::from(directory.start_row_id)
+                    + i128::try_from(directory.locators.len()).map_err(|_| {
+                        DbError::constraint("dense paged row position exceeds i128")
+                    })?;
+                if i128::from(row_id) != expected_row_id {
+                    return Ok(None);
+                }
+            }
+            directory.locators.push(RowLocatorV1 {
+                byte_offset: u32::try_from(row_bytes_offset)
+                    .map_err(|_| DbError::constraint("row locator offset exceeds u32"))?,
+                byte_len: u32::try_from(row_bytes_len)
+                    .map_err(|_| DbError::constraint("row locator length exceeds u32"))?,
+            });
+        }
+        directory.chunk_ends.push(directory.locators.len());
+    }
+
+    Ok(Some(directory))
 }
 
 impl TablePageManifest {
@@ -971,6 +1537,14 @@ impl TablePageManifest {
             .iter()
             .flat_map(|chunk| chunk.tombstoned_row_ids.iter().copied())
             .collect::<BTreeSet<_>>();
+
+        if let Some(directory) = try_build_dense_paged_row_directory(&chunks)? {
+            return Ok(Self {
+                chunks: Arc::new(chunks),
+                rows: Arc::new(TablePageDirectory::Dense(directory)),
+                tombstoned_row_ids: Arc::new(tombstoned_row_ids),
+            });
+        }
 
         // Collect tombstoned row IDs into a set per chunk
         let chunk_tombstones: Vec<BTreeSet<i64>> = chunks
@@ -1006,7 +1580,13 @@ impl TablePageManifest {
             })
             .collect();
 
-        let mut rows = Vec::with_capacity(64);
+        let expected_rows = chunks.iter().try_fold(0usize, |total, chunk| {
+            total
+                .checked_add(chunk.row_count)
+                .ok_or_else(|| DbError::constraint("paged table row count overflow"))
+        })?;
+        let mut rows = Vec::new();
+        try_reserve_paged_directory(&mut rows, expected_rows, "sparse paged row entries")?;
         let mut base_row_entries = Vec::new();
         let mut overlay_row_entries = Vec::new();
 
@@ -1131,7 +1711,7 @@ impl TablePageManifest {
 
         Ok(Self {
             chunks: Arc::new(chunks),
-            rows: Arc::new(rows),
+            rows: Arc::new(TablePageDirectory::Sparse(rows)),
             tombstoned_row_ids: Arc::new(tombstoned_row_ids),
         })
     }
@@ -1163,22 +1743,92 @@ impl TablePageManifest {
 
     fn append_row(&mut self, row: &StoredRow, page_size: u32) -> Result<()> {
         let mut encoded_values = Vec::with_capacity(64);
-        Row::encode_values_into(&row.values, &mut encoded_values)?;
+        self.append_row_with_scratch(row, page_size, &mut encoded_values)
+    }
+
+    fn append_row_with_scratch(
+        &mut self,
+        row: &StoredRow,
+        page_size: u32,
+        encoded_values: &mut Vec<u8>,
+    ) -> Result<()> {
+        let prepared = self.try_prepare_append_row_with_scratch(row, page_size, encoded_values)?;
+        self.append_prepared_row_with_scratch(row, page_size, encoded_values, prepared)
+    }
+
+    fn try_prepare_append_row_with_scratch(
+        &mut self,
+        row: &StoredRow,
+        page_size: u32,
+        encoded_values: &mut Vec<u8>,
+    ) -> Result<PreparedTablePageAppend> {
+        Row::encode_values_into(&row.values, encoded_values)?;
+        let encoded_row_len = 8usize
+            .saturating_add(4)
+            .saturating_add(encoded_values.len());
+        let (planned_chunk_index, planned_is_overlay) =
+            self.planned_append_target(row.row_id, encoded_row_len, page_size)?;
+        let entry_chunk_index = u32::try_from(planned_chunk_index)
+            .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?;
+        let directory = Arc::make_mut(&mut self.rows).try_prepare_append(
+            row.row_id,
+            planned_chunk_index,
+            planned_is_overlay,
+        )?;
+        Ok(PreparedTablePageAppend {
+            chunk_index: planned_chunk_index,
+            entry_chunk_index,
+            is_overlay: planned_is_overlay,
+            directory,
+        })
+    }
+
+    fn planned_append_target(
+        &self,
+        row_id: i64,
+        encoded_row_len: usize,
+        page_size: u32,
+    ) -> Result<(usize, bool)> {
+        #[cfg(test)]
+        PAGED_ROW_APPEND_PLAN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        if self.tombstoned_row_ids.contains(&row_id) {
+            let chunk_index = self
+                .chunks
+                .iter()
+                .position(|chunk| chunk.tombstoned_row_ids.contains(&row_id))
+                .ok_or_else(|| {
+                    DbError::corruption(
+                        "paged table tombstone index referenced a missing chunk tombstone",
+                    )
+                })?;
+            return Ok((chunk_index, true));
+        }
+        let target_chunk_bytes = paged_table_target_chunk_bytes(page_size);
+        let chunk_index = if self.chunks.last().is_some_and(|chunk| {
+            chunk.payload.len().saturating_add(encoded_row_len) <= target_chunk_bytes
+        }) {
+            self.chunks.len() - 1
+        } else {
+            self.chunks.len()
+        };
+        Ok((chunk_index, false))
+    }
+
+    fn append_prepared_row_with_scratch(
+        &mut self,
+        row: &StoredRow,
+        page_size: u32,
+        encoded_values: &[u8],
+        prepared: PreparedTablePageAppend,
+    ) -> Result<()> {
         let encoded_row_len = 8usize
             .saturating_add(4)
             .saturating_add(encoded_values.len());
         let target_chunk_bytes = paged_table_target_chunk_bytes(page_size);
 
         let chunks = Arc::make_mut(&mut self.chunks);
-        let (chunk_index, is_overlay, locator) = if self.tombstoned_row_ids.contains(&row.row_id) {
-            let Some(chunk_index) = chunks
-                .iter()
-                .position(|chunk| chunk.tombstoned_row_ids.contains(&row.row_id))
-            else {
-                return Err(DbError::corruption(
-                    "paged table tombstone index referenced a missing chunk tombstone",
-                ));
-            };
+        let locator = if prepared.is_overlay {
+            let chunk_index = prepared.chunk_index;
             let chunk = chunks
                 .get_mut(chunk_index)
                 .ok_or_else(|| DbError::internal("paged append chunk index was out of bounds"))?;
@@ -1193,20 +1843,17 @@ impl TablePageManifest {
             let locator = append_encoded_table_payload_row(
                 Arc::make_mut(overlay_payload),
                 row.row_id,
-                &encoded_values,
+                encoded_values,
             )?;
             chunk.overlay_checksum = None;
             chunk.row_count = chunk
                 .row_count
                 .checked_add(1)
                 .ok_or_else(|| DbError::constraint("paged table chunk row count overflow"))?;
-            (chunk_index, true, locator)
+            locator
         } else {
-            let chunk_index = if chunks.last().is_some_and(|chunk| {
-                chunk.payload.len().saturating_add(encoded_row_len) <= target_chunk_bytes
-            }) {
-                chunks.len() - 1
-            } else {
+            let chunk_index = prepared.chunk_index;
+            if chunk_index == chunks.len() {
                 let mut payload =
                     Vec::with_capacity(target_chunk_bytes.max(TABLE_PAYLOAD_MAGIC.len() + 4));
                 payload.extend_from_slice(TABLE_PAYLOAD_MAGIC);
@@ -1225,8 +1872,7 @@ impl TablePageManifest {
                     overlay_checksum: None,
                     overlay_payload: None,
                 });
-                chunks.len() - 1
-            };
+            }
 
             let chunk = chunks
                 .get_mut(chunk_index)
@@ -1234,7 +1880,7 @@ impl TablePageManifest {
             let locator = append_encoded_table_payload_row(
                 Arc::make_mut(&mut chunk.payload),
                 row.row_id,
-                &encoded_values,
+                encoded_values,
             )?;
             chunk.pointer = OverflowPointer {
                 head_page_id: 0,
@@ -1246,17 +1892,32 @@ impl TablePageManifest {
                 .row_count
                 .checked_add(1)
                 .ok_or_else(|| DbError::constraint("paged table chunk row count overflow"))?;
-            (chunk_index, false, locator)
+            locator
         };
 
         let entry = TablePageEntry {
             row_id: row.row_id,
-            chunk_index: u32::try_from(chunk_index)
-                .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?,
-            is_overlay,
+            chunk_index: prepared.entry_chunk_index,
+            is_overlay: prepared.is_overlay,
             locator,
         };
-        let rows = Arc::make_mut(&mut self.rows);
+        let directory = Arc::make_mut(&mut self.rows);
+        let rows = match (directory, prepared.directory) {
+            (
+                TablePageDirectory::Dense(rows),
+                PreparedTablePageDirectoryAppend::Dense { add_chunk },
+            ) => {
+                debug_assert!(!prepared.is_overlay);
+                rows.append_prepared(row.row_id, prepared.chunk_index, add_chunk, locator)?;
+                return Ok(());
+            }
+            (TablePageDirectory::Sparse(rows), PreparedTablePageDirectoryAppend::Sparse) => rows,
+            _ => {
+                return Err(DbError::corruption(
+                    "paged row directory changed after append preparation",
+                ));
+            }
+        };
         if rows
             .last()
             .is_none_or(|existing| existing.row_id < entry.row_id)
@@ -1276,49 +1937,24 @@ impl TablePageManifest {
     }
 
     fn row_by_id(&self, row_id: i64) -> Result<Option<TableRowRef<'_>>> {
-        if let Some(index) = row_id
-            .checked_sub(1)
-            .and_then(|value| usize::try_from(value).ok())
-        {
-            if self.rows.get(index).is_some_and(|row| row.row_id == row_id) {
-                return self.row_at_position(index);
-            }
-        }
-
-        if let Ok(index) = self.rows.binary_search_by_key(&row_id, |row| row.row_id) {
-            return self.row_at_position(index);
-        }
-
-        let Some(index) = self.rows.iter().position(|row| row.row_id == row_id) else {
+        let Some((position, _)) = self.rows.entry_for_row_id(row_id)? else {
             return Ok(None);
         };
-        self.row_at_position(index)
+        self.row_at_position(position)
     }
 
     pub(crate) fn row_ids_in_range(&self, low: i64, high: i64) -> Vec<i64> {
-        if low > high {
-            return Vec::new();
-        }
-        let rows = self.rows.as_ref();
-        let start = rows.partition_point(|row| row.row_id < low);
-        let end = start + rows[start..].partition_point(|row| row.row_id <= high);
-        rows[start..end].iter().map(|row| row.row_id).collect()
+        self.rows.row_ids_in_range(low, high)
     }
 
     /// Returns the chunk index owning `row_id`, if present. Used by the bulk
     /// delete manifest rebuild to avoid decoding base payloads.
     fn chunk_index_for_row_id(&self, row_id: i64) -> Option<usize> {
-        let position = row_id
-            .checked_sub(1)
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|&index| self.rows.get(index).is_some_and(|row| row.row_id == row_id))
-            .or_else(|| {
-                self.rows
-                    .binary_search_by_key(&row_id, |row| row.row_id)
-                    .ok()
-            })
-            .or_else(|| self.rows.iter().position(|row| row.row_id == row_id));
-        position.map(|idx| self.rows[idx].chunk_index as usize)
+        self.rows
+            .entry_for_row_id(row_id)
+            .ok()
+            .flatten()
+            .map(|(_, entry)| entry.chunk_index as usize)
     }
 
     fn projected_values_by_id(
@@ -1326,28 +1962,15 @@ impl TablePageManifest {
         row_id: i64,
         projection_indexes: &[usize],
     ) -> Result<Option<Vec<Value>>> {
-        if let Some(index) = row_id
-            .checked_sub(1)
-            .and_then(|value| usize::try_from(value).ok())
-        {
-            if self.rows.get(index).is_some_and(|row| row.row_id == row_id) {
-                return self.projected_values_at_position(index, projection_indexes);
-            }
-        }
-
-        if let Ok(index) = self.rows.binary_search_by_key(&row_id, |row| row.row_id) {
-            return self.projected_values_at_position(index, projection_indexes);
-        }
-
-        let Some(index) = self.rows.iter().position(|row| row.row_id == row_id) else {
+        let Some((position, _)) = self.rows.entry_for_row_id(row_id)? else {
             return Ok(None);
         };
-        self.projected_values_at_position(index, projection_indexes)
+        self.projected_values_at_position(position, projection_indexes)
     }
 
     fn row_bytes_for_entry<'a>(
         &'a self,
-        entry: &'a TablePageEntry,
+        entry: TablePageEntry,
         chunk: &'a TablePageManifestChunk,
     ) -> Result<Option<&'a [u8]>> {
         if entry.is_overlay {
@@ -1367,7 +1990,9 @@ impl TablePageManifest {
         }
 
         let start = entry.locator.byte_offset as usize;
-        let end = start + entry.locator.byte_len as usize;
+        let end = start
+            .checked_add(entry.locator.byte_len as usize)
+            .ok_or_else(|| DbError::corruption("paged row locator exceeded address space"))?;
         let row_bytes = chunk
             .payload
             .as_slice()
@@ -1378,7 +2003,9 @@ impl TablePageManifest {
 
     fn row_bytes_from_locator(payload: &[u8], locator: RowLocatorV1) -> Result<&[u8]> {
         let start = locator.byte_offset as usize;
-        let end = start + locator.byte_len as usize;
+        let end = start
+            .checked_add(locator.byte_len as usize)
+            .ok_or_else(|| DbError::corruption("paged row locator exceeded address space"))?;
         payload
             .get(start..end)
             .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))
@@ -1414,7 +2041,7 @@ impl TablePageManifest {
     }
 
     fn row_at_position(&self, position: usize) -> Result<Option<TableRowRef<'_>>> {
-        let Some(entry) = self.rows.get(position) else {
+        let Some(entry) = self.rows.entry_at(position)? else {
             return Ok(None);
         };
         let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
@@ -1435,7 +2062,7 @@ impl TablePageManifest {
         position: usize,
         projection_indexes: &[usize],
     ) -> Result<Option<Vec<Value>>> {
-        let Some(entry) = self.rows.get(position) else {
+        let Some(entry) = self.rows.entry_at(position)? else {
             return Ok(None);
         };
         let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
@@ -1452,11 +2079,28 @@ impl TablePageManifest {
         .map(Some)
     }
 
+    fn full_query_row_by_id(&self, row_id: i64) -> Result<Option<QueryRow>> {
+        let Some((_, entry)) = self.rows.entry_for_row_id(row_id)? else {
+            return Ok(None);
+        };
+        let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
+            DbError::corruption("paged table chunk index exceeded chunk list length")
+        })?;
+        let Some(row_bytes) = self.row_bytes_for_entry(entry, chunk)? else {
+            return Ok(None);
+        };
+        Row::decode(row_bytes)
+            .map(Row::into_values)
+            .map(QueryRow::new)
+            .map(Some)
+    }
+
     fn visit_int64_column_values<F>(&self, column_index: usize, mut visitor: F) -> Result<()>
     where
         F: FnMut(i64, Option<i64>) -> Result<()>,
     {
         for entry in self.rows.iter() {
+            let entry = entry?;
             let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
                 DbError::corruption("paged table chunk index exceeded chunk list length")
             })?;
@@ -1473,6 +2117,7 @@ impl TablePageManifest {
         F: FnMut(i64, Option<f64>) -> Result<()>,
     {
         for entry in self.rows.iter() {
+            let entry = entry?;
             let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
                 DbError::corruption("paged table chunk index exceeded chunk list length")
             })?;
@@ -1495,12 +2140,34 @@ impl TablePageManifest {
     }
 
     fn approximate_heap_bytes(&self) -> usize {
-        self.chunks
-            .iter()
-            .map(|chunk| chunk.payload.capacity())
-            .sum::<usize>()
-            + self.tombstoned_row_ids.len() * std::mem::size_of::<i64>()
-            + self.rows.capacity() * std::mem::size_of::<TablePageEntry>()
+        let chunks_bytes = self
+            .chunks
+            .capacity()
+            .saturating_mul(std::mem::size_of::<TablePageManifestChunk>());
+        let chunk_payload_bytes = self.chunks.iter().fold(0usize, |bytes, chunk| {
+            bytes
+                .saturating_add(chunk.payload.capacity())
+                .saturating_add(
+                    chunk
+                        .overlay_payload
+                        .as_ref()
+                        .map_or(0, |payload| payload.capacity()),
+                )
+                .saturating_add(
+                    chunk
+                        .tombstoned_row_ids
+                        .len()
+                        .saturating_mul(std::mem::size_of::<i64>()),
+                )
+        });
+        chunks_bytes
+            .saturating_add(chunk_payload_bytes)
+            .saturating_add(
+                self.tombstoned_row_ids
+                    .len()
+                    .saturating_mul(std::mem::size_of::<i64>()),
+            )
+            .saturating_add(self.rows.approximate_heap_bytes())
     }
 }
 
@@ -1658,13 +2325,9 @@ fn try_apply_paged_row_changes_to_manifest_update_only(
         let Some(next_values) = change.as_ref() else {
             return Ok(None);
         };
-        let Ok(entry_index) = manifest
-            .rows
-            .binary_search_by_key(row_id, |entry| entry.row_id)
-        else {
+        let Some((_, entry)) = manifest.rows.entry_for_row_id(*row_id)? else {
             return Ok(None);
         };
-        let entry = manifest.rows[entry_index];
         if entry.is_overlay {
             return Ok(None);
         }
@@ -1675,6 +2338,7 @@ fn try_apply_paged_row_changes_to_manifest_update_only(
     }
 
     let mut updated_manifest = manifest.clone();
+    Arc::make_mut(&mut updated_manifest.rows).sparse_mut()?;
     let chunks = Arc::make_mut(&mut updated_manifest.chunks);
     let tombstoned_row_ids = Arc::make_mut(&mut updated_manifest.tombstoned_row_ids);
 
@@ -1709,19 +2373,16 @@ fn try_apply_single_paged_row_update_to_manifest(
     row_id: i64,
     next_values: &[Value],
 ) -> Result<Option<TablePageManifest>> {
-    let Ok(entry_index) = manifest
-        .rows
-        .binary_search_by_key(&row_id, |entry| entry.row_id)
-    else {
+    let Some((_, entry)) = manifest.rows.entry_for_row_id(row_id)? else {
         return Ok(None);
     };
-    let entry = manifest.rows[entry_index];
     if entry.is_overlay {
         return Ok(None);
     }
     let chunk_index = usize::try_from(entry.chunk_index)
         .map_err(|_| DbError::corruption("paged table chunk index exceeded chunk list length"))?;
     let mut updated_manifest = manifest.clone();
+    Arc::make_mut(&mut updated_manifest.rows).sparse_mut()?;
     let chunks = Arc::make_mut(&mut updated_manifest.chunks);
     let tombstoned_row_ids = Arc::make_mut(&mut updated_manifest.tombstoned_row_ids);
     let chunk = chunks
@@ -1945,6 +2606,13 @@ impl<'a> VisibleTableRowSource<'a> {
         }
     }
 
+    fn full_query_row_by_id(&self, row_id: i64) -> Result<Option<QueryRow>> {
+        match self {
+            Self::Temp(data) => Ok(data.full_query_row_by_id(row_id)),
+            Self::Base(source) => source.full_query_row_by_id(row_id),
+        }
+    }
+
     fn projected_query_rows_in_id_range(
         &self,
         low: i64,
@@ -2084,6 +2752,13 @@ impl TableRowSource {
         }
     }
 
+    fn full_query_row_by_id(&self, row_id: i64) -> Result<Option<QueryRow>> {
+        match self {
+            Self::Resident(data) => Ok(data.full_query_row_by_id(row_id)),
+            Self::Paged(manifest) => manifest.full_query_row_by_id(row_id),
+        }
+    }
+
     fn projected_query_rows_in_id_range(
         &self,
         low: i64,
@@ -2211,7 +2886,7 @@ impl Default for PersistedTableState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeBtreeKey {
-    Encoded(Vec<u8>),
+    Encoded(RuntimeEncodedKey),
     Int64(i64),
     Uuid([u8; 16]),
 }
@@ -2246,20 +2921,1022 @@ impl Hasher for Int64IdentityHasher {
 type Int64HashBuilder = BuildHasherDefault<Int64IdentityHasher>;
 type Int64Map<V> = HashMap<i64, V, Int64HashBuilder>;
 
+/// Runtime storage for a unique typed `INT64` index.
+///
+/// Integer primary keys commonly map a contiguous key range to identical row
+/// IDs. Keeping that relation as a range avoids allocating and populating a
+/// hash-map entry for every row while retaining a conservative sparse fallback
+/// for every other unique integer index shape (ADR 0203).
+#[derive(Clone, Debug)]
+pub(crate) enum UniqueInt64Keys {
+    DenseIdentity { start: i64, len: usize },
+    Sparse(Int64Map<i64>),
+}
+
+impl Default for UniqueInt64Keys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Int64Map<i64>> for UniqueInt64Keys {
+    fn from(keys: Int64Map<i64>) -> Self {
+        Self::Sparse(keys)
+    }
+}
+
+impl UniqueInt64Keys {
+    fn new() -> Self {
+        Self::DenseIdentity { start: 0, len: 0 }
+    }
+
+    fn dense_value_at(start: i64, offset: usize) -> Option<i64> {
+        let offset = i128::try_from(offset).ok()?;
+        i64::try_from(i128::from(start) + offset).ok()
+    }
+
+    fn dense_contains(start: i64, len: usize, key: i64) -> bool {
+        let offset = i128::from(key) - i128::from(start);
+        offset >= 0 && usize::try_from(offset).is_ok_and(|offset| offset < len)
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::DenseIdentity { len, .. } => *len,
+            Self::Sparse(keys) => keys.len(),
+        }
+    }
+
+    fn get(&self, key: &i64) -> Option<i64> {
+        match self {
+            Self::DenseIdentity { start, len } if Self::dense_contains(*start, *len, *key) => {
+                Some(*key)
+            }
+            Self::DenseIdentity { .. } => None,
+            Self::Sparse(keys) => keys.get(key).copied(),
+        }
+    }
+
+    fn iter(&self) -> UniqueInt64KeysIter<'_> {
+        match self {
+            Self::DenseIdentity { start, len } => UniqueInt64KeysIter::Dense {
+                start: *start,
+                offset: 0,
+                len: *len,
+            },
+            Self::Sparse(keys) => UniqueInt64KeysIter::Sparse(keys.iter()),
+        }
+    }
+
+    fn materialize_sparse(&mut self) {
+        let Self::DenseIdentity { start, len } = self else {
+            return;
+        };
+        let start = *start;
+        let len = *len;
+        let mut keys = HashMap::with_capacity_and_hasher(len, Int64HashBuilder::default());
+        for offset in 0..len {
+            let Some(value) = Self::dense_value_at(start, offset) else {
+                debug_assert!(false, "dense INT64 identity range exceeded i64 bounds");
+                break;
+            };
+            keys.insert(value, value);
+        }
+        *self = Self::Sparse(keys);
+    }
+
+    /// Insert a mapping and return the previous row ID, matching
+    /// `HashMap::insert` semantics.
+    fn insert(&mut self, key: i64, row_id: i64) -> Option<i64> {
+        match self {
+            Self::DenseIdentity { start, len } => {
+                if Self::dense_contains(*start, *len, key) {
+                    if key == row_id {
+                        return Some(key);
+                    }
+                } else if key == row_id {
+                    if *len == 0 {
+                        *start = key;
+                        *len = 1;
+                        return None;
+                    }
+                    if Self::dense_value_at(*start, *len) == Some(key) {
+                        *len = len.saturating_add(1);
+                        return None;
+                    }
+                    if start.checked_sub(1) == Some(key) {
+                        *start = key;
+                        *len = len.saturating_add(1);
+                        return None;
+                    }
+                }
+                self.materialize_sparse();
+                let Self::Sparse(keys) = self else {
+                    return None;
+                };
+                keys.insert(key, row_id)
+            }
+            Self::Sparse(keys) => keys.insert(key, row_id),
+        }
+    }
+
+    fn remove_row_id_mapping(&mut self, row_id: i64) {
+        match self {
+            Self::DenseIdentity { start, len } if Self::dense_contains(*start, *len, row_id) => {
+                if *len == 1 {
+                    *len = 0;
+                } else if *start == row_id {
+                    *start = start.saturating_add(1);
+                    *len -= 1;
+                } else if Self::dense_value_at(*start, len.saturating_sub(1)) == Some(row_id) {
+                    *len -= 1;
+                } else {
+                    self.materialize_sparse();
+                    if let Self::Sparse(keys) = self {
+                        keys.remove(&row_id);
+                    }
+                }
+            }
+            Self::DenseIdentity { .. } => {}
+            Self::Sparse(keys) => keys.retain(|_, existing| *existing != row_id),
+        }
+    }
+
+    fn shrink_to_fit(&mut self) -> usize {
+        let Self::Sparse(keys) = self else {
+            return 0;
+        };
+        let old_capacity = keys.capacity();
+        keys.shrink_to_fit();
+        old_capacity
+            .saturating_sub(keys.capacity())
+            .saturating_mul(std::mem::size_of::<(i64, i64)>())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_dense_identity(&self) -> bool {
+        matches!(self, Self::DenseIdentity { .. })
+    }
+}
+
+enum UniqueInt64KeysIter<'a> {
+    Dense {
+        start: i64,
+        offset: usize,
+        len: usize,
+    },
+    Sparse(std::collections::hash_map::Iter<'a, i64, i64>),
+}
+
+impl Iterator for UniqueInt64KeysIter<'_> {
+    type Item = (i64, i64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense { start, offset, len } => {
+                if *offset >= *len {
+                    return None;
+                }
+                let value = UniqueInt64Keys::dense_value_at(*start, *offset)?;
+                *offset += 1;
+                Some((value, value))
+            }
+            Self::Sparse(iter) => iter.next().map(|(key, row_id)| (*key, *row_id)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Dense { offset, len, .. } => {
+                let remaining = len.saturating_sub(*offset);
+                (remaining, Some(remaining))
+            }
+            Self::Sparse(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for UniqueInt64KeysIter<'_> {}
+
+/// Row IDs stored beneath one key in a non-unique typed `INT64` index.
+///
+/// Foreign-key-like indexes commonly receive monotonically increasing row IDs
+/// grouped by key. Representing those postings as an inline singleton or a
+/// contiguous range avoids one heap allocation per distinct key. Irregular
+/// insertion order falls back to the same `Vec` semantics used previously.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeInt64RowIds {
+    One(i64),
+    Contiguous { start: i64, len: usize },
+    Many(Vec<i64>),
+}
+
+impl RuntimeInt64RowIds {
+    fn one(row_id: i64) -> Self {
+        Self::One(row_id)
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Contiguous { len, .. } => *len,
+            Self::Many(row_ids) => row_ids.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Many(row_ids) if row_ids.is_empty())
+    }
+
+    fn value_at(start: i64, offset: usize) -> Option<i64> {
+        let offset = i128::try_from(offset).ok()?;
+        i64::try_from(i128::from(start) + offset).ok()
+    }
+
+    fn from_vec(row_ids: Vec<i64>) -> Self {
+        match row_ids.as_slice() {
+            [] => Self::Many(row_ids),
+            [row_id] => Self::One(*row_id),
+            [start, rest @ ..]
+                if rest.iter().copied().enumerate().all(|(offset, row_id)| {
+                    Self::value_at(*start, offset.saturating_add(1)) == Some(row_id)
+                }) =>
+            {
+                Self::Contiguous {
+                    start: *start,
+                    len: row_ids.len(),
+                }
+            }
+            _ => Self::Many(row_ids),
+        }
+    }
+
+    fn push(&mut self, row_id: i64) {
+        match self {
+            Self::One(first_row_id) if first_row_id.checked_add(1) == Some(row_id) => {
+                *self = Self::Contiguous {
+                    start: *first_row_id,
+                    len: 2,
+                };
+            }
+            Self::One(first_row_id) => {
+                let mut row_ids = Vec::with_capacity(4);
+                row_ids.push(*first_row_id);
+                row_ids.push(row_id);
+                *self = Self::Many(row_ids);
+            }
+            Self::Contiguous { start, len } if Self::value_at(*start, *len) == Some(row_id) => {
+                *len = len.saturating_add(1);
+            }
+            Self::Contiguous { start, len } => {
+                let start = *start;
+                let len = *len;
+                let mut row_ids = Vec::with_capacity(len.saturating_add(1));
+                for offset in 0..len {
+                    if let Some(existing) = Self::value_at(start, offset) {
+                        row_ids.push(existing);
+                    }
+                }
+                row_ids.push(row_id);
+                *self = Self::Many(row_ids);
+            }
+            Self::Many(row_ids) => row_ids.push(row_id),
+        }
+    }
+
+    fn contains(&self, row_id: &i64) -> bool {
+        match self {
+            Self::One(existing) => existing == row_id,
+            Self::Contiguous { start, len } => {
+                UniqueInt64Keys::dense_contains(*start, *len, *row_id)
+            }
+            Self::Many(row_ids) => row_ids.contains(row_id),
+        }
+    }
+
+    fn iter(&self) -> RuntimeInt64RowIdsIter<'_> {
+        match self {
+            Self::One(row_id) => RuntimeInt64RowIdsIter::One(Some(*row_id)),
+            Self::Contiguous { start, len } => RuntimeInt64RowIdsIter::Contiguous {
+                start: *start,
+                offset: 0,
+                len: *len,
+            },
+            Self::Many(row_ids) => RuntimeInt64RowIdsIter::Many(row_ids.iter()),
+        }
+    }
+
+    fn to_vec(&self) -> Vec<i64> {
+        self.iter().collect()
+    }
+
+    fn retain(&mut self, mut retain: impl FnMut(&i64) -> bool) {
+        match self {
+            Self::One(row_id) => {
+                if !retain(row_id) {
+                    *self = Self::Many(Vec::new());
+                }
+            }
+            Self::Contiguous { .. } => {
+                let retained = self
+                    .iter()
+                    .filter(|row_id| retain(row_id))
+                    .collect::<Vec<_>>();
+                *self = Self::from_vec(retained);
+            }
+            Self::Many(row_ids) => row_ids.retain(retain),
+        }
+    }
+
+    fn shrink_to_fit(&mut self) -> usize {
+        let Self::Many(row_ids) = self else {
+            return 0;
+        };
+        let old_capacity = row_ids.capacity();
+        let compact = Self::from_vec(std::mem::take(row_ids));
+        if matches!(compact, Self::Many(_)) {
+            *self = compact;
+            let Self::Many(row_ids) = self else {
+                return 0;
+            };
+            row_ids.shrink_to_fit();
+            return old_capacity
+                .saturating_sub(row_ids.capacity())
+                .saturating_mul(std::mem::size_of::<i64>());
+        }
+        *self = compact;
+        old_capacity.saturating_mul(std::mem::size_of::<i64>())
+    }
+}
+
+pub(crate) enum RuntimeInt64RowIdsIter<'a> {
+    One(Option<i64>),
+    Contiguous {
+        start: i64,
+        offset: usize,
+        len: usize,
+    },
+    Many(std::slice::Iter<'a, i64>),
+}
+
+impl Iterator for RuntimeInt64RowIdsIter<'_> {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::One(row_id) => row_id.take(),
+            Self::Contiguous { start, offset, len } => {
+                if *offset >= *len {
+                    return None;
+                }
+                let row_id = RuntimeInt64RowIds::value_at(*start, *offset)?;
+                *offset += 1;
+                Some(row_id)
+            }
+            Self::Many(row_ids) => row_ids.next().copied(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = match self {
+            Self::One(row_id) => usize::from(row_id.is_some()),
+            Self::Contiguous { offset, len, .. } => len.saturating_sub(*offset),
+            Self::Many(row_ids) => row_ids.len(),
+        };
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for RuntimeInt64RowIdsIter<'_> {}
+
+pub(crate) fn contiguous_row_ids(start: i64, len: usize) -> RuntimeInt64RowIdsIter<'static> {
+    RuntimeInt64RowIdsIter::Contiguous {
+        start,
+        offset: 0,
+        len,
+    }
+}
+
+impl<'a> IntoIterator for &'a RuntimeInt64RowIds {
+    type Item = i64;
+    type IntoIter = RuntimeInt64RowIdsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Runtime key-domain storage for a non-unique typed `INT64` index.
+///
+/// Dense mode is intentionally conservative: insertions may repeat only the
+/// current final key or append its immediate successor. Gaps and out-of-order
+/// key insertion materialize a sparse identity-hashed map, ensuring arbitrary
+/// workloads keep general hash-map behavior while grouped benchmark-shaped
+/// foreign-key indexes avoid per-key hash buckets.
+#[derive(Clone, Debug)]
+pub(crate) enum NonUniqueInt64Keys {
+    Dense {
+        start: i64,
+        postings: Vec<RuntimeInt64RowIds>,
+    },
+    Sparse(Int64Map<RuntimeInt64RowIds>),
+}
+
+impl Default for NonUniqueInt64Keys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Int64Map<Vec<i64>>> for NonUniqueInt64Keys {
+    fn from(keys: Int64Map<Vec<i64>>) -> Self {
+        let mut postings =
+            Int64Map::with_capacity_and_hasher(keys.capacity(), Int64HashBuilder::default());
+        for (key, row_ids) in keys {
+            postings.insert(key, RuntimeInt64RowIds::from_vec(row_ids));
+        }
+        Self::Sparse(postings)
+    }
+}
+
+impl NonUniqueInt64Keys {
+    fn new() -> Self {
+        Self::Dense {
+            start: 0,
+            postings: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense { postings, .. } => postings.len(),
+            Self::Sparse(keys) => keys.len(),
+        }
+    }
+
+    fn get(&self, key: &i64) -> Option<&RuntimeInt64RowIds> {
+        match self {
+            Self::Dense { start, postings }
+                if UniqueInt64Keys::dense_contains(*start, postings.len(), *key) =>
+            {
+                let offset = usize::try_from(i128::from(*key) - i128::from(*start)).ok()?;
+                postings.get(offset)
+            }
+            Self::Dense { .. } => None,
+            Self::Sparse(keys) => keys.get(key),
+        }
+    }
+
+    fn get_mut(&mut self, key: &i64) -> Option<&mut RuntimeInt64RowIds> {
+        match self {
+            Self::Dense { start, postings }
+                if UniqueInt64Keys::dense_contains(*start, postings.len(), *key) =>
+            {
+                let offset = usize::try_from(i128::from(*key) - i128::from(*start)).ok()?;
+                postings.get_mut(offset)
+            }
+            Self::Dense { .. } => None,
+            Self::Sparse(keys) => keys.get_mut(key),
+        }
+    }
+
+    fn iter(&self) -> NonUniqueInt64KeysIter<'_> {
+        match self {
+            Self::Dense { start, postings } => NonUniqueInt64KeysIter::Dense {
+                start: *start,
+                offset: 0,
+                postings: postings.iter(),
+            },
+            Self::Sparse(keys) => NonUniqueInt64KeysIter::Sparse(keys.iter()),
+        }
+    }
+
+    fn values(&self) -> NonUniqueInt64Values<'_> {
+        match self {
+            Self::Dense { postings, .. } => NonUniqueInt64Values::Dense(postings.iter()),
+            Self::Sparse(keys) => NonUniqueInt64Values::Sparse(keys.values()),
+        }
+    }
+
+    fn materialize_sparse(&mut self) {
+        let Self::Dense { start, postings } = self else {
+            return;
+        };
+        let start = *start;
+        let postings = std::mem::take(postings);
+        let mut keys =
+            Int64Map::with_capacity_and_hasher(postings.len(), Int64HashBuilder::default());
+        for (offset, row_ids) in postings.into_iter().enumerate() {
+            let Some(key) = UniqueInt64Keys::dense_value_at(start, offset) else {
+                debug_assert!(false, "dense non-unique INT64 range exceeded i64 bounds");
+                break;
+            };
+            keys.insert(key, row_ids);
+        }
+        *self = Self::Sparse(keys);
+    }
+
+    fn insert_row_id(&mut self, key: i64, row_id: i64) {
+        match self {
+            Self::Dense { start, postings } => {
+                if postings.is_empty() {
+                    *start = key;
+                    postings.push(RuntimeInt64RowIds::one(row_id));
+                    return;
+                }
+                let last_offset = postings.len().saturating_sub(1);
+                if UniqueInt64Keys::dense_value_at(*start, last_offset) == Some(key) {
+                    if let Some(posting) = postings.last_mut() {
+                        posting.push(row_id);
+                    }
+                    return;
+                }
+                if UniqueInt64Keys::dense_value_at(*start, postings.len()) == Some(key) {
+                    postings.push(RuntimeInt64RowIds::one(row_id));
+                    return;
+                }
+                self.materialize_sparse();
+                self.insert_row_id(key, row_id);
+            }
+            Self::Sparse(keys) => match keys.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(RuntimeInt64RowIds::one(row_id));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(row_id);
+                }
+            },
+        }
+    }
+
+    fn remove_row_id_mapping(&mut self, row_id: i64) {
+        match self {
+            Self::Dense { start, postings } => {
+                for posting in postings.iter_mut() {
+                    if posting.contains(&row_id) {
+                        posting.retain(|existing| *existing != row_id);
+                    }
+                }
+                while postings.last().is_some_and(RuntimeInt64RowIds::is_empty) {
+                    postings.pop();
+                }
+                while postings.first().is_some_and(RuntimeInt64RowIds::is_empty) {
+                    postings.remove(0);
+                    *start = start.saturating_add(1);
+                }
+                if postings.iter().any(RuntimeInt64RowIds::is_empty) {
+                    self.materialize_sparse();
+                    if let Self::Sparse(keys) = self {
+                        keys.retain(|_, posting| !posting.is_empty());
+                    }
+                }
+            }
+            Self::Sparse(keys) => {
+                for posting in keys.values_mut() {
+                    if posting.contains(&row_id) {
+                        posting.retain(|existing| *existing != row_id);
+                    }
+                }
+                keys.retain(|_, posting| !posting.is_empty());
+            }
+        }
+    }
+
+    fn remove_empty_key(&mut self, key: i64) {
+        if self.get(&key).is_none_or(|posting| !posting.is_empty()) {
+            return;
+        }
+        match self {
+            Self::Dense { start, postings } => {
+                let Some(offset) = usize::try_from(i128::from(key) - i128::from(*start)).ok()
+                else {
+                    return;
+                };
+                if offset == postings.len().saturating_sub(1) {
+                    postings.pop();
+                } else if offset == 0 {
+                    postings.remove(0);
+                    *start = start.saturating_add(1);
+                } else {
+                    self.materialize_sparse();
+                    if let Self::Sparse(keys) = self {
+                        keys.remove(&key);
+                    }
+                }
+            }
+            Self::Sparse(keys) => {
+                keys.remove(&key);
+            }
+        }
+    }
+
+    fn shrink_to_fit(&mut self) -> usize {
+        match self {
+            Self::Dense { postings, .. } => {
+                let old_capacity = postings.capacity();
+                let mut freed = postings.iter_mut().fold(0usize, |freed, posting| {
+                    freed.saturating_add(posting.shrink_to_fit())
+                });
+                postings.shrink_to_fit();
+                freed = freed.saturating_add(
+                    old_capacity
+                        .saturating_sub(postings.capacity())
+                        .saturating_mul(std::mem::size_of::<RuntimeInt64RowIds>()),
+                );
+                freed
+            }
+            Self::Sparse(keys) => {
+                let old_capacity = keys.capacity();
+                let mut freed = keys.values_mut().fold(0usize, |freed, posting| {
+                    freed.saturating_add(posting.shrink_to_fit())
+                });
+                keys.shrink_to_fit();
+                freed = freed.saturating_add(
+                    old_capacity
+                        .saturating_sub(keys.capacity())
+                        .saturating_mul(std::mem::size_of::<(i64, RuntimeInt64RowIds)>()),
+                );
+                freed
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_dense(&self) -> bool {
+        matches!(self, Self::Dense { .. })
+    }
+}
+
+pub(crate) enum NonUniqueInt64KeysIter<'a> {
+    Dense {
+        start: i64,
+        offset: usize,
+        postings: std::slice::Iter<'a, RuntimeInt64RowIds>,
+    },
+    Sparse(std::collections::hash_map::Iter<'a, i64, RuntimeInt64RowIds>),
+}
+
+impl<'a> Iterator for NonUniqueInt64KeysIter<'a> {
+    type Item = (i64, &'a RuntimeInt64RowIds);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense {
+                start,
+                offset,
+                postings,
+            } => {
+                let row_ids = postings.next()?;
+                let key = UniqueInt64Keys::dense_value_at(*start, *offset)?;
+                *offset += 1;
+                Some((key, row_ids))
+            }
+            Self::Sparse(keys) => keys.next().map(|(key, row_ids)| (*key, row_ids)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Dense { postings, .. } => postings.size_hint(),
+            Self::Sparse(keys) => keys.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for NonUniqueInt64KeysIter<'_> {}
+
+pub(crate) enum NonUniqueInt64Values<'a> {
+    Dense(std::slice::Iter<'a, RuntimeInt64RowIds>),
+    Sparse(std::collections::hash_map::Values<'a, i64, RuntimeInt64RowIds>),
+}
+
+impl<'a> Iterator for NonUniqueInt64Values<'a> {
+    type Item = &'a RuntimeInt64RowIds;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(postings) => postings.next(),
+            Self::Sparse(postings) => postings.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Dense(postings) => postings.size_hint(),
+            Self::Sparse(postings) => postings.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for NonUniqueInt64Values<'_> {}
+
 #[derive(Clone, Debug)]
 pub(crate) enum RuntimeBtreeKeys {
-    UniqueEncoded(Arc<BTreeMap<Vec<u8>, i64>>, BTreeSet<i64>),
-    NonUniqueEncoded(Arc<BTreeMap<Vec<u8>, Vec<i64>>>, BTreeSet<i64>),
-    UniqueInt64(Arc<Int64Map<i64>>, BTreeSet<i64>),
-    NonUniqueInt64(Arc<Int64Map<Vec<i64>>>, BTreeSet<i64>),
+    UniqueEncoded(Arc<BTreeMap<RuntimeEncodedKey, i64>>, BTreeSet<i64>),
+    NonUniqueEncoded(Arc<RuntimeEncodedPostings>, BTreeSet<i64>),
+    UniqueInt64(Arc<UniqueInt64Keys>, BTreeSet<i64>),
+    NonUniqueInt64(Arc<NonUniqueInt64Keys>, BTreeSet<i64>),
     UniqueUuid(Arc<BTreeMap<[u8; 16], i64>>, BTreeSet<i64>),
     NonUniqueUuid(Arc<BTreeMap<[u8; 16], Vec<i64>>>, BTreeSet<i64>),
+}
+
+/// Non-unique encoded-key map plus exact state for whether any posting can
+/// release capacity at commit. High-cardinality text indexes normally contain
+/// only singleton values, so commit can skip an otherwise
+/// linear scan over every key.
+#[derive(Debug)]
+pub(crate) struct RuntimeEncodedPostings {
+    entries: BTreeMap<RuntimeEncodedKey, RuntimeEncodedRowIds>,
+    shrinkable_postings: usize,
+}
+
+impl Clone for RuntimeEncodedPostings {
+    fn clone(&self) -> Self {
+        // Cloning a Vec is allowed to choose a capacity different from the
+        // source. Recompute rather than copying the count so Arc::make_mut's
+        // COW clone cannot leave shrink bookkeeping stale.
+        Self::new(self.entries.clone())
+    }
+}
+
+impl RuntimeEncodedPostings {
+    fn new(entries: BTreeMap<RuntimeEncodedKey, RuntimeEncodedRowIds>) -> Self {
+        let shrinkable_postings = entries
+            .values()
+            .filter(|row_ids| row_ids.is_shrinkable())
+            .count();
+        Self {
+            entries,
+            shrinkable_postings,
+        }
+    }
+
+    fn adjust_shrinkable_count(&mut self, was_shrinkable: bool, is_shrinkable: bool) {
+        match (was_shrinkable, is_shrinkable) {
+            (false, true) => self.shrinkable_postings = self.shrinkable_postings.saturating_add(1),
+            (true, false) => self.shrinkable_postings = self.shrinkable_postings.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    fn insert_row_id(&mut self, key: RuntimeEncodedKey, row_id: i64) {
+        use std::collections::btree_map::Entry;
+
+        let (was_shrinkable, is_shrinkable) = match self.entries.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(RuntimeEncodedRowIds::one(row_id));
+                (false, false)
+            }
+            Entry::Occupied(mut entry) => {
+                let row_ids = entry.get_mut();
+                let was_shrinkable = row_ids.is_shrinkable();
+                row_ids.push(row_id);
+                (was_shrinkable, row_ids.is_shrinkable())
+            }
+        };
+        self.adjust_shrinkable_count(was_shrinkable, is_shrinkable);
+    }
+
+    fn remove_row_id_everywhere(&mut self, row_id: i64) {
+        for row_ids in self.entries.values_mut() {
+            row_ids.retain(|existing| *existing != row_id);
+        }
+        self.entries.retain(|_, row_ids| !row_ids.is_empty());
+        self.shrinkable_postings = self
+            .entries
+            .values()
+            .filter(|row_ids| row_ids.is_shrinkable())
+            .count();
+    }
+
+    fn remove_row_id_for_key(&mut self, key: &[u8], row_id: i64) {
+        let Some(row_ids) = self.entries.get_mut(key) else {
+            return;
+        };
+        let was_shrinkable = row_ids.is_shrinkable();
+        row_ids.retain(|existing| *existing != row_id);
+        let is_empty = row_ids.is_empty();
+        let is_shrinkable = !is_empty && row_ids.is_shrinkable();
+        if is_empty {
+            self.entries.remove(key);
+        }
+        self.adjust_shrinkable_count(was_shrinkable, is_shrinkable);
+    }
+
+    fn shrink_to_fit(&mut self) -> usize {
+        if self.shrinkable_postings == 0 {
+            return 0;
+        }
+        let freed = self.entries.values_mut().fold(0usize, |freed, row_ids| {
+            freed.saturating_add(row_ids.shrink_to_fit())
+        });
+        // Vec::shrink_to_fit is explicitly best-effort. Recompute from the
+        // allocator's actual post-shrink capacities so zero can never become a
+        // false-clean state that permanently suppresses later compaction.
+        self.shrinkable_postings = self
+            .entries
+            .values()
+            .filter(|row_ids| row_ids.is_shrinkable())
+            .count();
+        freed
+    }
+
+    #[cfg(test)]
+    fn shrinkable_posting_count(&self) -> usize {
+        self.shrinkable_postings
+    }
+}
+
+impl std::ops::Deref for RuntimeEncodedPostings {
+    type Target = BTreeMap<RuntimeEncodedKey, RuntimeEncodedRowIds>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+/// Row IDs stored beneath one encoded key in a non-unique runtime index.
+///
+/// Encoded indexes are commonly declared non-unique even when their data is
+/// high-cardinality. On 64-bit targets, keeping the first row ID inline avoids
+/// a heap allocation for every such key while preserving the insertion order
+/// used by index scans; a second row promotes the singleton to the existing
+/// `Vec` layout. Supported 32-bit targets use `Vec` directly because an
+/// `i64`-carrying enum would exceed the former three-word object footprint.
+#[cfg(target_pointer_width = "64")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeEncodedRowIds {
+    One(i64),
+    Many(Vec<i64>),
+}
+
+#[cfg(target_pointer_width = "32")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct RuntimeEncodedRowIds(Vec<i64>);
+
+// Keep every posting object no larger than the Vec it replaces on all
+// supported pointer widths, including wasm32. This intentionally lives in
+// production code so cross-target checks enforce the layout invariant.
+const _: () =
+    assert!(std::mem::size_of::<RuntimeEncodedRowIds>() == std::mem::size_of::<Vec<i64>>());
+
+impl RuntimeEncodedRowIds {
+    fn one(row_id: i64) -> Self {
+        #[cfg(target_pointer_width = "64")]
+        {
+            Self::One(row_id)
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            Self(vec![row_id])
+        }
+    }
+
+    #[cfg(test)]
+    fn many(row_ids: Vec<i64>) -> Self {
+        #[cfg(target_pointer_width = "64")]
+        {
+            Self::Many(row_ids)
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            Self(row_ids)
+        }
+    }
+
+    fn as_slice(&self) -> &[i64] {
+        #[cfg(target_pointer_width = "64")]
+        {
+            match self {
+                Self::One(row_id) => std::slice::from_ref(row_id),
+                Self::Many(row_ids) => row_ids.as_slice(),
+            }
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            self.0.as_slice()
+        }
+    }
+
+    fn push(&mut self, row_id: i64) {
+        #[cfg(target_pointer_width = "64")]
+        {
+            match self {
+                Self::One(first_row_id) => {
+                    // Match Vec's small-allocation growth behavior so postings
+                    // with a few duplicates do not immediately reallocate.
+                    let mut row_ids = Vec::with_capacity(4);
+                    row_ids.push(*first_row_id);
+                    row_ids.push(row_id);
+                    *self = Self::Many(row_ids);
+                }
+                Self::Many(row_ids) => row_ids.push(row_id),
+            }
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            self.0.push(row_id);
+        }
+    }
+
+    fn is_shrinkable(&self) -> bool {
+        #[cfg(target_pointer_width = "64")]
+        {
+            match self {
+                Self::One(_) => false,
+                Self::Many(row_ids) => row_ids.len() == 1 || row_ids.capacity() > row_ids.len(),
+            }
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            self.0.capacity() > self.0.len()
+        }
+    }
+
+    fn retain(&mut self, retain: impl FnMut(&i64) -> bool) {
+        #[cfg(target_pointer_width = "64")]
+        {
+            let mut retain = retain;
+            match self {
+                Self::One(row_id) => {
+                    if !retain(row_id) {
+                        // Empty postings are transient: every map-owning caller
+                        // removes the entry immediately after retaining.
+                        *self = Self::Many(Vec::new());
+                    }
+                }
+                Self::Many(row_ids) => row_ids.retain(retain),
+            }
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            self.0.retain(retain);
+        }
+    }
+
+    fn shrink_to_fit(&mut self) -> usize {
+        #[cfg(target_pointer_width = "64")]
+        {
+            let Self::Many(row_ids) = self else {
+                return 0;
+            };
+            let old_capacity = row_ids.capacity();
+            if row_ids.len() == 1 {
+                let row_id = row_ids[0];
+                *self = Self::One(row_id);
+                return old_capacity.saturating_mul(std::mem::size_of::<i64>());
+            }
+            row_ids.shrink_to_fit();
+            old_capacity
+                .saturating_sub(row_ids.capacity())
+                .saturating_mul(std::mem::size_of::<i64>())
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            let old_capacity = self.0.capacity();
+            self.0.shrink_to_fit();
+            old_capacity
+                .saturating_sub(self.0.capacity())
+                .saturating_mul(std::mem::size_of::<i64>())
+        }
+    }
+
+    #[cfg(test)]
+    fn is_inline_singleton(&self) -> bool {
+        #[cfg(target_pointer_width = "64")]
+        {
+            matches!(self, Self::One(_))
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            false
+        }
+    }
+}
+
+impl std::ops::Deref for RuntimeEncodedRowIds {
+    type Target = [i64];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a RuntimeEncodedRowIds {
+    type Item = &'a i64;
+    type IntoIter = std::slice::Iter<'a, i64>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeRowIdSet<'a> {
     Empty,
     Single(i64),
+    Contiguous { start: i64, len: usize },
     Many(&'a [i64]),
     Owned(Vec<i64>),
 }
@@ -2270,6 +3947,7 @@ impl RuntimeRowIdSet<'_> {
         match self {
             Self::Empty => 0,
             Self::Single(_) => 1,
+            Self::Contiguous { len, .. } => *len,
             Self::Many(values) => values.len(),
             Self::Owned(values) => values.len(),
         }
@@ -2284,6 +3962,13 @@ impl RuntimeRowIdSet<'_> {
         match self {
             Self::Empty => {}
             Self::Single(row_id) => f(*row_id),
+            Self::Contiguous { start, len } => {
+                for offset in 0..*len {
+                    if let Some(row_id) = RuntimeInt64RowIds::value_at(*start, offset) {
+                        f(row_id);
+                    }
+                }
+            }
             Self::Many(values) => {
                 for row_id in *values {
                     f(*row_id);
@@ -2301,6 +3986,17 @@ impl RuntimeRowIdSet<'_> {
         match self {
             Self::Empty => Ok(false),
             Self::Single(row_id) => visitor(row_id),
+            Self::Contiguous { start, len } => {
+                for offset in 0..len {
+                    let Some(row_id) = RuntimeInt64RowIds::value_at(start, offset) else {
+                        break;
+                    };
+                    if visitor(row_id)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
             Self::Many(values) => {
                 for row_id in values {
                     if visitor(*row_id)? {
@@ -2361,14 +4057,6 @@ impl RuntimeBtreeKeys {
         freed
     }
 
-    fn shrink_int64_map<V>(keys: &mut Int64Map<V>) -> usize {
-        let old_capacity = keys.capacity();
-        keys.shrink_to_fit();
-        old_capacity
-            .saturating_sub(keys.capacity())
-            .saturating_mul(std::mem::size_of::<(i64, V)>())
-    }
-
     fn shrink_to_fit_if_unique(&mut self) -> usize {
         match self {
             Self::UniqueEncoded(_, _)
@@ -2379,8 +4067,7 @@ impl RuntimeBtreeKeys {
                 match self {
                     Self::NonUniqueEncoded(keys, _) => {
                         if let Some(keys) = Arc::get_mut(keys) {
-                            freed =
-                                freed.saturating_add(Self::shrink_row_id_vecs(keys.values_mut()));
+                            freed = freed.saturating_add(keys.shrink_to_fit());
                         }
                     }
                     Self::NonUniqueUuid(keys, _) => {
@@ -2393,29 +4080,23 @@ impl RuntimeBtreeKeys {
                 }
                 freed
             }
-            Self::UniqueInt64(keys, _) => {
-                Arc::get_mut(keys).map(Self::shrink_int64_map).unwrap_or(0)
-            }
+            Self::UniqueInt64(keys, _) => Arc::get_mut(keys)
+                .map(UniqueInt64Keys::shrink_to_fit)
+                .unwrap_or(0),
             Self::NonUniqueInt64(keys, _) => {
                 let Some(keys) = Arc::get_mut(keys) else {
                     return 0;
                 };
-                Self::shrink_int64_map(keys)
-                    .saturating_add(Self::shrink_row_id_vecs(keys.values_mut()))
+                keys.shrink_to_fit()
             }
         }
     }
 
     fn push_non_unique_row_id(row_ids: &mut Vec<i64>, row_id: i64) {
-        let capacity = row_ids.capacity();
-        if row_ids.len() == capacity {
-            let additional = if capacity < 16 {
-                capacity.max(4)
-            } else {
-                capacity / 2
-            };
-            row_ids.reserve_exact(additional);
-        }
+        // Keep Vec's geometric growth policy on the insert hot path. The
+        // explicit 1.5x `reserve_exact` policy caused several extra
+        // reallocations for the common 50-150-row posting lists while the
+        // post-commit shrink pass already recovers excess capacity.
         row_ids.push(row_id);
     }
 
@@ -2466,17 +4147,65 @@ impl RuntimeBtreeKeys {
         }
     }
 
+    fn visible_encoded_row_ids<'a>(
+        row_ids: &'a RuntimeEncodedRowIds,
+        deleted_row_ids: &'a BTreeSet<i64>,
+    ) -> RuntimeRowIdSet<'a> {
+        match row_ids.as_slice() {
+            [row_id] => Self::visible_single(*row_id, deleted_row_ids),
+            row_ids => Self::visible_many(row_ids, deleted_row_ids),
+        }
+    }
+
+    fn visible_int64_row_ids<'a>(
+        row_ids: &'a RuntimeInt64RowIds,
+        deleted_row_ids: &'a BTreeSet<i64>,
+    ) -> RuntimeRowIdSet<'a> {
+        match row_ids {
+            RuntimeInt64RowIds::One(row_id) => Self::visible_single(*row_id, deleted_row_ids),
+            RuntimeInt64RowIds::Contiguous { start, len } => {
+                if deleted_row_ids.is_empty() {
+                    return RuntimeRowIdSet::Contiguous {
+                        start: *start,
+                        len: *len,
+                    };
+                }
+                let Some(end) = len
+                    .checked_sub(1)
+                    .and_then(|offset| RuntimeInt64RowIds::value_at(*start, offset))
+                else {
+                    return RuntimeRowIdSet::Empty;
+                };
+                if deleted_row_ids.range(*start..=end).next().is_none() {
+                    return RuntimeRowIdSet::Contiguous {
+                        start: *start,
+                        len: *len,
+                    };
+                }
+                let visible = row_ids
+                    .iter()
+                    .filter(|row_id| !deleted_row_ids.contains(row_id))
+                    .collect::<Vec<_>>();
+                if visible.is_empty() {
+                    RuntimeRowIdSet::Empty
+                } else {
+                    RuntimeRowIdSet::Owned(visible)
+                }
+            }
+            RuntimeInt64RowIds::Many(row_ids) => Self::visible_many(row_ids, deleted_row_ids),
+        }
+    }
+
     fn row_ids_for_row_id(&self, row_id: i64) -> RuntimeRowIdSet<'_> {
         match self {
-            Self::UniqueInt64(keys, deleted) => keys
-                .get(&row_id)
-                .copied()
-                .map_or(RuntimeRowIdSet::Empty, |row_id| {
+            Self::UniqueInt64(keys, deleted) => {
+                keys.get(&row_id).map_or(RuntimeRowIdSet::Empty, |row_id| {
                     Self::visible_single(row_id, deleted)
-                }),
+                })
+            }
             Self::NonUniqueInt64(keys, deleted) => keys
                 .get(&row_id)
-                .map(|row_ids| Self::visible_many(row_ids.as_slice(), deleted))
+                .map(|row_ids| Self::visible_int64_row_ids(row_ids, deleted))
                 .unwrap_or(RuntimeRowIdSet::Empty),
             Self::UniqueEncoded(..)
             | Self::NonUniqueEncoded(..)
@@ -2499,39 +4228,23 @@ impl RuntimeBtreeKeys {
                 .copied()
                 .map(|row_id| Self::visible_single(row_id, deleted))
                 .unwrap_or(RuntimeRowIdSet::Empty),
-            (Self::NonUniqueEncoded(keys, deleted), RuntimeBtreeKey::Encoded(key))
-                if deleted.is_empty() =>
-            {
-                keys.get(key)
-                    .map(|row_ids| RuntimeRowIdSet::Many(row_ids.as_slice()))
-                    .unwrap_or(RuntimeRowIdSet::Empty)
-            }
             (Self::NonUniqueEncoded(keys, deleted), RuntimeBtreeKey::Encoded(key)) => keys
                 .get(key)
-                .map(|row_ids| Self::visible_many(row_ids, deleted))
+                .map(|row_ids| Self::visible_encoded_row_ids(row_ids, deleted))
                 .unwrap_or(RuntimeRowIdSet::Empty),
             (Self::UniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key))
                 if deleted.is_empty() =>
             {
                 keys.get(key)
-                    .copied()
                     .map_or(RuntimeRowIdSet::Empty, RuntimeRowIdSet::Single)
             }
             (Self::UniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key)) => keys
                 .get(key)
-                .copied()
                 .map(|row_id| Self::visible_single(row_id, deleted))
                 .unwrap_or(RuntimeRowIdSet::Empty),
-            (Self::NonUniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key))
-                if deleted.is_empty() =>
-            {
-                keys.get(key)
-                    .map(|row_ids| RuntimeRowIdSet::Many(row_ids.as_slice()))
-                    .unwrap_or(RuntimeRowIdSet::Empty)
-            }
             (Self::NonUniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key)) => keys
                 .get(key)
-                .map(|row_ids| Self::visible_many(row_ids, deleted))
+                .map(|row_ids| Self::visible_int64_row_ids(row_ids, deleted))
                 .unwrap_or(RuntimeRowIdSet::Empty),
             (Self::UniqueUuid(keys, deleted), RuntimeBtreeKey::Uuid(key)) if deleted.is_empty() => {
                 keys.get(key)
@@ -2636,7 +4349,7 @@ impl RuntimeBtreeKeys {
     pub(super) fn row_ids_for_value_set(&self, value: &Value) -> Result<RuntimeRowIdSet<'_>> {
         match self {
             Self::UniqueEncoded(_, _) | Self::NonUniqueEncoded(_, _) => {
-                let key = RuntimeBtreeKey::Encoded(encode_index_key(value)?);
+                let key = RuntimeBtreeKey::Encoded(encode_runtime_index_key(value)?);
                 Ok(self.row_id_set_for_key(&key))
             }
             Self::UniqueInt64(_, _) | Self::NonUniqueInt64(_, _) => match value {
@@ -2665,7 +4378,7 @@ impl RuntimeBtreeKeys {
         match self {
             Self::UniqueEncoded(keys, deleted) => {
                 for value in values {
-                    let key = encode_index_key(value)?;
+                    let key = encode_runtime_index_key(value)?;
                     if let Some(row_id) = keys.get(&key) {
                         if !deleted.contains(row_id) {
                             row_ids.push(*row_id);
@@ -2675,7 +4388,7 @@ impl RuntimeBtreeKeys {
             }
             Self::NonUniqueEncoded(keys, deleted) => {
                 for value in values {
-                    let key = encode_index_key(value)?;
+                    let key = encode_runtime_index_key(value)?;
                     if let Some(entry_row_ids) = keys.get(&key) {
                         row_ids.extend(
                             entry_row_ids
@@ -2690,8 +4403,8 @@ impl RuntimeBtreeKeys {
                 for value in values {
                     if let Value::Int64(value) = value {
                         if let Some(row_id) = keys.get(value) {
-                            if !deleted.contains(row_id) {
-                                row_ids.push(*row_id);
+                            if !deleted.contains(&row_id) {
+                                row_ids.push(row_id);
                             }
                         }
                     }
@@ -2704,7 +4417,6 @@ impl RuntimeBtreeKeys {
                             row_ids.extend(
                                 entry_row_ids
                                     .iter()
-                                    .copied()
                                     .filter(|row_id| !deleted.contains(row_id)),
                             );
                         }
@@ -2763,13 +4475,13 @@ impl RuntimeBtreeKeys {
             Self::UniqueInt64(keys, deleted) => keys
                 .iter()
                 .filter(|(_, row_id)| !deleted.contains(row_id))
-                .map(|(key, _)| (RuntimeBtreeKey::Int64(*key), 1))
+                .map(|(key, _)| (RuntimeBtreeKey::Int64(key), 1))
                 .collect(),
             Self::NonUniqueInt64(keys, deleted) => keys
                 .iter()
                 .map(|(key, row_ids)| {
                     (
-                        RuntimeBtreeKey::Int64(*key),
+                        RuntimeBtreeKey::Int64(key),
                         row_ids
                             .iter()
                             .filter(|row_id| !deleted.contains(row_id))
@@ -2810,10 +4522,10 @@ impl RuntimeBtreeKeys {
                 .is_some_and(|row_ids| row_ids.iter().any(|row_id| !deleted.contains(row_id))),
             (Self::UniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key)) => keys
                 .get(key)
-                .is_some_and(|row_id| !deleted.contains(row_id)),
+                .is_some_and(|row_id| !deleted.contains(&row_id)),
             (Self::NonUniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key)) => keys
                 .get(key)
-                .is_some_and(|row_ids| row_ids.iter().any(|row_id| !deleted.contains(row_id))),
+                .is_some_and(|row_ids| row_ids.iter().any(|row_id| !deleted.contains(&row_id))),
             (Self::UniqueUuid(keys, deleted), RuntimeBtreeKey::Uuid(key)) => keys
                 .get(key)
                 .is_some_and(|row_id| !deleted.contains(row_id)),
@@ -2843,38 +4555,37 @@ impl RuntimeBtreeKeys {
             }
             (Self::NonUniqueEncoded(keys, deleted), RuntimeBtreeKey::Encoded(key)) => {
                 let keys = Arc::make_mut(keys);
-                if deleted.remove(&row_id) {
-                    for row_ids in keys.values_mut() {
-                        row_ids.retain(|existing| *existing != row_id);
-                    }
-                    keys.retain(|_, row_ids| !row_ids.is_empty());
+                if !deleted.is_empty() && deleted.remove(&row_id) {
+                    keys.remove_row_id_everywhere(row_id);
                 }
-                Self::push_non_unique_row_id(keys.entry(key).or_default(), row_id);
+                keys.insert_row_id(key, row_id);
             }
             (Self::UniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key)) => {
-                if deleted.remove(&row_id) {
-                    Arc::make_mut(keys).retain(|_, existing| *existing != row_id);
+                let revived = deleted.remove(&row_id);
+                let keys = Arc::make_mut(keys);
+                if revived {
+                    if keys.get(&key) == Some(row_id) {
+                        return Ok(());
+                    }
+                    keys.remove_row_id_mapping(row_id);
                 }
-                if let Some(existing) = keys.get(&key).copied() {
+                if let Some(existing) = keys.get(&key) {
                     if deleted.remove(&existing) {
-                        Arc::make_mut(keys).insert(key, row_id);
+                        keys.insert(key, row_id);
                         return Ok(());
                     }
                     return Err(DbError::internal(
                         "unique runtime BTREE index received a duplicate key insert",
                     ));
                 }
-                Arc::make_mut(keys).insert(key, row_id);
+                keys.insert(key, row_id);
             }
             (Self::NonUniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key)) => {
                 let keys = Arc::make_mut(keys);
                 if deleted.remove(&row_id) {
-                    for row_ids in keys.values_mut() {
-                        row_ids.retain(|existing| *existing != row_id);
-                    }
-                    keys.retain(|_, row_ids| !row_ids.is_empty());
+                    keys.remove_row_id_mapping(row_id);
                 }
-                Self::push_non_unique_row_id(keys.entry(key).or_default(), row_id);
+                keys.insert_row_id(key, row_id);
             }
             (Self::UniqueUuid(keys, deleted), RuntimeBtreeKey::Uuid(key)) => {
                 if deleted.remove(&row_id) {
@@ -2923,13 +4634,8 @@ impl RuntimeBtreeKeys {
                 RuntimeBtreeKey::Encoded(new_key),
             ) if !deleted.contains(&row_id) => {
                 let keys = Arc::make_mut(keys);
-                if let Some(row_ids) = keys.get_mut(old_key) {
-                    row_ids.retain(|existing| *existing != row_id);
-                }
-                if keys.get(old_key).is_some_and(Vec::is_empty) {
-                    keys.remove(old_key);
-                }
-                Self::push_non_unique_row_id(keys.entry(new_key).or_default(), row_id);
+                keys.remove_row_id_for_key(old_key.as_slice(), row_id);
+                keys.insert_row_id(new_key, row_id);
                 Ok(true)
             }
             (
@@ -2941,10 +4647,8 @@ impl RuntimeBtreeKeys {
                 if let Some(row_ids) = keys.get_mut(old_key) {
                     row_ids.retain(|existing| *existing != row_id);
                 }
-                if keys.get(old_key).is_some_and(Vec::is_empty) {
-                    keys.remove(old_key);
-                }
-                Self::push_non_unique_row_id(keys.entry(new_key).or_default(), row_id);
+                keys.remove_empty_key(*old_key);
+                keys.insert_row_id(new_key, row_id);
                 Ok(true)
             }
             (
@@ -2987,7 +4691,7 @@ impl RuntimeBtreeKeys {
                 }
             }
             (Self::UniqueInt64(keys, deleted), RuntimeBtreeKey::Int64(key)) => {
-                if let Some(existing) = keys.get(key).copied() {
+                if let Some(existing) = keys.get(key) {
                     if existing != row_id {
                         return Err(DbError::internal(
                             "unique runtime BTREE index row-id mismatch during delete",
@@ -3060,6 +4764,9 @@ impl RuntimeBtreeKeys {
                 })
                 .sum(),
             Self::UniqueInt64(keys, deleted) => keys.len().saturating_sub(deleted.len()),
+            Self::NonUniqueInt64(keys, deleted) if deleted.is_empty() => {
+                keys.values().map(RuntimeInt64RowIds::len).sum()
+            }
             Self::NonUniqueInt64(keys, deleted) => keys
                 .values()
                 .map(|row_ids| {
@@ -3092,7 +4799,7 @@ impl RuntimeBtreeKeys {
             Self::UniqueInt64(keys, deleted) => keys.len().saturating_sub(deleted.len()),
             Self::NonUniqueInt64(keys, deleted) => keys
                 .values()
-                .filter(|row_ids| row_ids.iter().any(|row_id| !deleted.contains(row_id)))
+                .filter(|row_ids| row_ids.iter().any(|row_id| !deleted.contains(&row_id)))
                 .count(),
             Self::UniqueUuid(keys, deleted) => keys.len().saturating_sub(deleted.len()),
             Self::NonUniqueUuid(keys, deleted) => keys
@@ -3112,7 +4819,7 @@ impl RuntimeBtreeKeys {
             Self::UniqueInt64(keys, deleted) => keys.len() == deleted.len(),
             Self::NonUniqueInt64(keys, deleted) => keys
                 .values()
-                .all(|row_ids| row_ids.iter().all(|row_id| deleted.contains(row_id))),
+                .all(|row_ids| row_ids.iter().all(|row_id| deleted.contains(&row_id))),
             Self::UniqueUuid(keys, deleted) => keys.len() == deleted.len(),
             Self::NonUniqueUuid(keys, deleted) => keys
                 .values()
@@ -3924,6 +5631,28 @@ impl EngineRuntime {
             .contains_key(table_name)
     }
 
+    #[cfg(test)]
+    pub(crate) fn deferred_paged_row_locator_cache_is_dense_for_tests(
+        &self,
+        table_name: &str,
+    ) -> Option<bool> {
+        let canonical = map_key_ci(self.deferred_paged_row_locator_caches.as_ref(), table_name)?;
+        self.deferred_paged_row_locator_caches
+            .get(&canonical)
+            .map(|cache| cache.locators.is_dense())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_paged_row_locator_cache_sparse_len_for_tests(
+        &self,
+        table_name: &str,
+    ) -> Option<usize> {
+        let canonical = map_key_ci(self.deferred_paged_row_locator_caches.as_ref(), table_name)?;
+        self.deferred_paged_row_locator_caches
+            .get(&canonical)
+            .map(|cache| cache.locators.sparse_len())
+    }
+
     fn should_cache_deferred_paged_row_locators(&self, table_name: &str) -> bool {
         let has_runtime_btree = self.catalog.indexes.values().any(|index| {
             identifiers_equal(&index.table_name, table_name)
@@ -3990,7 +5719,7 @@ impl EngineRuntime {
         schema_cookie: u32,
         config: &crate::config::DbConfig,
     ) -> Result<(Self, u64)> {
-        let reader = wal.begin_reader()?;
+        let reader = wal.begin_reader_with_pager(pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         let runtime =
             Self::load_from_storage_at_snapshot(pager, wal, schema_cookie, config, snapshot_lsn)?;
@@ -4032,7 +5761,9 @@ impl EngineRuntime {
             } else {
                 return Err(DbError::corruption("unknown catalog state payload magic"));
             };
+            let root_schema_cookie = root.schema_cookie;
             runtime.root_state = Some(root);
+            runtime.catalog_mut().schema_cookie = root_schema_cookie;
             runtime.paged_row_storage = config.paged_row_storage;
             runtime.extension_trust_anchors = Arc::new(config.extension_trust_anchors.clone());
             runtime.extension_unsigned_development_mode =
@@ -4046,7 +5777,9 @@ impl EngineRuntime {
             .lock()
             .expect("payload cache lock should not be poisoned")
             .set_max_entries(config.cached_payloads_max_entries);
-        runtime.catalog_mut().schema_cookie = schema_cookie;
+        if runtime.root_state.is_none() {
+            runtime.catalog_mut().schema_cookie = schema_cookie;
+        }
         // Materialize any deferred tables under the same reader guard so
         // that overflow pointers from the manifest are read against the
         // same WAL snapshot. If deferred loading uses a later snapshot,
@@ -4227,7 +5960,7 @@ impl EngineRuntime {
             return Ok(());
         }
         let Some(snapshot_lsn) = snapshot_lsn else {
-            let reader = wal.begin_reader()?;
+            let reader = wal.begin_reader_with_pager(pager)?;
             let snapshot_lsn = reader.snapshot_lsn();
             let store = SnapshotPageStore {
                 pager,
@@ -4361,7 +6094,7 @@ impl EngineRuntime {
                 },
             )?;
         }
-        self.redefer_persisted_tables(&[canonical_table_name.as_str()]);
+        let _ = self.redefer_persisted_tables(&[canonical_table_name.as_str()]);
         Ok(())
     }
 
@@ -4377,7 +6110,7 @@ impl EngineRuntime {
             return Ok(());
         }
         let Some(snapshot_lsn) = snapshot_lsn else {
-            let reader = wal.begin_reader()?;
+            let reader = wal.begin_reader_with_pager(pager)?;
             let snapshot_lsn = reader.snapshot_lsn();
             let store = SnapshotPageStore {
                 pager,
@@ -6045,7 +7778,8 @@ impl EngineRuntime {
         Ok(())
     }
 
-    pub(crate) fn redefer_persisted_tables(&mut self, names: &[&str]) {
+    pub(crate) fn redefer_persisted_tables(&mut self, names: &[&str]) -> usize {
+        let mut freed_bytes = 0usize;
         for name in names {
             let Some(table_name) = self.canonical_catalog_table_name(name) else {
                 continue;
@@ -6054,13 +7788,16 @@ impl EngineRuntime {
                 .persisted_tables
                 .get(&table_name)
                 .is_some_and(|state| state.pointer.is_table_paged_manifest())
-                && self.tables_mut().remove(&table_name).is_some()
             {
-                self.deferred_tables_mut().insert(table_name.clone());
-                self.dirty_tables_mut().remove(&table_name);
-                self.paged_mutations.remove(&table_name);
+                if let Some(row_source) = self.tables_mut().remove(&table_name) {
+                    freed_bytes = freed_bytes.saturating_add(row_source.approximate_heap_bytes());
+                    self.deferred_tables_mut().insert(table_name.clone());
+                    self.dirty_tables_mut().remove(&table_name);
+                    self.paged_mutations.remove(&table_name);
+                }
             }
         }
+        freed_bytes
     }
 
     pub(crate) fn has_redeferable_persisted_tables(&self, names: &[&str]) -> bool {
@@ -6075,7 +7812,7 @@ impl EngineRuntime {
         })
     }
 
-    pub(crate) fn redefer_all_persisted_paged_tables(&mut self) {
+    pub(crate) fn redefer_all_persisted_paged_tables(&mut self) -> usize {
         let paged_names: Vec<String> = self
             .persisted_tables
             .iter()
@@ -6088,7 +7825,7 @@ impl EngineRuntime {
             })
             .collect();
         let name_refs: Vec<&str> = paged_names.iter().map(|s| s.as_str()).collect();
-        self.redefer_persisted_tables(&name_refs);
+        self.redefer_persisted_tables(&name_refs)
     }
 
     pub(crate) fn rebuild_indexes(&mut self, page_size: u32) -> Result<()> {
@@ -7900,11 +9637,11 @@ impl EngineRuntime {
             RuntimeBtreeKeys::UniqueInt64(entries, deleted) => {
                 groups.reserve(entries.len());
                 for (key, row_id) in entries.iter() {
-                    if deleted.contains(row_id) {
+                    if deleted.contains(&row_id) {
                         continue;
                     }
                     groups.push(SimpleGroupedCountAggregate {
-                        group_values: vec![Value::Int64(*key)],
+                        group_values: vec![Value::Int64(key)],
                         count: 1,
                     });
                 }
@@ -7920,7 +9657,7 @@ impl EngineRuntime {
                         continue;
                     }
                     groups.push(SimpleGroupedCountAggregate {
-                        group_values: vec![Value::Int64(*key)],
+                        group_values: vec![Value::Int64(key)],
                         count: i64::try_from(count).map_err(|_| {
                             DbError::constraint(
                                 "grouped COUNT index bucket exceeds INT64 row-count limits",
@@ -8059,11 +9796,11 @@ impl EngineRuntime {
             RuntimeBtreeKeys::UniqueInt64(entries, deleted) => {
                 groups.reserve(entries.len());
                 for (key, row_id) in entries.iter() {
-                    if deleted.contains(row_id) {
+                    if deleted.contains(&row_id) {
                         continue;
                     }
                     groups.push(SimpleGroupedCountAggregate {
-                        group_values: vec![Value::Int64(*key)],
+                        group_values: vec![Value::Int64(key)],
                         count: 1,
                     });
                 }
@@ -8079,7 +9816,7 @@ impl EngineRuntime {
                         continue;
                     }
                     groups.push(SimpleGroupedCountAggregate {
-                        group_values: vec![Value::Int64(*key)],
+                        group_values: vec![Value::Int64(key)],
                         count: i64::try_from(count).map_err(|_| {
                             DbError::constraint(
                                 "grouped COUNT index bucket exceeds INT64 row-count limits",
@@ -9892,6 +11629,20 @@ impl EngineRuntime {
                             };
                             add_status_aggregate_child_row(&mut counts, child_row.values(), &plan)?;
                         }
+                        RuntimeRowIdSet::Contiguous { start, len } => {
+                            for child_row_id in contiguous_row_ids(start, len) {
+                                let Some(child_row) = child_source.row_by_id(child_row_id)? else {
+                                    return Err(DbError::internal(
+                                        "child index referenced missing row id",
+                                    ));
+                                };
+                                add_status_aggregate_child_row(
+                                    &mut counts,
+                                    child_row.values(),
+                                    &plan,
+                                )?;
+                            }
+                        }
                         RuntimeRowIdSet::Many(row_ids) => {
                             for child_row_id in row_ids {
                                 let Some(child_row) = child_source.row_by_id(*child_row_id)? else {
@@ -10095,6 +11846,17 @@ impl EngineRuntime {
                         matched_child = true;
                         state.accumulate(child_row.values())?;
                     }
+                    RuntimeRowIdSet::Contiguous { start, len } => {
+                        for child_row_id in contiguous_row_ids(start, len) {
+                            let Some(child_row) = child_source.row_by_id(child_row_id)? else {
+                                return Err(DbError::internal(
+                                    "child index referenced missing row id",
+                                ));
+                            };
+                            matched_child = true;
+                            state.accumulate(child_row.values())?;
+                        }
+                    }
                     RuntimeRowIdSet::Many(row_ids) => {
                         for child_row_id in row_ids {
                             let Some(child_row) = child_source.row_by_id(*child_row_id)? else {
@@ -10234,6 +11996,25 @@ impl EngineRuntime {
                         &mut rating_sum,
                         &mut rating_count,
                     )?;
+                }
+                RuntimeRowIdSet::Contiguous { start, len } => {
+                    for row_id in contiguous_row_ids(start, len) {
+                        let Some(bridge_row) = bridge_source.row_by_id(row_id)? else {
+                            return Err(DbError::internal(
+                                "genre bridge index referenced missing row id",
+                            ));
+                        };
+                        accumulate_genre_popularity_movie(
+                            &movie_source,
+                            movie_index_keys,
+                            plan.movie_id_is_rowid_alias,
+                            bridge_row.values().get(plan.bridge_movie_id_index),
+                            plan.movie_rating_index,
+                            &mut movie_count,
+                            &mut rating_sum,
+                            &mut rating_count,
+                        )?;
+                    }
                 }
                 RuntimeRowIdSet::Many(row_ids) => {
                     for row_id in row_ids {
@@ -10394,6 +12175,25 @@ impl EngineRuntime {
                         &mut rows,
                     )?;
                 }
+                RuntimeRowIdSet::Contiguous { start, len } => {
+                    for row_id in contiguous_row_ids(start, len) {
+                        let Some(bridge_row) = bridge_source.row_by_id(row_id)? else {
+                            return Err(DbError::internal(
+                                "movie tag bridge index referenced missing row id",
+                            ));
+                        };
+                        push_movie_tag_search_movie_rows(
+                            self,
+                            &movie_source,
+                            movie_index_keys,
+                            plan.movie_id_is_rowid_alias,
+                            bridge_row.values().get(plan.bridge_movie_id_index),
+                            &plan.projection_indexes,
+                            bounded_order,
+                            &mut rows,
+                        )?;
+                    }
+                }
                 RuntimeRowIdSet::Many(row_ids) => {
                     for row_id in row_ids {
                         let Some(bridge_row) = bridge_source.row_by_id(*row_id)? else {
@@ -10441,6 +12241,13 @@ impl EngineRuntime {
             RuntimeRowIdSet::Single(row_id) => {
                 if let Some(tag_row) = tag_source.row_by_id(row_id)? {
                     visit_tag_row(tag_row)?;
+                }
+            }
+            RuntimeRowIdSet::Contiguous { start, len } => {
+                for row_id in contiguous_row_ids(start, len) {
+                    if let Some(tag_row) = tag_source.row_by_id(row_id)? {
+                        visit_tag_row(tag_row)?;
+                    }
                 }
             }
             RuntimeRowIdSet::Many(row_ids) => {
@@ -10739,6 +12546,13 @@ impl EngineRuntime {
             RuntimeRowIdSet::Single(row_id) => {
                 if let Some(watchlist_row) = watchlist_source.row_by_id(row_id)? {
                     visit_watchlist_row(watchlist_row)?;
+                }
+            }
+            RuntimeRowIdSet::Contiguous { start, len } => {
+                for row_id in contiguous_row_ids(start, len) {
+                    if let Some(watchlist_row) = watchlist_source.row_by_id(row_id)? {
+                        visit_watchlist_row(watchlist_row)?;
+                    }
                 }
             }
             RuntimeRowIdSet::Many(row_ids) => {
@@ -11109,6 +12923,13 @@ impl EngineRuntime {
                 RuntimeRowIdSet::Single(row_id) => {
                     if let Some(movie_row) = movie_source.row_by_id(row_id)? {
                         visit_movie_row(movie_row)?;
+                    }
+                }
+                RuntimeRowIdSet::Contiguous { start, len } => {
+                    for row_id in contiguous_row_ids(start, len) {
+                        if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                            visit_movie_row(movie_row)?;
+                        }
                     }
                 }
                 RuntimeRowIdSet::Many(row_ids) => {
@@ -13529,6 +15350,8 @@ impl EngineRuntime {
             .as_deref()
             .zip(plan.limit)
             .filter(|(_, _)| plan.offset == 0);
+        let scalar_count_top_n_limit = plan.scalar_count_top_n_limit();
+        let mut scalar_count_top_n_rows: Vec<(i64, QueryRow)> = Vec::new();
         let mut rows = Vec::new();
         for parent_row in parent_source.rows() {
             let parent_row = parent_row?;
@@ -13555,13 +15378,42 @@ impl EngineRuntime {
                 ))
             })?;
 
+            let scalar_count_top_n_slot = if let Some(limit) = scalar_count_top_n_limit {
+                if limit == 0 {
+                    continue;
+                }
+                if scalar_count_top_n_rows.len() < limit {
+                    Some(scalar_count_top_n_rows.len())
+                } else {
+                    let mut worst_index = 0;
+                    for index in 1..scalar_count_top_n_rows.len() {
+                        if scalar_count_top_n_rows[index].0 < scalar_count_top_n_rows[worst_index].0
+                        {
+                            worst_index = index;
+                        }
+                    }
+                    if child_count <= scalar_count_top_n_rows[worst_index].0 {
+                        continue;
+                    }
+                    Some(worst_index)
+                }
+            } else {
+                None
+            };
+
             let mut output = Vec::with_capacity(plan.group_column_indexes.len() + 1);
             for index in &plan.group_column_indexes {
                 output.push(parent_values[*index].clone());
             }
             output.push(Value::Int64(child_count));
             let row = QueryRow::new(output);
-            if let Some((order_by, limit)) = bounded_order {
+            if let Some(slot) = scalar_count_top_n_slot {
+                if slot == scalar_count_top_n_rows.len() {
+                    scalar_count_top_n_rows.push((child_count, row));
+                } else {
+                    scalar_count_top_n_rows[slot] = (child_count, row);
+                }
+            } else if let Some((order_by, limit)) = bounded_order {
                 push_bounded_projection_ordered_query_row(
                     Some(self),
                     &mut rows,
@@ -13572,6 +15424,15 @@ impl EngineRuntime {
             } else {
                 rows.push(row);
             }
+        }
+
+        if scalar_count_top_n_limit.is_some() {
+            scalar_count_top_n_rows.sort_by_key(|row| std::cmp::Reverse(row.0));
+            let rows = scalar_count_top_n_rows
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect();
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
         }
 
         if let Some((order_by, _)) = bounded_order {
@@ -15549,6 +17410,35 @@ impl EngineRuntime {
                         )?;
                     }
                 }
+                RuntimeRowIdSet::Contiguous { start, len } => {
+                    for source_row_id in contiguous_row_ids(start, len) {
+                        if stop {
+                            break;
+                        }
+                        let Some(source_row) = source_source.row_by_id(source_row_id)? else {
+                            continue;
+                        };
+                        stop = self.process_simple_indexed_join_source_row(
+                            *kind,
+                            source_is_left,
+                            source_row.values(),
+                            &ordered_source_join_indexes,
+                            probe_source,
+                            probe_row_positions.as_ref(),
+                            keys,
+                            probe_hash_rows.as_ref(),
+                            matched_probe_row_ids.as_mut(),
+                            post_join_filter.as_ref(),
+                            &projection_plan,
+                            &join_eval_dataset,
+                            left_width,
+                            right_width,
+                            params,
+                            early_stop_limit,
+                            &mut rows,
+                        )?;
+                    }
+                }
                 RuntimeRowIdSet::Many(source_row_ids) => {
                     for source_row_id in source_row_ids {
                         if stop {
@@ -15766,9 +17656,9 @@ impl EngineRuntime {
             if join_values.len() == 1 {
                 keys.row_ids_for_value_set(join_values[0])?
             } else {
-                keys.row_id_set_for_key(&RuntimeBtreeKey::Encoded(
+                keys.row_id_set_for_key(&RuntimeBtreeKey::Encoded(RuntimeEncodedKey::from_vec(
                     Row::new(join_values.into_iter().cloned().collect()).encode()?,
-                ))
+                )))
             }
         } else if join_values.len() == 1 {
             let join_value = join_values[0];
@@ -17978,21 +19868,21 @@ impl EngineRuntime {
             match keys {
                 RuntimeBtreeKeys::UniqueInt64(entries, deleted) => {
                     for (value, row_id) in entries.iter() {
-                        if deleted.contains(row_id) {
+                        if deleted.contains(&row_id) {
                             continue;
                         }
-                        if *value >= range_start && *value < range_end_exclusive {
-                            distinct_values.insert(*value);
+                        if value >= range_start && value < range_end_exclusive {
+                            distinct_values.insert(value);
                         }
                     }
                 }
                 RuntimeBtreeKeys::NonUniqueInt64(entries, deleted) => {
                     for (value, row_ids) in entries.iter() {
-                        if row_ids.iter().any(|row_id| !deleted.contains(row_id))
-                            && *value >= range_start
-                            && *value < range_end_exclusive
+                        if row_ids.iter().any(|row_id| !deleted.contains(&row_id))
+                            && value >= range_start
+                            && value < range_end_exclusive
                         {
-                            distinct_values.insert(*value);
+                            distinct_values.insert(value);
                         }
                     }
                 }
@@ -18869,6 +20759,17 @@ impl EngineRuntime {
                     ));
                 }
             }
+            RuntimeRowIdSet::Contiguous { start, len } => {
+                rows.reserve(len);
+                for row_id in contiguous_row_ids(start, len) {
+                    if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                        rows.push(project_simple_projection_values(
+                            stored_row.values(),
+                            projection_indexes,
+                        ));
+                    }
+                }
+            }
             RuntimeRowIdSet::Many(row_ids) => {
                 rows.reserve(row_ids.len());
                 for row_id in row_ids {
@@ -18939,19 +20840,19 @@ impl EngineRuntime {
         };
 
         let lower_key = lower_bound
-            .map(|bound| encode_index_key(&bound.value).map(|key| (key, bound.inclusive)))
+            .map(|bound| encode_runtime_index_key(&bound.value).map(|key| (key, bound.inclusive)))
             .transpose()?;
         let upper_key = upper_bound
-            .map(|bound| encode_index_key(&bound.value).map(|key| (key, bound.inclusive)))
+            .map(|bound| encode_runtime_index_key(&bound.value).map(|key| (key, bound.inclusive)))
             .transpose()?;
-        let lower_range: Bound<&Vec<u8>> = match lower_key.as_ref() {
-            Some((key, true)) => Bound::Included(key),
-            Some((key, false)) => Bound::Excluded(key),
+        let lower_range: Bound<&[u8]> = match lower_key.as_ref() {
+            Some((key, true)) => Bound::Included(key.as_slice()),
+            Some((key, false)) => Bound::Excluded(key.as_slice()),
             None => Bound::Unbounded,
         };
-        let upper_range: Bound<&Vec<u8>> = match upper_key.as_ref() {
-            Some((key, true)) => Bound::Included(key),
-            Some((key, false)) => Bound::Excluded(key),
+        let upper_range: Bound<&[u8]> = match upper_key.as_ref() {
+            Some((key, true)) => Bound::Included(key.as_slice()),
+            Some((key, false)) => Bound::Excluded(key.as_slice()),
             None => Bound::Unbounded,
         };
 
@@ -18960,13 +20861,13 @@ impl EngineRuntime {
             RuntimeBtreeKeys::UniqueEncoded(entries, deleted) => {
                 candidate_row_ids.extend(
                     entries
-                        .range::<Vec<u8>, _>((lower_range, upper_range))
+                        .range::<[u8], _>((lower_range, upper_range))
                         .filter_map(|(_, row_id)| (!deleted.contains(row_id)).then_some(*row_id)),
                 );
             }
             RuntimeBtreeKeys::NonUniqueEncoded(entries, deleted) => {
                 for row_ids in entries
-                    .range::<Vec<u8>, _>((lower_range, upper_range))
+                    .range::<[u8], _>((lower_range, upper_range))
                     .map(|(_, row_ids)| row_ids)
                 {
                     candidate_row_ids.extend(
@@ -19977,10 +21878,100 @@ impl EngineRuntime {
         )
     }
 
+    pub(crate) fn try_execute_resident_simple_row_id_projection(
+        &self,
+        table_name: &str,
+        projection_columns: &[&str],
+        filter_column: &str,
+        lookup_row_id: i64,
+    ) -> Result<Option<QueryResult>> {
+        if let Some(view) = self.visible_view(table_name, NameResolutionScope::Session) {
+            if view.temporary {
+                return Ok(None);
+            }
+            // The observed-current caller has already established that this
+            // runtime represents a stable committed snapshot.  When every
+            // base table needed by the view is resident, execute the same
+            // validated indexed join without acquiring a reader slot or
+            // constructing a snapshot page store.  A missing resident source
+            // returns `None`, preserving the snapshot-backed fallback.
+            let store = page::InMemoryPageStore::default();
+            return self.execute_simple_view_row_id_projection_from_store(
+                projection_columns,
+                filter_column,
+                lookup_row_id,
+                view,
+                &store,
+                false,
+                true,
+            );
+        }
+        if self.visible_table_is_temporary(table_name) {
+            return Ok(None);
+        }
+        let Some(table_schema) = self.table_schema(table_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
+        if !row_id_alias_column_name(table_schema)
+            .is_some_and(|column_name| identifiers_equal(column_name, filter_column))
+        {
+            return Ok(None);
+        }
+        let mut projection_indexes = Vec::with_capacity(projection_columns.len());
+        let mut column_names = Vec::with_capacity(projection_columns.len());
+        for projection_column in projection_columns {
+            let Some(index) = table_schema
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, projection_column))
+            else {
+                return Ok(None);
+            };
+            projection_indexes.push(index);
+            column_names.push((*projection_column).to_string());
+        }
+        self.try_execute_validated_resident_simple_row_id_projection(
+            table_schema,
+            &projection_indexes,
+            Arc::from(column_names),
+            lookup_row_id,
+        )
+    }
+
     fn execute_simple_view_row_id_projection_at_snapshot(
         &self,
         request: &SimpleRowIdProjectionRequest<'_>,
         view: &ViewSchema,
+    ) -> Result<Option<QueryResult>> {
+        let store = SnapshotPageStore {
+            pager: request.pager,
+            wal: request.wal,
+            snapshot_lsn: request.snapshot_lsn,
+        };
+        self.execute_simple_view_row_id_projection_from_store(
+            request.projection_columns,
+            request.filter_column,
+            request.lookup_row_id,
+            view,
+            &store,
+            request.use_persistent_pk_index,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_simple_view_row_id_projection_from_store<S: PageStore>(
+        &self,
+        projection_columns: &[&str],
+        filter_column: &str,
+        lookup_row_id: i64,
+        view: &ViewSchema,
+        store: &S,
+        use_persistent_pk_index: bool,
+        resident_only: bool,
     ) -> Result<Option<QueryResult>> {
         if view.temporary {
             return Ok(None);
@@ -20009,7 +22000,7 @@ impl EngineRuntime {
         }
 
         let Some(filter_source_expr) =
-            view_projection_expr_for_output_column(&view_select.projection, request.filter_column)
+            view_projection_expr_for_output_column(&view_select.projection, filter_column)
         else {
             return Ok(None);
         };
@@ -20068,9 +22059,9 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        let mut projections = Vec::with_capacity(request.projection_columns.len());
-        let mut column_names = Vec::with_capacity(request.projection_columns.len());
-        for projection_column in request.projection_columns {
+        let mut projections = Vec::with_capacity(projection_columns.len());
+        let mut column_names = Vec::with_capacity(projection_columns.len());
+        for projection_column in projection_columns {
             let Some(view_expr) =
                 view_projection_expr_for_output_column(&view_select.projection, projection_column)
             else {
@@ -20147,6 +22138,9 @@ impl EngineRuntime {
                 table_readers.push(DeferredViewTableRowReader::Source(source));
                 continue;
             }
+            if resident_only && self.dirty_tables.contains(&schema.name) {
+                return Ok(None);
+            }
             let Some(state) = self.persisted_table_state(binding.name) else {
                 return Ok(None);
             };
@@ -20155,12 +22149,7 @@ impl EngineRuntime {
                 .table(binding.name)
                 .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
                 .map(|cache| cache.as_ref());
-            if !deferred_rowid_lookup_available(
-                state,
-                schema,
-                request.use_persistent_pk_index,
-                cache,
-            ) {
+            if !deferred_rowid_lookup_available(state, schema, use_persistent_pk_index, cache) {
                 return Ok(None);
             }
             table_readers.push(DeferredViewTableRowReader::Deferred {
@@ -20170,16 +22159,25 @@ impl EngineRuntime {
             });
         }
 
-        let store = SnapshotPageStore {
-            pager: request.pager,
-            wal: request.wal,
-            snapshot_lsn: request.snapshot_lsn,
-        };
+        if resident_only {
+            return self.try_execute_observed_current_linear_three_table_view(
+                &table_readers,
+                &join_steps,
+                &join_keys,
+                &key_projection_indexes,
+                &table_projections,
+                &projection_indexes,
+                lookup_row_id,
+                column_names,
+                linear_tail_can_move,
+            );
+        }
+
         let mut chunk_payload_cache = HashMap::new();
         let Some(source_row) = table_readers[source_table_index].read_projected_with_chunk_cache(
-            &store,
-            request.lookup_row_id,
-            request.use_persistent_pk_index,
+            store,
+            lookup_row_id,
+            use_persistent_pk_index,
             &table_projections[source_table_index].projection_indexes,
             &mut chunk_payload_cache,
         )?
@@ -20190,14 +22188,14 @@ impl EngineRuntime {
         let mut rows = Vec::with_capacity(64);
         let mut join_partial_rows = Vec::with_capacity(join_steps.len() + 1);
         if let Some(stopped) = self.stream_deferred_view_linear_three_table_rows_from_root(
-            &store,
+            store,
             &table_readers,
             &join_steps,
             &join_keys,
             &key_projection_indexes,
             &table_projections,
             &source_row,
-            request.use_persistent_pk_index,
+            use_persistent_pk_index,
             &mut chunk_payload_cache,
             &mut |root_row, row1, row2| {
                 let row = collect_deferred_view_query_row_from_linear_tail(
@@ -20217,7 +22215,7 @@ impl EngineRuntime {
         }
 
         match self.stream_deferred_view_join_rows_from_root(
-            &store,
+            store,
             &table_readers,
             &join_steps,
             &join_keys,
@@ -20225,7 +22223,7 @@ impl EngineRuntime {
             &table_projections,
             source_row,
             &mut join_partial_rows,
-            request.use_persistent_pk_index,
+            use_persistent_pk_index,
             false,
             &mut chunk_payload_cache,
             &mut |partial| {
@@ -20616,15 +22614,13 @@ impl EngineRuntime {
     ) -> Result<Option<QueryResult>> {
         let table_schema = request.table_schema;
         let canonical_table_name = table_schema.name.as_str();
-        if let Some(row_source) = self.visible_table_row_source(canonical_table_name) {
-            let rows = row_source
-                .projected_query_row_by_id(request.lookup_row_id, request.projection_indexes)?
-                .map(|row| vec![row])
-                .unwrap_or_default();
-            return Ok(Some(QueryResult::with_shared_columns(
-                Arc::clone(&request.column_names),
-                rows,
-            )));
+        if let Some(result) = self.try_execute_validated_resident_simple_row_id_projection(
+            table_schema,
+            request.projection_indexes,
+            Arc::clone(&request.column_names),
+            request.lookup_row_id,
+        )? {
+            return Ok(Some(result));
         }
 
         if !self.has_deferred_tables()
@@ -20662,6 +22658,78 @@ impl EngineRuntime {
             Arc::clone(&request.column_names),
             rows,
         )))
+    }
+
+    fn try_execute_validated_resident_simple_row_id_projection(
+        &self,
+        table_schema: &TableSchema,
+        projection_indexes: &[usize],
+        column_names: Arc<[String]>,
+        lookup_row_id: i64,
+    ) -> Result<Option<QueryResult>> {
+        let canonical_table_name = table_schema.name.as_str();
+        if let Some(row_source) = self.visible_table_row_source(canonical_table_name) {
+            let projects_complete_row = projection_indexes.len() == table_schema.columns.len()
+                && projection_indexes
+                    .iter()
+                    .enumerate()
+                    .all(|(position, index)| position == *index);
+            let row = if projects_complete_row {
+                row_source.full_query_row_by_id(lookup_row_id)?
+            } else {
+                row_source.projected_query_row_by_id(lookup_row_id, projection_indexes)?
+            };
+            let rows = row.map(|row| vec![row]).unwrap_or_default();
+            return Ok(Some(QueryResult::with_shared_columns(column_names, rows)));
+        }
+
+        // A checkpoint may re-defer a paged table while retaining its compact
+        // row locator directory and a bounded set of already-verified chunk
+        // payloads.  Those immutable payloads are part of this runtime's
+        // observed snapshot, so a point lookup can be answered without a
+        // pager read or a cross-process reader slot.  If the requested chunk
+        // was not retained, preserve the normal snapshot-backed fallback.
+        if !self.dirty_tables.contains(canonical_table_name) {
+            let state = self.persisted_table_state(canonical_table_name);
+            let cache = self
+                .deferred_paged_row_locator_caches
+                .get(canonical_table_name);
+            if let (Some(state), Some(cache)) = (state, cache) {
+                if cache.matches_state(state) {
+                    if let Some(cached) = cache.locators.get(lookup_row_id) {
+                        if let Some(payload) =
+                            cache.verified_payload(cached.pointer, cached.checksum)
+                        {
+                            let projects_complete_row = projection_indexes.len()
+                                == table_schema.columns.len()
+                                && projection_indexes
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(position, index)| position == *index);
+                            let row = if projects_complete_row {
+                                decode_row_by_locator_from_payload(
+                                    payload,
+                                    lookup_row_id,
+                                    cached.locator,
+                                )
+                                .map(|row| QueryRow::new(row.values))?
+                            } else {
+                                QueryRow::new(decode_projected_values_by_locator_from_payload::<
+                                    page::InMemoryPageStore,
+                                >(
+                                    None, payload, cached.locator, projection_indexes
+                                )?)
+                            };
+                            return Ok(Some(QueryResult::with_shared_columns(
+                                column_names,
+                                vec![row],
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn try_execute_simple_deferred_rowid_join_projection_query(
@@ -21753,6 +23821,125 @@ impl EngineRuntime {
         Ok(Some(stopped))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_observed_current_linear_three_table_view(
+        &self,
+        table_row_readers: &[DeferredViewTableRowReader<'_>],
+        join_steps: &[DeferredViewJoinStep],
+        join_keys: &[&RuntimeBtreeKeys],
+        key_projection_indexes: &[Option<usize>],
+        table_projections: &[DeferredViewTableProjection],
+        projection_indexes: &[DeferredViewProjectionSource],
+        lookup_row_id: i64,
+        column_names: Vec<String>,
+        linear_tail_can_move: bool,
+    ) -> Result<Option<QueryResult>> {
+        if table_row_readers.len() != 3
+            || join_steps.len() != 2
+            || table_projections.len() != 3
+            || join_keys.len() != 2
+            || key_projection_indexes.len() != 2
+        {
+            return Ok(None);
+        }
+        let step0 = &join_steps[0];
+        let step1 = &join_steps[1];
+        if step0.previous_table_index != 0
+            || step0.current_table_index != 1
+            || step1.previous_table_index != 1
+            || step1.current_table_index != 2
+        {
+            return Ok(None);
+        }
+        let [keys0, keys1] = join_keys else {
+            return Ok(None);
+        };
+        let [key0_projection_index, key1_projection_index] = key_projection_indexes else {
+            return Ok(None);
+        };
+        let Some(source_row) = table_row_readers[0].read_projected_from_observed_cache(
+            lookup_row_id,
+            &table_projections[0].projection_indexes,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(source_row) = source_row else {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        };
+
+        let key0_row_ids = match *key0_projection_index {
+            Some(projection_index) => {
+                let Some(key_value) = source_row.values.get(projection_index) else {
+                    return Err(DbError::internal(
+                        "observed-current view root row is shorter than planned schema",
+                    ));
+                };
+                if matches!(key_value, Value::Null) {
+                    return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+                }
+                keys0.row_ids_for_value_set(key_value)?
+            }
+            None => keys0.row_ids_for_row_id(source_row.row_id),
+        };
+
+        let mut cache_available = true;
+        let mut rows = Vec::with_capacity(64);
+        key0_row_ids.visit_until(|row1_id| {
+            let Some(row1) = table_row_readers[1].read_projected_from_observed_cache(
+                row1_id,
+                &table_projections[1].projection_indexes,
+            )?
+            else {
+                cache_available = false;
+                return Ok(true);
+            };
+            let Some(row1) = row1 else {
+                return Ok(false);
+            };
+            let key1_row_ids = match *key1_projection_index {
+                Some(projection_index) => {
+                    let Some(key_value) = row1.values.get(projection_index) else {
+                        return Err(DbError::internal(
+                            "observed-current view join row is shorter than planned schema",
+                        ));
+                    };
+                    if matches!(key_value, Value::Null) {
+                        return Ok(false);
+                    }
+                    keys1.row_ids_for_value_set(key_value)?
+                }
+                None => keys1.row_ids_for_row_id(row1.row_id),
+            };
+            key1_row_ids.visit_until(|row2_id| {
+                let Some(row2) = table_row_readers[2].read_projected_from_observed_cache(
+                    row2_id,
+                    &table_projections[2].projection_indexes,
+                )?
+                else {
+                    cache_available = false;
+                    return Ok(true);
+                };
+                let Some(row2) = row2 else {
+                    return Ok(false);
+                };
+                rows.push(collect_deferred_view_query_row_from_linear_tail(
+                    &source_row,
+                    &row1,
+                    row2,
+                    projection_indexes,
+                    "observed-current view row-id projection",
+                    linear_tail_can_move,
+                )?);
+                Ok(false)
+            })
+        })?;
+        if !cache_available {
+            return Ok(None);
+        }
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
     fn deferred_view_join_step(
         &self,
         table_bindings: &[TableBindingRef<'_>],
@@ -22034,6 +24221,21 @@ impl EngineRuntime {
                     Some(true) => return Ok(Some(true)),
                     None => return Ok(None),
                 },
+                RuntimeRowIdSet::Contiguous { start, len } => {
+                    for row_id in contiguous_row_ids(start, len) {
+                        if outcome.is_some() {
+                            break;
+                        }
+                        match visit_row_id(row_id)? {
+                            Some(false) => {}
+                            Some(true) => return Ok(Some(true)),
+                            None => {
+                                outcome = Some(None);
+                                break;
+                            }
+                        }
+                    }
+                }
                 RuntimeRowIdSet::Many(row_ids) => {
                     for row_id in row_ids {
                         if outcome.is_some() {
@@ -22632,7 +24834,7 @@ impl EngineRuntime {
             }
         }
         let mut unbounded_lower_bound = None;
-        if let Some(cache) = paged_locator_cache {
+        if let Some(cache) = paged_locator_cache.filter(|cache| cache.matches_state(state)) {
             if let Some(min_row_id) = cache.min_row_id() {
                 unbounded_lower_bound = Some(SimpleRangeBoundValue {
                     inclusive: true,
@@ -23401,7 +25603,6 @@ impl EngineRuntime {
                 let mut ordered = entries
                     .iter()
                     .filter(|(_, row_id)| !deleted.contains(row_id))
-                    .map(|(key, row_id)| (*key, *row_id))
                     .collect::<Vec<_>>();
                 let window = offset.saturating_add(take).min(ordered.len());
                 if window == 0 {
@@ -23435,7 +25636,7 @@ impl EngineRuntime {
             RuntimeBtreeKeys::NonUniqueInt64(entries, deleted) => {
                 let mut ordered = entries
                     .iter()
-                    .map(|(key, row_ids)| (*key, row_ids.as_slice()))
+                    .map(|(key, row_ids)| (key, row_ids.to_vec()))
                     .collect::<Vec<_>>();
                 ordered.sort_unstable_by_key(|(key, _)| *key);
                 let mut skipped = 0usize;
@@ -23445,8 +25646,7 @@ impl EngineRuntime {
                 } else {
                     ordered
                 };
-                for (_, ids) in ordered {
-                    let mut ids = ids.to_vec();
+                for (_, mut ids) in ordered {
                     ids.sort_unstable();
                     for row_id in ids {
                         if deleted.contains(&row_id) {
@@ -26477,9 +28677,9 @@ impl EngineRuntime {
                 if join_values.len() == 1 {
                     keys.row_ids_for_value_set(join_values[0])?
                 } else {
-                    keys.row_id_set_for_key(&RuntimeBtreeKey::Encoded(
+                    keys.row_id_set_for_key(&RuntimeBtreeKey::Encoded(RuntimeEncodedKey::from_vec(
                         Row::new(join_values.into_iter().cloned().collect()).encode()?,
-                    ))
+                    )))
                 }
             } else if join_values.len() == 1 {
                 match join_values[0] {
@@ -26765,7 +28965,9 @@ impl EngineRuntime {
                         keys.row_ids_for_value_set(join_values[0])?
                     } else {
                         keys.row_id_set_for_key(&RuntimeBtreeKey::Encoded(
-                            Row::new(join_values.into_iter().cloned().collect()).encode()?,
+                            RuntimeEncodedKey::from_vec(
+                                Row::new(join_values.into_iter().cloned().collect()).encode()?,
+                            ),
                         ))
                     }
                 } else if join_values.len() == 1 {
@@ -28747,6 +30949,23 @@ struct IndexedJoinGroupedCountPlan<'a> {
     offset: usize,
 }
 
+impl IndexedJoinGroupedCountPlan<'_> {
+    fn scalar_count_top_n_limit(&self) -> Option<usize> {
+        let order_by = self.order_by.as_deref()?;
+        let [order] = order_by else {
+            return None;
+        };
+        if self.offset != 0
+            || order.projection_index != self.group_column_indexes.len()
+            || !order.descending
+            || order.collation.is_some()
+        {
+            return None;
+        }
+        self.limit
+    }
+}
+
 #[derive(Clone, Copy)]
 struct IndexedJoinLimitTablePlan<'a> {
     name: &'a str,
@@ -29091,6 +31310,11 @@ impl<'a, S: PageStore> OverflowPayloadCursor<'a, S> {
             }
             let next_page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
             let chunk_len = u32::from_le_bytes(page[4..8].try_into().expect("header chunk len"));
+            if chunk_len == 0 {
+                return Err(DbError::corruption(
+                    "overflow chunk made no progress toward logical payload length",
+                ));
+            }
             let chunk_end = OVERFLOW_HEADER_SIZE + chunk_len as usize;
             if chunk_end > page.len() {
                 return Err(DbError::corruption(
@@ -29229,10 +31453,7 @@ fn build_runtime_index(
             let uuid_keys = btree_uses_typed_uuid_keys(index, table);
             let mut covering = covering_payloads_for_index(index, table);
             if index.unique && int64_keys {
-                let mut keys = HashMap::with_capacity_and_hasher(
-                    source.row_count(),
-                    Int64HashBuilder::default(),
-                );
+                let mut keys = UniqueInt64Keys::new();
                 for row in source.rows() {
                     let row = row?;
                     let Some(key) = compute_index_key(runtime, index, table, row.values())? else {
@@ -29292,7 +31513,7 @@ fn build_runtime_index(
                     covering,
                 })
             } else if index.unique {
-                let mut keys = BTreeMap::<Vec<u8>, i64>::new();
+                let mut keys = BTreeMap::<RuntimeEncodedKey, i64>::new();
                 for row in source.rows() {
                     let row = row?;
                     let Some(key) = compute_index_key(runtime, index, table, row.values())? else {
@@ -29322,10 +31543,7 @@ fn build_runtime_index(
                     covering,
                 })
             } else if int64_keys {
-                let mut keys: Int64Map<Vec<i64>> = HashMap::with_capacity_and_hasher(
-                    source.row_count(),
-                    Int64HashBuilder::default(),
-                );
+                let mut keys = NonUniqueInt64Keys::new();
                 for row in source.rows() {
                     let row = row?;
                     let Some(key) = compute_index_key(runtime, index, table, row.values())? else {
@@ -29336,7 +31554,7 @@ fn build_runtime_index(
                             "typed INT64 runtime index received an encoded key",
                         ));
                     };
-                    keys.entry(key).or_default().push(row.row_id());
+                    keys.insert_row_id(key, row.row_id());
                     if let Some(covering) = covering.as_mut() {
                         if let Some(values) =
                             covering_payload_values_for_row(index, table, row.values())
@@ -29375,7 +31593,7 @@ fn build_runtime_index(
                     covering,
                 })
             } else {
-                let mut keys = BTreeMap::<Vec<u8>, Vec<i64>>::new();
+                let mut keys = BTreeMap::<RuntimeEncodedKey, RuntimeEncodedRowIds>::new();
                 // Pre-parse the partial-index predicate once instead of
                 // re-parsing the predicate SQL for every row in the table
                 // (row_satisfies_index_predicate parses on each call). Also
@@ -29427,7 +31645,7 @@ fn build_runtime_index(
                         // directly from the borrowed row slice, avoiding the
                         // intermediate Value clone that compute_index_values
                         // would perform.
-                        encode_index_key(&values[position])?
+                        encode_runtime_index_key(&values[position])?
                     } else if let Some(positions) = &multi_column_positions {
                         // Fast path for composite plain-column indexes: read
                         // each indexed column value by position and encode the
@@ -29439,7 +31657,7 @@ fn build_runtime_index(
                         if index.unique && key_values.iter().any(|v| matches!(v, Value::Null)) {
                             continue;
                         }
-                        Row::new(key_values).encode()?
+                        RuntimeEncodedKey::from_vec(Row::new(key_values).encode()?)
                     } else {
                         let Some(encoded) = compute_index_key(runtime, index, table, values)?
                         else {
@@ -29452,7 +31670,14 @@ fn build_runtime_index(
                         };
                         encoded
                     };
-                    keys.entry(key).or_default().push(row.row_id());
+                    match keys.entry(key) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(RuntimeEncodedRowIds::one(row.row_id()));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            entry.get_mut().push(row.row_id());
+                        }
+                    }
                     if let Some(covering) = covering.as_mut() {
                         if let Some(values) = covering_payload_values_for_row(index, table, values)
                         {
@@ -29461,7 +31686,10 @@ fn build_runtime_index(
                     }
                 }
                 Ok(RuntimeIndex::Btree {
-                    keys: RuntimeBtreeKeys::NonUniqueEncoded(Arc::new(keys), BTreeSet::new()),
+                    keys: RuntimeBtreeKeys::NonUniqueEncoded(
+                        Arc::new(RuntimeEncodedPostings::new(keys)),
+                        BTreeSet::new(),
+                    ),
                     covering,
                 })
             }
@@ -29805,7 +32033,9 @@ pub(super) fn compute_index_key_with_predicate(
         if index.unique && matches!(value, Value::Null) {
             return Ok(None);
         }
-        return Ok(Some(RuntimeBtreeKey::Encoded(encode_index_key(&value)?)));
+        return Ok(Some(RuntimeBtreeKey::Encoded(encode_runtime_index_key(
+            value,
+        )?)));
     }
     if let Some(positions) = plain_index_column_positions(index, table) {
         if positions.len() > 1 {
@@ -29821,7 +32051,9 @@ pub(super) fn compute_index_key_with_predicate(
             if index.unique && values.iter().any(|value| matches!(value, Value::Null)) {
                 return Ok(None);
             }
-            return Ok(Some(RuntimeBtreeKey::Encoded(Row::new(values).encode()?)));
+            return Ok(Some(RuntimeBtreeKey::Encoded(RuntimeEncodedKey::from_vec(
+                Row::new(values).encode()?,
+            ))));
         }
     }
     let values = compute_index_values(runtime, index, table, row_values)?;
@@ -29829,9 +32061,9 @@ pub(super) fn compute_index_key_with_predicate(
         return Ok(None);
     }
     let key = if values.len() == 1 {
-        encode_index_key(&values[0])?
+        encode_runtime_index_key(&values[0])?
     } else {
-        Row::new(values).encode()?
+        RuntimeEncodedKey::from_vec(Row::new(values).encode()?)
     };
     Ok(Some(RuntimeBtreeKey::Encoded(key)))
 }
@@ -29840,11 +32072,11 @@ pub(super) fn compute_index_key_with_predicate(
 /// stored column (no expression, no virtual generated column). Reads the value
 /// directly by position without building a `Dataset` or cloning the full row,
 /// which is the hot path for index maintenance during bulk DML.
-fn compute_single_column_index_key_fast(
+fn compute_single_column_index_key_fast<'a>(
     index: &IndexSchema,
     table: &TableSchema,
-    row_values: &[Value],
-) -> Result<Option<Value>> {
+    row_values: &'a [Value],
+) -> Result<Option<&'a Value>> {
     if index.columns.len() != 1 {
         return Ok(None);
     }
@@ -29874,7 +32106,7 @@ fn compute_single_column_index_key_fast(
     let Some(value) = row_values.get(position) else {
         return Ok(None);
     };
-    Ok(Some(value.clone()))
+    Ok(Some(value))
 }
 
 pub(super) fn spatial_index_backend(
@@ -31555,6 +33787,29 @@ fn visit_table_payload_int64_column_from_pointer<S: PageStore, F>(
     store: &S,
     pointer: OverflowPointer,
     column_index: usize,
+    tombstoned_row_ids: Option<&[i64]>,
+    visitor: &mut F,
+) -> Result<usize>
+where
+    F: FnMut(i64, Option<i64>) -> Result<()>,
+{
+    let mut payload_scratch = Vec::new();
+    visit_table_payload_int64_column_from_pointer_with_scratch(
+        store,
+        pointer,
+        column_index,
+        tombstoned_row_ids,
+        &mut payload_scratch,
+        visitor,
+    )
+}
+
+fn visit_table_payload_int64_column_from_pointer_with_scratch<S: PageStore, F>(
+    store: &S,
+    pointer: OverflowPointer,
+    column_index: usize,
+    tombstoned_row_ids: Option<&[i64]>,
+    payload_scratch: &mut Vec<u8>,
     visitor: &mut F,
 ) -> Result<usize>
 where
@@ -31563,30 +33818,13 @@ where
     if pointer.head_page_id == 0 || pointer.logical_len == 0 {
         return Ok(0);
     }
-    if pointer.is_compressed() {
-        let payload = read_overflow(store, pointer)?;
-        return visit_table_payload_int64_column_from_bytes(&payload, column_index, None, visitor);
-    }
-
-    let mut cursor = OverflowPayloadCursor::new(store, pointer);
-    let mut magic = [0_u8; TABLE_PAYLOAD_MAGIC.len()];
-    cursor.read_exact(&mut magic)?;
-    if magic != *TABLE_PAYLOAD_MAGIC {
-        return Err(DbError::corruption("table payload magic is invalid"));
-    }
-    let row_count = cursor.read_u32()? as usize;
-    let mut visited = 0usize;
-    for _ in 0..row_count {
-        let row_id = cursor.read_i64()?;
-        let (is_tombstone, row_bytes_len) = split_table_payload_row_len(cursor.read_u32()?);
-        let row_bytes = cursor.read_vec(row_bytes_len)?;
-        if is_tombstone {
-            continue;
-        }
-        visitor(row_id, Row::decode_int64_at(&row_bytes, column_index)?)?;
-        visited += 1;
-    }
-    Ok(visited)
+    read_overflow_into(store, pointer, payload_scratch)?;
+    visit_table_payload_int64_column_from_bytes(
+        payload_scratch,
+        column_index,
+        tombstoned_row_ids,
+        visitor,
+    )
 }
 
 fn visit_persisted_table_int64_column<S: PageStore, F>(
@@ -31606,6 +33844,7 @@ where
             store,
             state.pointer,
             column_index,
+            None,
             &mut visitor,
         )?;
         if state.row_count != 0 && row_count != state.row_count {
@@ -31622,6 +33861,7 @@ where
     }
     let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
     let mut total_row_count = 0usize;
+    let mut payload_scratch = Vec::new();
     for chunk in manifest.chunks {
         let mut count = 0usize;
         let tombstones = if chunk.tombstoned_row_ids.is_empty() {
@@ -31630,20 +33870,22 @@ where
             Some(chunk.tombstoned_row_ids.as_slice())
         };
 
-        let base_payload = read_overflow(store, chunk.pointer)?;
-        count += visit_table_payload_int64_column_from_bytes(
-            &base_payload,
+        count += visit_table_payload_int64_column_from_pointer_with_scratch(
+            store,
+            chunk.pointer,
             column_index,
             tombstones,
+            &mut payload_scratch,
             &mut visitor,
         )?;
 
         if let Some(overlay_pointer) = chunk.overlay_pointer {
-            let overlay_payload = read_overflow(store, overlay_pointer)?;
-            count += visit_table_payload_int64_column_from_bytes(
-                &overlay_payload,
+            count += visit_table_payload_int64_column_from_pointer_with_scratch(
+                store,
+                overlay_pointer,
                 column_index,
                 None,
+                &mut payload_scratch,
                 &mut visitor,
             )?;
         }
@@ -32121,15 +34363,16 @@ fn try_apply_paged_row_deletions_to_manifest_without_base_decode(
     manifest: &TablePageManifest,
     deleted_row_ids: &BTreeSet<i64>,
 ) -> Result<Option<TablePageManifest>> {
-    let mut planned_deletions = Vec::with_capacity(deleted_row_ids.len());
+    let mut planned_deletions = Vec::new();
+    try_reserve_paged_directory(
+        &mut planned_deletions,
+        deleted_row_ids.len(),
+        "paged row deletions",
+    )?;
     for &row_id in deleted_row_ids {
-        let Ok(entry_index) = manifest
-            .rows
-            .binary_search_by_key(&row_id, |entry| entry.row_id)
-        else {
+        let Some((entry_index, entry)) = manifest.rows.entry_for_row_id(row_id)? else {
             continue;
         };
-        let entry = manifest.rows[entry_index];
         if entry.is_overlay {
             return Ok(None);
         }
@@ -32150,9 +34393,11 @@ fn try_apply_paged_row_deletions_to_manifest_without_base_decode(
     let tombstoned_row_ids = Arc::make_mut(&mut updated_manifest.tombstoned_row_ids);
 
     let mut remaining_deletions = planned_deletions.iter().peekable();
-    let source_rows = manifest.rows.as_ref();
-    let mut rebuilt_rows = Vec::with_capacity(source_rows.len() - planned_deletions.len());
-    for (entry_index, entry) in source_rows.iter().copied().enumerate() {
+    let rebuilt_len = manifest.rows.len().saturating_sub(planned_deletions.len());
+    let mut rebuilt_rows = Vec::new();
+    try_reserve_paged_directory(&mut rebuilt_rows, rebuilt_len, "sparse paged row entries")?;
+    for (entry_index, entry) in manifest.rows.iter().enumerate() {
+        let entry = entry?;
         if remaining_deletions
             .peek()
             .is_some_and(|(delete_entry_index, _, _)| *delete_entry_index == entry_index)
@@ -32162,7 +34407,7 @@ fn try_apply_paged_row_deletions_to_manifest_without_base_decode(
         }
         rebuilt_rows.push(entry);
     }
-    updated_manifest.rows = Arc::new(rebuilt_rows);
+    updated_manifest.rows = Arc::new(TablePageDirectory::Sparse(rebuilt_rows));
 
     for &(_, chunk_index, row_id) in &planned_deletions {
         let chunk = chunks.get_mut(chunk_index).ok_or_else(|| {
@@ -32332,10 +34577,12 @@ fn rebuild_table_page_manifest_after_sparse_chunk_changes(
         .iter()
         .flat_map(|chunk| chunk.tombstoned_row_ids.iter().copied())
         .collect::<BTreeSet<_>>();
-    let mut rows = Vec::with_capacity(manifest.rows.len());
+    let mut rows = Vec::new();
+    try_reserve_paged_directory(&mut rows, manifest.rows.len(), "sparse paged row entries")?;
     for entry in manifest.rows.iter() {
+        let entry = entry?;
         if !changed_chunk_indexes.contains(&(entry.chunk_index as usize)) {
-            rows.push(*entry);
+            rows.push(entry);
         }
     }
     for chunk_index in changed_chunk_indexes {
@@ -32363,7 +34610,7 @@ fn rebuild_table_page_manifest_after_sparse_chunk_changes(
 
     Ok(TablePageManifest {
         chunks: Arc::new(new_chunks),
-        rows: Arc::new(rows),
+        rows: Arc::new(TablePageDirectory::Sparse(rows)),
         tombstoned_row_ids: Arc::new(tombstoned_row_ids),
     })
 }
@@ -35952,7 +38199,7 @@ fn row_ids_for_simple_indexed_projection_lookup<'a>(
         )
         .collect::<Vec<_>>();
     Ok(SimpleIndexedProjectionRowIds::Owned(keys.row_ids_for_key(
-        &RuntimeBtreeKey::Encoded(Row::new(values).encode()?),
+        &RuntimeBtreeKey::Encoded(RuntimeEncodedKey::from_vec(Row::new(values).encode()?)),
     )))
 }
 
@@ -37749,6 +39996,47 @@ enum DeferredViewTableRowReader<'a> {
 }
 
 impl<'a> DeferredViewTableRowReader<'a> {
+    /// Reads from data already owned by the observed-current runtime.
+    ///
+    /// The outer `Option` reports whether the lookup can be completed without
+    /// storage; the inner `Option` distinguishes an absent row from a row that
+    /// was decoded successfully. Verified paged payloads were checksummed when
+    /// the immutable locator cache was built.
+    fn read_projected_from_observed_cache(
+        &self,
+        row_id: i64,
+        projection_indexes: &[usize],
+    ) -> Result<Option<Option<StoredRow>>> {
+        match *self {
+            Self::Source(source) => source
+                .projected_values_by_id(row_id, projection_indexes)
+                .map(|values| Some(values.map(|values| StoredRow { row_id, values }))),
+            Self::Deferred {
+                state,
+                paged_locator_cache,
+                ..
+            } => {
+                let Some(cache) = paged_locator_cache.filter(|cache| cache.matches_state(state))
+                else {
+                    return Ok(None);
+                };
+                let Some(cached) = cache.locators.get(row_id) else {
+                    return Ok(Some(None));
+                };
+                let Some(payload) = cache.verified_payload(cached.pointer, cached.checksum) else {
+                    return Ok(None);
+                };
+                decode_projected_values_by_locator_from_payload::<page::InMemoryPageStore>(
+                    None,
+                    payload,
+                    cached.locator,
+                    projection_indexes,
+                )
+                .map(|values| Some(Some(StoredRow { row_id, values })))
+            }
+        }
+    }
+
     fn read_projected_with_chunk_cache<S: PageStore>(
         &self,
         store: &S,
@@ -37779,8 +40067,7 @@ impl<'a> DeferredViewTableRowReader<'a> {
                     {
                         return cache
                             .locators
-                            .get(&row_id)
-                            .copied()
+                            .get(row_id)
                             .map(|cached| {
                                 read_deferred_projected_values_by_cached_paged_locator_with_query_cache(
                                     store,
@@ -38924,7 +41211,6 @@ where
             let mut ordered = entries
                 .iter()
                 .filter(|(_, row_id)| !deleted.contains(row_id))
-                .map(|(key, row_id)| (*key, *row_id))
                 .collect::<Vec<_>>();
             ordered.sort_unstable_by_key(|(key, _)| *key);
             if descending {
@@ -38939,14 +41225,13 @@ where
         RuntimeBtreeKeys::NonUniqueInt64(entries, deleted) => {
             let mut ordered = entries
                 .iter()
-                .map(|(key, row_ids)| (*key, row_ids.as_slice()))
+                .map(|(key, row_ids)| (key, row_ids.to_vec()))
                 .collect::<Vec<_>>();
             ordered.sort_unstable_by_key(|(key, _)| *key);
             if descending {
                 ordered.reverse();
             }
-            for (_, row_ids) in ordered {
-                let mut row_ids = row_ids.to_vec();
+            for (_, mut row_ids) in ordered {
                 row_ids.sort_unstable();
                 for row_id in row_ids {
                     if !deleted.contains(&row_id) && visitor(row_id)? {
@@ -39809,16 +42094,31 @@ fn build_deferred_paged_row_locator_cache(
     state: PersistedTableState,
     chunks: &[TablePageManifestChunk],
 ) -> Result<DeferredPagedRowLocatorCache> {
-    let expected_locators = chunks
-        .iter()
-        .map(|chunk| {
-            chunk
-                .row_count
-                .saturating_add(chunk.overlay_payload.is_some() as usize)
-        })
-        .sum();
-    let mut locators =
-        Int64Map::with_capacity_and_hasher(expected_locators, Int64HashBuilder::default());
+    let mut locators = if let Some(directory) = try_build_dense_paged_row_directory(chunks)? {
+        let mut sources = Vec::new();
+        try_reserve_paged_directory(&mut sources, chunks.len(), "deferred paged chunk sources")?;
+        sources.extend(chunks.iter().map(|chunk| CachedPagedChunkSource {
+            pointer: chunk.pointer,
+            checksum: chunk.checksum,
+        }));
+        DeferredPagedRowLocators::Dense {
+            directory,
+            chunks: sources,
+        }
+    } else {
+        let expected_locators = chunks.iter().try_fold(0usize, |total, chunk| {
+            total
+                .checked_add(chunk.row_count)
+                .ok_or_else(|| DbError::constraint("paged table row count overflow"))
+        })?;
+        let mut sparse = Int64Map::with_hasher(Int64HashBuilder::default());
+        sparse.try_reserve(expected_locators).map_err(|error| {
+            DbError::internal(format!(
+                "failed to reserve {expected_locators} deferred paged row locators: {error}"
+            ))
+        })?;
+        DeferredPagedRowLocators::Sparse(sparse)
+    };
     let mut verified_payloads = HashMap::new();
     let mut cached_payload_bytes = 0usize;
     for chunk in chunks {
@@ -39829,13 +42129,15 @@ fn build_deferred_paged_row_locator_cache(
             chunk.checksum,
             &chunk.payload,
         );
-        append_cached_paged_row_locators(
-            &mut locators,
-            chunk.payload.as_slice(),
-            chunk.pointer,
-            chunk.checksum,
-            &chunk.tombstoned_row_ids,
-        )?;
+        if let DeferredPagedRowLocators::Sparse(sparse) = &mut locators {
+            append_cached_paged_row_locators(
+                sparse,
+                chunk.payload.as_slice(),
+                chunk.pointer,
+                chunk.checksum,
+                &chunk.tombstoned_row_ids,
+            )?;
+        }
         if let (Some(overlay_pointer), Some(overlay_checksum), Some(overlay_payload)) = (
             chunk.overlay_pointer,
             chunk.overlay_checksum,
@@ -39848,13 +42150,15 @@ fn build_deferred_paged_row_locator_cache(
                 overlay_checksum,
                 overlay_payload,
             );
-            append_cached_paged_row_locators(
-                &mut locators,
-                overlay_payload.as_slice(),
-                overlay_pointer,
-                overlay_checksum,
-                &BTreeSet::new(),
-            )?;
+            if let DeferredPagedRowLocators::Sparse(sparse) = &mut locators {
+                append_cached_paged_row_locators(
+                    sparse,
+                    overlay_payload.as_slice(),
+                    overlay_pointer,
+                    overlay_checksum,
+                    &BTreeSet::new(),
+                )?;
+            }
         }
     }
     Ok(DeferredPagedRowLocatorCache {
@@ -40499,8 +42803,7 @@ fn read_deferred_stored_row_by_id<S: PageStore>(
         if let Some(cache) = paged_locator_cache.filter(|cache| cache.matches_state(state)) {
             return cache
                 .locators
-                .get(&row_id)
-                .copied()
+                .get(row_id)
                 .map(|cached| {
                     read_deferred_row_by_cached_paged_locator(
                         store,
@@ -40571,7 +42874,7 @@ fn read_deferred_projected_values_by_id<S: PageStore>(
         if state.pointer.is_table_paged_manifest()
             && paged_locator_cache
                 .filter(|cache| cache.matches_state(state))
-                .and_then(|cache| cache.locators.get(&row_id).copied())
+                .and_then(|cache| cache.locators.get(row_id))
                 .is_some()
         {
             return Ok(Some(Vec::new()));
@@ -40592,8 +42895,7 @@ fn read_deferred_projected_values_by_id<S: PageStore>(
         if let Some(cache) = paged_locator_cache.filter(|cache| cache.matches_state(state)) {
             return cache
                 .locators
-                .get(&row_id)
-                .copied()
+                .get(row_id)
                 .map(|cached| {
                     read_deferred_projected_values_by_cached_paged_locator(
                         store,
@@ -41394,6 +43696,19 @@ fn accumulate_genre_popularity_movie(
                 );
             }
         }
+        RuntimeRowIdSet::Contiguous { start, len } => {
+            for row_id in contiguous_row_ids(start, len) {
+                if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                    accumulate_genre_popularity_rating(
+                        movie_row.values(),
+                        movie_rating_index,
+                        movie_count,
+                        rating_sum,
+                        rating_count,
+                    );
+                }
+            }
+        }
         RuntimeRowIdSet::Many(row_ids) => {
             for row_id in row_ids {
                 if let Some(movie_row) = movie_source.row_by_id(*row_id)? {
@@ -41487,6 +43802,19 @@ fn push_movie_tag_search_movie_rows(
                     bounded_order,
                     rows,
                 )?;
+            }
+        }
+        RuntimeRowIdSet::Contiguous { start, len } => {
+            for row_id in contiguous_row_ids(start, len) {
+                if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                    push_movie_tag_search_projected_row(
+                        runtime,
+                        movie_row.values(),
+                        projection_indexes,
+                        bounded_order,
+                        rows,
+                    )?;
+                }
             }
         }
         RuntimeRowIdSet::Many(row_ids) => {
@@ -41584,6 +43912,22 @@ fn insert_movie_watchlist_group_rows(
                     review_score_index,
                     groups,
                 )?;
+            }
+        }
+        RuntimeRowIdSet::Contiguous { start, len } => {
+            for row_id in contiguous_row_ids(start, len) {
+                if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                    insert_movie_watchlist_group_row(
+                        movie_row.values(),
+                        priority,
+                        review_source,
+                        review_movie_keys,
+                        movie_id_index,
+                        movie_title_index,
+                        review_score_index,
+                        groups,
+                    )?;
+                }
             }
         }
         RuntimeRowIdSet::Many(row_ids) => {
@@ -41774,6 +44118,18 @@ fn push_movie_busiest_people_row(
                 );
             }
         }
+        RuntimeRowIdSet::Contiguous { start, len } => {
+            for row_id in contiguous_row_ids(start, len) {
+                if let Some(people_row) = people_source.row_by_id(row_id)? {
+                    push_movie_busiest_people_projected_row(
+                        people_row.values(),
+                        candidate.role_count,
+                        projection_indexes,
+                        rows,
+                    );
+                }
+            }
+        }
         RuntimeRowIdSet::Many(row_ids) => {
             for row_id in row_ids {
                 if let Some(people_row) = people_source.row_by_id(*row_id)? {
@@ -41841,6 +44197,13 @@ fn movie_review_score_stats(
                 visit_review(review_row)?;
             }
         }
+        RuntimeRowIdSet::Contiguous { start, len } => {
+            for row_id in contiguous_row_ids(start, len) {
+                if let Some(review_row) = review_source.row_by_id(row_id)? {
+                    visit_review(review_row)?;
+                }
+            }
+        }
         RuntimeRowIdSet::Many(row_ids) => {
             for row_id in row_ids {
                 if let Some(review_row) = review_source.row_by_id(*row_id)? {
@@ -41885,6 +44248,17 @@ fn accumulate_directors_cte_movie(
         RuntimeRowIdSet::Single(row_id) => {
             if let Some(movie_row) = movie_source.row_by_id(row_id)? {
                 accumulator.add_movie(movie_row.values(), movie_title_index, movie_rating_index);
+            }
+        }
+        RuntimeRowIdSet::Contiguous { start, len } => {
+            for row_id in contiguous_row_ids(start, len) {
+                if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                    accumulator.add_movie(
+                        movie_row.values(),
+                        movie_title_index,
+                        movie_rating_index,
+                    );
+                }
             }
         }
         RuntimeRowIdSet::Many(row_ids) => {

@@ -34,6 +34,11 @@ impl RuntimeTraceState {
         connection_id: u64,
         database_id_hash: String,
     ) -> Self {
+        let recent_session_capacity = if config.enabled && config.sessions.enabled {
+            config.sessions.max_recent_sessions.clamp(1, 16_384)
+        } else {
+            0
+        };
         Self {
             config: config.clone(),
             connection_id,
@@ -53,7 +58,7 @@ impl RuntimeTraceState {
                 },
             )),
             recent_sessions: Mutex::new(RecentSessionBuffer::with_capacity(
-                config.sessions.max_recent_sessions.clamp(1, 16384),
+                recent_session_capacity,
             )),
             slow_query_counter: AtomicU64::new(0),
         }
@@ -327,5 +332,109 @@ impl RuntimeTraceSink for RuntimeTraceState {
 
     fn reset(&self, family: crate::tracing::events::RuntimeTraceFamily) {
         self.reset(family)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracing::config::{
+        IndexUsageTraceConfig, LockWaitTraceConfig, SessionTraceConfig, SlowQueryTraceConfig,
+    };
+
+    #[test]
+    fn globally_disabled_state_allocates_no_family_buffers() {
+        let config = RuntimeTracingConfig {
+            enabled: false,
+            slow_query: SlowQueryTraceConfig {
+                enabled: true,
+                threshold_us: 1,
+                ..Default::default()
+            },
+            lock_wait: LockWaitTraceConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            index_usage: IndexUsageTraceConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            sessions: SessionTraceConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let state = RuntimeTraceState::new(&config, 1, "hash".to_string());
+
+        assert_eq!(
+            state
+                .slow_query_store
+                .lock()
+                .expect("slow-query store")
+                .allocated_capacity(),
+            0
+        );
+        assert_eq!(
+            state
+                .lock_wait_store
+                .lock()
+                .expect("lock-wait store")
+                .allocated_capacity(),
+            0
+        );
+        let index_usage = state.index_usage_store.lock().expect("index-usage store");
+        assert_eq!(index_usage.allocated_capacities(), (0, 0));
+        drop(index_usage);
+        assert_eq!(
+            state
+                .recent_sessions
+                .lock()
+                .expect("recent sessions")
+                .allocated_capacity(),
+            0
+        );
+    }
+
+    #[test]
+    fn enabled_session_buffer_reserves_configured_capacity() {
+        let config = RuntimeTracingConfig {
+            enabled: true,
+            sessions: SessionTraceConfig {
+                enabled: true,
+                max_recent_sessions: 7,
+            },
+            ..Default::default()
+        };
+        let state = RuntimeTraceState::new(&config, 1, "hash".to_string());
+        assert_eq!(
+            state
+                .recent_sessions
+                .lock()
+                .expect("recent sessions")
+                .allocated_capacity(),
+            7
+        );
+    }
+
+    #[test]
+    fn disabled_session_family_does_not_allocate() {
+        let config = RuntimeTracingConfig {
+            enabled: true,
+            sessions: SessionTraceConfig {
+                enabled: false,
+                max_recent_sessions: 256,
+            },
+            ..Default::default()
+        };
+        let state = RuntimeTraceState::new(&config, 1, "hash".to_string());
+        assert_eq!(
+            state
+                .recent_sessions
+                .lock()
+                .expect("recent sessions")
+                .allocated_capacity(),
+            0
+        );
     }
 }

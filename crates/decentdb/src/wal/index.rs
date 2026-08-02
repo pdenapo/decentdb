@@ -90,6 +90,25 @@ impl WalVersion {
             },
         }
     }
+
+    /// Construct a self-contained version whose payload is read from the WAL
+    /// file on demand. Only full Page frames can be published this way by the
+    /// writer without retaining a materialized base chain in memory.
+    pub(crate) fn on_disk(
+        lsn: u64,
+        wal_offset: u64,
+        frame_len: u32,
+        encoding: FrameEncoding,
+    ) -> Self {
+        Self {
+            lsn,
+            payload: WalVersionPayload::OnDisk {
+                wal_offset,
+                frame_len,
+                encoding,
+            },
+        }
+    }
 }
 
 /// Inline storage for the common single-version-per-page case (slice M7).
@@ -261,9 +280,17 @@ impl WalIndex {
                         data,
                         wal_offset,
                         frame_len,
-                        encoding,
-                    } => Some((*wal_offset, *frame_len, *encoding, data.len())),
-                    WalVersionPayload::OnDisk { .. } => None,
+                        encoding: FrameEncoding::Page,
+                    } => Some((*wal_offset, *frame_len, FrameEncoding::Page, data.len())),
+                    // A resident delta can be the only complete page image
+                    // left after latest-version replacement. Without stable
+                    // base provenance, demoting it could make later reads
+                    // replay against a stale main-database page.
+                    WalVersionPayload::Resident {
+                        encoding: FrameEncoding::PageDelta,
+                        ..
+                    }
+                    | WalVersionPayload::OnDisk { .. } => None,
                 }) else {
                     continue;
                 };

@@ -43,7 +43,11 @@ pub(crate) struct LockWaitStore {
 
 impl LockWaitStore {
     pub(crate) fn new(config: &RuntimeTracingConfig) -> Self {
-        let capacity = config.lock_wait.max_events.clamp(1, 16_384);
+        let capacity = if config.enabled && config.lock_wait.enabled {
+            config.lock_wait.max_events.clamp(1, 16_384)
+        } else {
+            0
+        };
         Self {
             config: config.clone(),
             buffer: BoundedRingBuffer::with_capacity(capacity),
@@ -91,5 +95,45 @@ impl LockWaitStore {
 
     pub(crate) fn reset(&mut self) {
         self.buffer.reset();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocated_capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracing::config::LockWaitTraceConfig;
+
+    #[test]
+    fn disabled_store_does_not_allocate() {
+        let config = RuntimeTracingConfig {
+            enabled: true,
+            lock_wait: LockWaitTraceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let store = LockWaitStore::new(&config);
+        assert_eq!(store.allocated_capacity(), 0);
+    }
+
+    #[test]
+    fn enabled_store_reserves_configured_capacity() {
+        let config = RuntimeTracingConfig {
+            enabled: true,
+            lock_wait: LockWaitTraceConfig {
+                enabled: true,
+                max_events: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let store = LockWaitStore::new(&config);
+        assert_eq!(store.allocated_capacity(), 7);
     }
 }

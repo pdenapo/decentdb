@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::error::Result;
 
-use super::{FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
+use super::{BootstrapSyncReservation, FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BenchVfsFileStats {
@@ -193,6 +193,12 @@ impl Vfs for StatsVfs {
 
     fn supports_file_locks(&self) -> bool {
         self.inner.supports_file_locks()
+    }
+
+    fn concurrent_bootstrap_sync_reservation(
+        &self,
+    ) -> Option<Box<dyn BootstrapSyncReservation + '_>> {
+        self.inner.concurrent_bootstrap_sync_reservation()
     }
 }
 

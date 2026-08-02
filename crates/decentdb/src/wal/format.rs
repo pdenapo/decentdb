@@ -7,7 +7,7 @@
 //! - design/adr/0068-wal-header-end-offset.md
 
 use crate::error::{DbError, Result};
-use crate::storage::page::PageId;
+use crate::storage::page::{is_supported_page_size, PageId};
 use crate::vfs::{read_exact_at, VfsFile};
 
 use super::delta::DELTA_FRAME_PAYLOAD_SIZE;
@@ -147,6 +147,7 @@ impl WalFrame {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn checkpoint(checkpoint_lsn: u64) -> Self {
         Self {
@@ -166,6 +167,7 @@ impl WalFrame {
         }
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
     pub(crate) fn encode(&self, page_size: u32) -> Result<Vec<u8>> {
         let expected_payload = self.frame_type.payload_size(page_size);
         if self.payload.len() != expected_payload {
@@ -240,6 +242,139 @@ impl WalFrame {
             page_id,
             payload,
         }))
+    }
+
+    /// Decodes a WAL frame whose total byte length is already known (from the
+    /// WAL index's `WalVersion::frame_len`), reading the whole frame in a
+    /// single `pread` instead of separate header/body reads. This halves the
+    /// syscall count for materializing demoted (OnDisk) versions, which is the
+    /// dominant checkpoint-copyback and cold-read cost when many versions have
+    /// been demoted out of the resident hot set.
+    pub(crate) fn decode_from_file_with_len(
+        file: &dyn VfsFile,
+        offset: u64,
+        frame_len: u32,
+        page_size: u32,
+        logical_end: u64,
+    ) -> Result<Option<Self>> {
+        if offset >= logical_end {
+            return Ok(None);
+        }
+        let total_len = frame_len as usize;
+        let minimum_len = FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE;
+        if total_len < minimum_len {
+            return Err(DbError::corruption(format!(
+                "WAL frame length {total_len} too small at offset {offset}"
+            )));
+        }
+        if !is_supported_page_size(page_size) {
+            return Err(DbError::corruption(format!(
+                "unsupported WAL page size {page_size}"
+            )));
+        }
+        let page_payload_len = usize::try_from(page_size)
+            .map_err(|_| DbError::corruption("WAL page size does not fit this platform"))?;
+        let maximum_payload_len = page_payload_len.max(DELTA_FRAME_PAYLOAD_SIZE).max(8);
+        let maximum_len = FRAME_HEADER_SIZE
+            .checked_add(maximum_payload_len)
+            .and_then(|len| len.checked_add(FRAME_TRAILER_SIZE))
+            .ok_or_else(|| DbError::corruption("WAL frame length limit overflows"))?;
+        if total_len > maximum_len {
+            return Err(DbError::corruption(format!(
+                "WAL frame length {total_len} exceeds maximum {maximum_len} at offset {offset}"
+            )));
+        }
+        let frame_end = offset
+            .checked_add(total_len as u64)
+            .ok_or_else(|| DbError::corruption("WAL frame end offset overflows"))?;
+        if frame_end > logical_end {
+            return Ok(None);
+        }
+
+        let mut bytes = vec![0_u8; total_len];
+        read_exact_at(file, offset, &mut bytes)?;
+        let frame_type = FrameType::try_from(bytes[0])?;
+        let page_id = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+        let payload_len = frame_type.payload_size(page_size);
+        let expected_total = FRAME_HEADER_SIZE + payload_len + FRAME_TRAILER_SIZE;
+        if expected_total != total_len {
+            return Err(DbError::corruption(format!(
+                "WAL frame length mismatch at offset {offset}: caller said {total_len}, frame type needs {expected_total}"
+            )));
+        }
+        if matches!(frame_type, FrameType::Page | FrameType::PageDelta) && page_id == 0 {
+            return Err(DbError::corruption("page WAL frame used page id 0"));
+        }
+        if !matches!(frame_type, FrameType::Page | FrameType::PageDelta) && page_id != 0 {
+            return Err(DbError::corruption(
+                "non-page WAL frame used a non-zero page id",
+            ));
+        }
+        // Reuse the one-read frame allocation for the returned payload rather
+        // than allocating and copying a second buffer.
+        bytes.copy_within(FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len, 0);
+        bytes.truncate(payload_len);
+
+        Ok(Some(Self {
+            frame_type,
+            page_id,
+            payload: bytes,
+        }))
+    }
+
+    /// Validate one complete encoded full-page frame and borrow its payload.
+    ///
+    /// Checkpoint read-ahead uses this slice-based counterpart to
+    /// `decode_from_file_with_len`: a bounded WAL span is read once, then each
+    /// indexed full-page frame is validated in place without allocating a
+    /// temporary `Vec`/`Arc` for every page. The caller must still prove that
+    /// the frame lies within the WAL's logical end before obtaining `bytes`.
+    pub(crate) fn page_payload_from_encoded_with_len(
+        bytes: &[u8],
+        expected_page_id: PageId,
+        frame_len: u32,
+        page_size: u32,
+    ) -> Result<&[u8]> {
+        if !is_supported_page_size(page_size) {
+            return Err(DbError::corruption(format!(
+                "unsupported WAL page size {page_size}"
+            )));
+        }
+        let payload_len = usize::try_from(page_size)
+            .map_err(|_| DbError::corruption("WAL page size does not fit this platform"))?;
+        let expected_len = FRAME_HEADER_SIZE
+            .checked_add(payload_len)
+            .and_then(|len| len.checked_add(FRAME_TRAILER_SIZE))
+            .ok_or_else(|| DbError::corruption("WAL full-page frame length overflows"))?;
+        let indexed_len = usize::try_from(frame_len)
+            .map_err(|_| DbError::corruption("WAL frame length does not fit this platform"))?;
+        if indexed_len != expected_len {
+            return Err(DbError::corruption(format!(
+                "WAL full-page frame length mismatch: index says {indexed_len}, expected {expected_len}"
+            )));
+        }
+        if bytes.len() != indexed_len {
+            return Err(DbError::corruption(format!(
+                "WAL full-page frame slice has {} bytes; expected {indexed_len}",
+                bytes.len()
+            )));
+        }
+        let frame_type = FrameType::try_from(bytes[0])?;
+        if frame_type != FrameType::Page {
+            return Err(DbError::corruption(format!(
+                "WAL checkpoint index expected a full Page frame, found {frame_type:?}"
+            )));
+        }
+        let page_id = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+        if page_id == 0 {
+            return Err(DbError::corruption("page WAL frame used page id 0"));
+        }
+        if page_id != expected_page_id {
+            return Err(DbError::corruption(format!(
+                "WAL frame belongs to page {page_id}, expected {expected_page_id}"
+            )));
+        }
+        Ok(&bytes[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len])
     }
 }
 

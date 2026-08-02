@@ -188,9 +188,11 @@ pub struct DbConfig {
     /// See ADR 0137 — Size-Based Auto-Checkpoint Trigger.
     pub wal_checkpoint_threshold_bytes: u64,
 
-    /// On Linux/glibc, call `malloc_trim(0)` after a successful checkpoint
-    /// to return freed heap arenas to the operating system. No-op on other
-    /// platforms regardless of value.
+    /// On Linux/glibc, allow the database to call `malloc_trim(0)` after every
+    /// successful configured checkpoint and after thresholded row-source,
+    /// runtime-compaction, or WAL-demotion releases. No-op on other platforms
+    /// regardless of value. Despite the legacy field name, `false` is the
+    /// global opt-out for DecentDB's proactive heap-release calls.
     ///
     /// Defaults to `true` on Linux/glibc and `false` elsewhere. On
     /// long-lived embedders the default removes the dominant cause of
@@ -223,6 +225,9 @@ pub struct DbConfig {
     /// in-memory hot set on demand. Multi-version reader history and
     /// delta-dependent latest versions still stay resident, and recovery
     /// still rebuilds the index in memory before post-open spill.
+    /// Cross-process coordinated databases currently keep the index in memory
+    /// even when this value is non-zero: the sidecar is a process-local cache
+    /// and is disabled until it has a shared generation/locking protocol.
     ///
     /// See ADR 0141 — Paged On-Disk WAL Index.
     pub wal_index_hot_set_pages: u32,

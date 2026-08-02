@@ -167,5 +167,159 @@ mod tests {
             prop_assert_eq!(decoded.page_id, 0);
             prop_assert_eq!(&decoded.payload, &checkpoint_lsn.to_le_bytes());
         }
+
+        /// `decode_from_file_with_len` reads the whole frame in one pread using
+        /// the caller-supplied frame length (from the WAL index). It must agree
+        /// with `decode_from_file` for page frames.
+        #[test]
+        fn decode_from_file_with_len_matches_decode_from_file_page(
+            page_id in 1u32..=u32::MAX,
+            payload in proptest::collection::vec(any::<u8>(), page::DEFAULT_PAGE_SIZE as usize..=page::DEFAULT_PAGE_SIZE as usize),
+        ) {
+            let frame = WalFrame::page(page_id, payload.clone());
+            let encoded = frame.encode(page::DEFAULT_PAGE_SIZE).expect("encode");
+            let frame_len = encoded.len() as u32;
+            let logical_end = encoded.len() as u64;
+            // Prepend a non-zero offset to prove offset handling is correct.
+            let prefix = vec![0u8; 32];
+            let mut bytes = prefix.clone();
+            bytes.extend_from_slice(&encoded);
+            let file = TestFile::new(bytes);
+            let with_len = WalFrame::decode_from_file_with_len(
+                &file, 32, frame_len, page::DEFAULT_PAGE_SIZE, logical_end + 32,
+            )
+            .expect("decode with len")
+            .expect("frame present");
+            prop_assert_eq!(with_len.frame_type, FrameType::Page);
+            prop_assert_eq!(with_len.page_id, page_id);
+            prop_assert_eq!(&with_len.payload, &payload);
+        }
+
+        /// `decode_from_file_with_len` must reject a caller-supplied length that
+        /// disagrees with the frame type's expected length (corruption guard).
+        #[test]
+        fn decode_from_file_with_len_rejects_length_mismatch(
+            page_id in 1u32..=u32::MAX,
+            payload in proptest::collection::vec(any::<u8>(), page::DEFAULT_PAGE_SIZE as usize..=page::DEFAULT_PAGE_SIZE as usize),
+        ) {
+            let frame = WalFrame::page(page_id, payload);
+            let encoded = frame.encode(page::DEFAULT_PAGE_SIZE).expect("encode");
+            let wrong_len = encoded.len() as u32 - 10;
+            let logical_end = encoded.len() as u64;
+            let file = TestFile::new(encoded);
+            let result = WalFrame::decode_from_file_with_len(
+                &file, 0, wrong_len, page::DEFAULT_PAGE_SIZE, logical_end,
+            );
+            prop_assert!(result.is_err(), "mismatched frame length must error");
+        }
+    }
+
+    #[test]
+    fn decode_from_file_with_len_rejects_oversized_length_before_allocation() {
+        let file = TestFile::new(Vec::new());
+        let error = WalFrame::decode_from_file_with_len(
+            &file,
+            0,
+            u32::MAX,
+            page::DEFAULT_PAGE_SIZE,
+            u64::MAX,
+        )
+        .expect_err("oversized frame length must be rejected");
+        assert!(error.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn decode_from_file_with_len_rejects_end_offset_overflow() {
+        let frame = WalFrame::page(1, vec![0; page::DEFAULT_PAGE_SIZE as usize]);
+        let encoded = frame.encode(page::DEFAULT_PAGE_SIZE).expect("encode");
+        let file = TestFile::new(encoded.clone());
+        let error = WalFrame::decode_from_file_with_len(
+            &file,
+            u64::MAX - 1,
+            encoded.len() as u32,
+            page::DEFAULT_PAGE_SIZE,
+            u64::MAX,
+        )
+        .expect_err("overflowing frame end must be rejected");
+        assert!(error.to_string().contains("end offset overflows"));
+    }
+
+    #[test]
+    fn decode_from_file_with_len_reports_logically_truncated_frame() {
+        let frame = WalFrame::page(1, vec![0; page::DEFAULT_PAGE_SIZE as usize]);
+        let encoded = frame.encode(page::DEFAULT_PAGE_SIZE).expect("encode");
+        let file = TestFile::new(encoded.clone());
+        let decoded = WalFrame::decode_from_file_with_len(
+            &file,
+            0,
+            encoded.len() as u32,
+            page::DEFAULT_PAGE_SIZE,
+            encoded.len() as u64 - 1,
+        )
+        .expect("truncation check should not be an I/O error");
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn encoded_full_page_payload_is_borrowed_after_strict_validation() {
+        let page_id = 73;
+        let payload = vec![0xA7; page::DEFAULT_PAGE_SIZE as usize];
+        let encoded = WalFrame::page(page_id, payload.clone())
+            .encode(page::DEFAULT_PAGE_SIZE)
+            .expect("encode page");
+
+        let decoded = WalFrame::page_payload_from_encoded_with_len(
+            &encoded,
+            page_id,
+            encoded.len() as u32,
+            page::DEFAULT_PAGE_SIZE,
+        )
+        .expect("validate encoded page");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn encoded_full_page_payload_rejects_index_identity_mismatch() {
+        let encoded = WalFrame::page(73, vec![0xA7; page::DEFAULT_PAGE_SIZE as usize])
+            .encode(page::DEFAULT_PAGE_SIZE)
+            .expect("encode page");
+
+        let error = WalFrame::page_payload_from_encoded_with_len(
+            &encoded,
+            74,
+            encoded.len() as u32,
+            page::DEFAULT_PAGE_SIZE,
+        )
+        .expect_err("wrong indexed page id must fail");
+        assert!(error.to_string().contains("belongs to page 73"));
+    }
+
+    #[test]
+    fn encoded_full_page_payload_rejects_type_and_slice_length_corruption() {
+        let mut encoded = WalFrame::page(73, vec![0xA7; page::DEFAULT_PAGE_SIZE as usize])
+            .encode(page::DEFAULT_PAGE_SIZE)
+            .expect("encode page");
+        let frame_len = encoded.len() as u32;
+        encoded[0] = FrameType::PageDelta as u8;
+        let type_error = WalFrame::page_payload_from_encoded_with_len(
+            &encoded,
+            73,
+            frame_len,
+            page::DEFAULT_PAGE_SIZE,
+        )
+        .expect_err("wrong frame type must fail");
+        assert!(type_error
+            .to_string()
+            .contains("expected a full Page frame"));
+
+        let short = &encoded[..encoded.len() - 1];
+        let length_error = WalFrame::page_payload_from_encoded_with_len(
+            short,
+            73,
+            frame_len,
+            page::DEFAULT_PAGE_SIZE,
+        )
+        .expect_err("short frame slice must fail");
+        assert!(length_error.to_string().contains("frame slice has"));
     }
 }

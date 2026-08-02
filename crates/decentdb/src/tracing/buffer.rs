@@ -58,6 +58,11 @@ impl<T> BoundedRingBuffer<T> {
         self.len
     }
 
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
     /// Reset to empty, returning previous metadata counts.
     pub fn reset(&mut self) -> (u64, u64) {
         let evictions = self.eviction_count;
@@ -206,6 +211,7 @@ mod tests {
     #[test]
     fn push_capacity_zero_is_noop() {
         let mut buf = BoundedRingBuffer::with_capacity(0);
+        assert_eq!(buf.capacity(), 0);
         buf.push_back(1);
         assert!(buf.is_empty());
         assert_eq!(buf.eviction_count, 0);
