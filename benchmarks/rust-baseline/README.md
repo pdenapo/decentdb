@@ -498,13 +498,23 @@ when comparing runs programmatically.
 
 `--report` is a **report-only** mode when used by itself: it does not run a
 benchmark. When the input directory contains `history-manifest.json`, report
-generation loads exactly those manifested results and verifies every SHA-256;
-unaccepted or provisional JSON files beside the manifest are ignored. A
-directory without a manifest retains the convenient ad-hoc behavior of loading
-all `*rust-baseline*.json` results. Runs are grouped by scale (`smoke`,
+generation loads every manifested result and verifies its SHA-256; those runs
+are labeled `verified` in the report. Additional `*rust-baseline*.json` files
+present beside the manifest — typically fresh local `--benchmark` results that
+have not been accepted into the canonical history yet — are still included but
+labeled `provisional`, so the report always reflects the latest local work
+while keeping the pinned history checksum-verified. A tampered manifested
+result still fails report generation; an unreadable provisional file is
+skipped with a warning instead of taking down the report. A directory without
+a manifest retains the convenient ad-hoc behavior of loading all
+`*rust-baseline*.json` results. Runs are grouped by scale (`smoke`,
 `medium`, `full`, `huge`) and written to `results/report.html` by default.
 `--benchmark` runs the suite first and then performs this report generation
 step automatically.
+
+Result JSON files are written atomically (temporary file plus rename) so an
+interrupted run cannot leave a truncated result that would break later report
+loading.
 
 The generated report includes:
 

@@ -1269,6 +1269,10 @@ struct HistoricalRun {
     timestamp_unix: u64,
     timestamp_label: String,
     total_runtime_seconds: f64,
+    /// True when the run file is not pinned by `history-manifest.json`: it is
+    /// shown for local comparison but is not part of the checksum-verified
+    /// canonical history.
+    provisional: bool,
     report: RunReport,
 }
 
@@ -1287,6 +1291,11 @@ struct HtmlReportData {
     generated_at_label: String,
     source_directory: String,
     total_runs: usize,
+    verified_runs: usize,
+    provisional_runs: usize,
+    has_manifest: bool,
+    skipped_inputs: Vec<String>,
+    inputs_summary: String,
     scales: Vec<ReportScaleSection>,
 }
 
@@ -1507,6 +1516,16 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Writes `contents` to `path` atomically: a sibling temporary file is
+/// written first and then renamed over `path`, so an interrupted run cannot
+/// leave a truncated JSON result that would later break report loading.
+fn write_json_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, contents)?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 fn delete_db_files(path: &Path) {
@@ -1745,7 +1764,7 @@ fn run_plan_cache_benchmark(cli: &Cli) -> anyhow::Result<()> {
     let out_path = cli
         .out_dir
         .join(format!("{datetime_stamp}-rust-baseline-plan-cache.json"));
-    fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
+    write_json_atomic(&out_path, &serde_json::to_string_pretty(&report)?)?;
     println!("\nWrote {}", out_path.display());
     delete_db_files(&base_path);
     Ok(())
@@ -2368,7 +2387,7 @@ fn run_single_benchmark_with_path(cli: &Cli, scale: Scale, db_path: PathBuf) -> 
         report.benchmark_profile.as_str(),
         scale.name
     ));
-    fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
+    write_json_atomic(&out_path, &serde_json::to_string_pretty(&report)?)?;
     println!("\nWrote {}", out_path.display());
 
     delete_db_files(&db_path);
@@ -2736,7 +2755,9 @@ fn run_sqlite_benchmark(
     // Suite modes after queries
     #[cfg(feature = "extended-suites")]
     {
-        let total_songs = u64::try_from(count).unwrap_or(0);
+        // The query_count_songs evidence above already asserted COUNT(*) ==
+        // summary.total_songs, so reuse the planned value directly.
+        let total_songs = summary.total_songs;
         if cli.latency_suite {
             run_latency_suite_sqlite(&conn, &mut report, scale, total_songs, cli)?;
         }
@@ -2780,7 +2801,7 @@ fn run_sqlite_benchmark(
         report.benchmark_profile.as_str(),
         scale.name
     ));
-    fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
+    write_json_atomic(&out_path, &serde_json::to_string_pretty(&report)?)?;
     println!("\nWrote {}", out_path.display());
 
     delete_db_files(&db_path);
@@ -2819,6 +2840,26 @@ fn sqlite_checkpoint_truncate(conn: &SqliteConnection) -> rusqlite::Result<(i64,
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     })
+}
+
+#[cfg(feature = "sqlite")]
+#[cfg(feature = "extended-suites")]
+fn sqlite_query_row_count<P: rusqlite::Params>(
+    conn: &SqliteConnection,
+    sql: &str,
+    params: P,
+) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(sql)?;
+    let column_count = stmt.column_count();
+    let mut rows = stmt.query(params)?;
+    let mut count = 0usize;
+    while let Some(row) = rows.next()? {
+        for index in 0..column_count {
+            let _: rusqlite::types::Value = row.get(index)?;
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 #[cfg(feature = "sqlite")]
@@ -3039,12 +3080,45 @@ fn generate_html_report(results_dir: &Path, report_file: &Path) -> anyhow::Resul
 }
 
 #[cfg(feature = "extended-suites")]
+struct ReportInput {
+    file_name: String,
+    path: PathBuf,
+    json: Vec<u8>,
+    /// True when the file is not pinned by `history-manifest.json`; it is
+    /// loaded for local comparison but is not part of the verified history.
+    provisional: bool,
+}
+
+#[cfg(feature = "extended-suites")]
 fn load_report_data(results_dir: &Path) -> anyhow::Result<HtmlReportData> {
+    let has_manifest = results_dir.join("history-manifest.json").exists();
     let mut runs = Vec::new();
-    for (file_name, path, json) in report_inputs(results_dir)? {
-        let report: RunReport = serde_json::from_slice(&json)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        runs.push(HistoricalRun::new(file_name, report));
+    let mut skipped_inputs = Vec::new();
+    for input in report_inputs(results_dir)? {
+        let report: RunReport = match serde_json::from_slice(&input.json) {
+            Ok(report) => report,
+            Err(error) if input.provisional => {
+                // A local result that does not match the run schema (for
+                // example a truncated write or a plan-cache report) must not
+                // take down the whole report; only checksum-verified history
+                // is strict.
+                eprintln!(
+                    "skipping unreadable rust-baseline result {}: {error}",
+                    input.path.display()
+                );
+                skipped_inputs.push(input.file_name);
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to parse {}", input.path.display()));
+            }
+        };
+        runs.push(HistoricalRun::new(
+            input.file_name,
+            input.provisional,
+            report,
+        ));
     }
 
     if runs.is_empty() {
@@ -3060,6 +3134,27 @@ fn load_report_data(results_dir: &Path) -> anyhow::Result<HtmlReportData> {
             .then(left.timestamp_unix.cmp(&right.timestamp_unix))
             .then(left.file_name.cmp(&right.file_name))
     });
+
+    let verified_runs = runs.iter().filter(|run| !run.provisional).count();
+    let provisional_runs = runs.len() - verified_runs;
+    let mut inputs_summary = if has_manifest {
+        let mut summary = format!("{verified_runs} checksum-verified historical run(s)");
+        if provisional_runs > 0 {
+            summary.push_str(&format!(
+                " and {provisional_runs} provisional local run(s) not pinned by history-manifest.json"
+            ));
+        }
+        summary
+    } else {
+        format!("{} historical run(s)", runs.len())
+    };
+    if !skipped_inputs.is_empty() {
+        inputs_summary.push_str(&format!(
+            "; skipped {} unreadable file(s): {}",
+            skipped_inputs.len(),
+            skipped_inputs.join(", ")
+        ));
+    }
 
     let mut sections = Vec::with_capacity(4);
     for scale_name in ["smoke", "medium", "full", "huge"] {
@@ -3086,12 +3181,17 @@ fn load_report_data(results_dir: &Path) -> anyhow::Result<HtmlReportData> {
         generated_at_label: format_unix_label(now_unix()),
         source_directory: results_dir.display().to_string(),
         total_runs: runs.len(),
+        verified_runs,
+        provisional_runs,
+        has_manifest,
+        skipped_inputs,
+        inputs_summary,
         scales: sections,
     })
 }
 
 #[cfg(feature = "extended-suites")]
-fn report_inputs(results_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf, Vec<u8>)>> {
+fn report_inputs(results_dir: &Path) -> anyhow::Result<Vec<ReportInput>> {
     let manifest_path = results_dir.join("history-manifest.json");
     if manifest_path.exists() {
         let manifest_json = fs::read(&manifest_path)
@@ -3114,10 +3214,13 @@ fn report_inputs(results_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf, Vec
         for entry in manifest.files {
             let relative_path = Path::new(&entry.path);
             let mut components = relative_path.components();
-            let is_plain_file_name = matches!(components.next(), Some(std::path::Component::Normal(_)))
-                && components.next().is_none();
+            let is_plain_file_name =
+                matches!(components.next(), Some(std::path::Component::Normal(_)))
+                    && components.next().is_none();
             if !is_plain_file_name
-                || relative_path.extension().and_then(|extension| extension.to_str())
+                || relative_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
                     != Some("json")
                 || !entry.path.contains("rust-baseline")
             {
@@ -3156,11 +3259,35 @@ fn report_inputs(results_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf, Vec
                     actual_sha256
                 );
             }
-            inputs.push((entry.path, path, json));
+            inputs.push(ReportInput {
+                file_name: entry.path,
+                path,
+                json,
+                provisional: false,
+            });
+        }
+
+        // The manifest pins the checksum-verified canonical history, but a
+        // local `--benchmark` run writes fresh results that are not pinned
+        // yet. Merge those as provisional inputs so the report reflects the
+        // latest local work instead of silently dropping it.
+        for input in scan_results_dir(results_dir)? {
+            if seen.contains(&input.file_name) {
+                continue;
+            }
+            inputs.push(ReportInput {
+                provisional: true,
+                ..input
+            });
         }
         return Ok(inputs);
     }
 
+    scan_results_dir(results_dir)
+}
+
+#[cfg(feature = "extended-suites")]
+fn scan_results_dir(results_dir: &Path) -> anyhow::Result<Vec<ReportInput>> {
     let dir = fs::read_dir(results_dir)
         .with_context(|| format!("failed to read results directory {}", results_dir.display()))?;
     let mut inputs = Vec::new();
@@ -3177,16 +3304,21 @@ fn report_inputs(results_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf, Vec
         if !file_name.contains("rust-baseline") {
             continue;
         }
-        let json = fs::read(&path)
-            .with_context(|| format!("failed to read result {}", path.display()))?;
-        inputs.push((file_name, path, json));
+        let json =
+            fs::read(&path).with_context(|| format!("failed to read result {}", path.display()))?;
+        inputs.push(ReportInput {
+            file_name,
+            path,
+            json,
+            provisional: false,
+        });
     }
     Ok(inputs)
 }
 
 #[cfg(feature = "extended-suites")]
 impl HistoricalRun {
-    fn new(file_name: String, report: RunReport) -> Self {
+    fn new(file_name: String, provisional: bool, report: RunReport) -> Self {
         let timestamp_unix = report.started_unix;
         let total_runtime_seconds = report.steps.iter().map(|step| step.duration_seconds).sum();
         Self {
@@ -3194,6 +3326,7 @@ impl HistoricalRun {
             timestamp_unix,
             timestamp_label: format_unix_label(timestamp_unix),
             total_runtime_seconds,
+            provisional,
             report,
         }
     }
@@ -3432,7 +3565,7 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
 <body>
   <header>
     <h1>DecentDB rust-baseline analytics report</h1>
-    <p class="meta">Generated {generated_at} from <code>{source_directory}</code> using {total_runs} historical run(s).</p>
+    <p class="meta">Generated {generated_at} from <code>{source_directory}</code> using {inputs_summary}.</p>
   </header>
   <main>
     <div id="overview"></div>
@@ -3464,11 +3597,6 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
     function formatRps(value) {{
       if (value == null || Number.isNaN(value)) return '—';
       return `${{Math.round(Number(value)).toLocaleString()}} r/s`;
-    }}
-
-    function formatDateLabel(unix) {{
-      if (!unix) return '—';
-      return new Date(unix * 1000).toLocaleString();
     }}
 
     function getStep(run, stepName) {{
@@ -3528,18 +3656,6 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
       return latest;
     }}
 
-    function pickLatestRunByProfile(runs) {{
-      const latest = new Map();
-      for (const run of runs) {{
-        const profile = metricProfile(run);
-        const existing = latest.get(profile);
-        if (!existing || run.timestamp_unix > existing.timestamp_unix) {{
-          latest.set(profile, run);
-        }}
-      }}
-      return latest;
-    }}
-
     function addEmptyMessage(parent, message) {{
       const empty = document.createElement('p');
       empty.className = 'empty';
@@ -3589,6 +3705,7 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
       const wrap = document.createElement('div');
       wrap.className = 'table-wrap';
 
+      section.appendChild(document.createElement('h3')).textContent = title;
       if (!rows.length) {{
         addEmptyMessage(wrap, 'No rows for this run mode.');
         section.appendChild(wrap);
@@ -3627,25 +3744,7 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
       }}
 
       wrap.appendChild(table);
-      section.appendChild(document.createElement('h3')).textContent = title;
       section.appendChild(wrap);
-    }}
-
-    function pickLatestRunByKey(runs, keyFn) {{
-      const latest = new Map();
-      for (const run of runs) {{
-        latest.set(keyFn(run), run);
-      }}
-      return latest;
-    }}
-
-    function runCaseRows(run, fieldName) {{
-      const cases = run.report[fieldName] || [];
-      const rows = new Map();
-      for (const entry of cases) {{
-        rows.set(entry.name, entry);
-      }}
-      return rows;
     }}
 
     function trendClass(latest, best, lowerIsBetter) {{
@@ -3749,9 +3848,10 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
       const bestRuntime = Math.min(...scale.runs.map(run => run.total_runtime_seconds));
       const bestPeakRss = Math.min(...scale.runs.map(run => run.report.peak_rss_bytes));
 
+      const provisionalCount = scale.runs.filter(run => run.provisional).length;
       const meta = document.createElement('p');
       meta.className = 'section-meta';
-      meta.textContent = `Runs: ${{scale.runs.length}} · Latest: ${{latest.timestamp_label}}`;
+      meta.textContent = `Runs: ${{scale.runs.length}} · Latest: ${{latest.timestamp_label}}${{provisionalCount ? ` · ${{provisionalCount}} provisional` : ''}}`;
       section.appendChild(meta);
 
       const summary = document.createElement('div');
@@ -3822,6 +3922,7 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
       const runTableWrap = document.createElement('div');
       runTableWrap.className = 'table-wrap';
       const runTable = document.createElement('table');
+      const sourceHeader = reportData.has_manifest ? '<th>Source</th>' : '';
       runTable.innerHTML = `
         <thead>
           <tr>
@@ -3832,12 +3933,16 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
             <th>Peak RSS</th>
             <th>DB size</th>
             <th>WAL size</th>
+            ${{sourceHeader}}
           </tr>
         </thead>
         <tbody></tbody>
       `;
       const runBody = runTable.querySelector('tbody');
       for (const run of scale.runs) {{
+        const sourceCell = reportData.has_manifest
+          ? `<td>${{run.provisional ? 'provisional' : 'verified'}}</td>`
+          : '';
         const row = document.createElement('tr');
         row.innerHTML = `
           <td class="mono">${{run.file_name}}</td>
@@ -3847,6 +3952,7 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
           <td>${{formatBytes(run.report.peak_rss_bytes)}}</td>
           <td>${{formatBytes(run.report.database_size_bytes)}}</td>
           <td>${{formatBytes(run.report.wal_size_bytes)}}</td>
+          ${{sourceCell}}
         `;
         runBody.appendChild(row);
       }}
@@ -4114,7 +4220,7 @@ fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
 "#,
         generated_at = data.generated_at_label,
         source_directory = data.source_directory,
-        total_runs = data.total_runs,
+        inputs_summary = data.inputs_summary,
         report_json = report_json,
     );
     Ok(html)
@@ -6494,7 +6600,7 @@ fn run_duckdb_benchmark(cli: &Cli, scale: Scale) -> anyhow::Result<()> {
         "{datetime_stamp}-rust-baseline-duckdb-engine-default-{}.json",
         scale.name
     ));
-    fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
+    write_json_atomic(&out_path, &serde_json::to_string_pretty(&report)?)?;
     println!("\nWrote {}", out_path.display());
 
     delete_db_files(&db_path);
@@ -7046,10 +7152,11 @@ mod tests {
 
     #[cfg(feature = "extended-suites")]
     #[test]
-    fn html_report_uses_only_checksum_verified_manifest_results() {
+    fn html_report_merges_verified_manifest_and_provisional_results() {
         let directory = TestDirectory::new("manifest-report-inputs");
         let accepted_name = "accepted-rust-baseline-default-smoke.json";
         let provisional_name = "provisional-rust-baseline-default-smoke.json";
+        let junk_name = "junk-rust-baseline-default-smoke.json";
 
         let accepted = RunReport {
             scale_name: "smoke".into(),
@@ -7060,13 +7167,17 @@ mod tests {
         std::fs::write(directory.path().join(accepted_name), &accepted_json)
             .expect("write accepted run");
 
-        let mut provisional = accepted;
+        let mut provisional = accepted.clone();
         provisional.started_unix = 2;
         std::fs::write(
             directory.path().join(provisional_name),
             serde_json::to_vec_pretty(&provisional).expect("serialize provisional run"),
         )
         .expect("write provisional run");
+
+        // An unparseable local file (for example a truncated run write) is
+        // skipped with a warning instead of taking down the whole report.
+        std::fs::write(directory.path().join(junk_name), b"not json").expect("write junk run");
 
         let accepted_sha256 = format!("{:x}", Sha256::digest(&accepted_json));
         let manifest = serde_json::json!({
@@ -7080,9 +7191,16 @@ mod tests {
         .expect("write history manifest");
 
         let report = load_report_data(directory.path()).expect("load manifested report data");
-        assert_eq!(report.total_runs, 1);
-        assert_eq!(report.scales[0].runs.len(), 1);
+        assert!(report.has_manifest);
+        assert_eq!(report.total_runs, 2);
+        assert_eq!(report.verified_runs, 1);
+        assert_eq!(report.provisional_runs, 1);
+        assert_eq!(report.skipped_inputs, vec![junk_name.to_string()]);
+        assert_eq!(report.scales[0].runs.len(), 2);
         assert_eq!(report.scales[0].runs[0].file_name, accepted_name);
+        assert!(!report.scales[0].runs[0].provisional);
+        assert_eq!(report.scales[0].runs[1].file_name, provisional_name);
+        assert!(report.scales[0].runs[1].provisional);
 
         std::fs::write(directory.path().join(accepted_name), b"tampered")
             .expect("tamper accepted run");
@@ -7505,6 +7623,7 @@ mod tests {
     fn ordered_step_names_uses_benchmark_order() {
         let run = HistoricalRun::new(
             "sample.json".to_string(),
+            false,
             RunReport {
                 scale_name: "full".to_string(),
                 steps: vec![
