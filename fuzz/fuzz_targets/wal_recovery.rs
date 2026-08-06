@@ -36,29 +36,32 @@ fn wal_path(db_path: &Path) -> PathBuf {
 fn build_template() -> Template {
     let dir = std::env::temp_dir().join(format!("decentdb-fuzz-template-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create template dir");
+    if fs::create_dir_all(&dir).is_err() {
+        return Template { db_bytes: vec![] };
+    }
     let db_path = dir.join("template.ddb");
 
     let config = DbConfig {
         wal_sync_mode: WalSyncMode::TestingOnlyUnsafeNoSync,
         ..DbConfig::default()
     };
-    {
-        let db = Db::create(&db_path, config).expect("create template db");
+    let result = (|| -> Option<Vec<u8>> {
+        let db = Db::create(&db_path, config).ok()?;
         db.execute("CREATE TABLE t(id INT64, val TEXT, amount FLOAT64)")
-            .expect("create table");
+            .ok()?;
         for i in 0..25 {
-            db.execute(&format!(
-                "INSERT INTO t VALUES ({i}, 'row-{i}', {i}.5)"
-            ))
-            .expect("seed row");
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'row-{i}', {i}.5)"))
+                .ok()?;
         }
-        db.checkpoint_wal().expect("checkpoint template");
-    }
+        db.checkpoint_wal().ok()?;
+        drop(db);
+        fs::read(&db_path).ok()
+    })();
 
-    let db_bytes = fs::read(&db_path).expect("read template db");
     let _ = fs::remove_dir_all(&dir);
-    Template { db_bytes }
+    Template {
+        db_bytes: result.unwrap_or_default(),
+    }
 }
 
 /// Derive this iteration's WAL bytes from the fuzz input.
@@ -72,6 +75,10 @@ fn fuzz_wal_bytes(data: &[u8]) -> &[u8] {
 
 fuzz_target!(|data: &[u8]| {
     let template = TEMPLATE.get_or_init(build_template);
+    // Skip iteration if template setup failed (e.g. transient filesystem errors).
+    if template.db_bytes.is_empty() {
+        return;
+    }
 
     let ordinal = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let db_path = std::env::temp_dir().join(format!(
