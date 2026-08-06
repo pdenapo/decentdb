@@ -5,6 +5,74 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.17.1] - [2026-08-06]
+
+### Added
+
+- Added a `fuzz/` cargo-fuzz crate with coverage-guided libFuzzer targets
+  (`wal_recovery`, `record_decode`) that assert WAL recovery and record
+  decoding never panic on malformed input, plus a `fuzz-internals` engine
+  feature exposing doc-hidden decode shims, and a `coverage-guided-fuzz`
+  matrix job in the memory-safety nightly workflow running each target for
+  ten minutes with crash-artifact upload.
+- Added the four grouped-commit fault-injection harness scenarios from
+  `tests/harness/grouped_commit_fault_injection_plan.md`
+  (`grouped_commit_all_commit`, `grouped_commit_fail_during_second_commit`,
+  `grouped_commit_fail_sync_before_flush`, `grouped_commit_crash_after_sync`)
+  to the pre-commit suite (stage 5) and the release validation workflow.
+- Added a `coverage-nightly` workflow that runs `cargo llvm-cov nextest` and
+  uploads `lcov.info`, an `msrv` CI job that checks the workspace on the newly
+  pinned Rust 1.88 MSRV (`rust-version` in the workspace manifest), and a
+  `supply-chain` CI job running `cargo deny check` with a new `deny.toml`
+  (advisories, licenses, bans, sources).
+- Added a Web binding browser smoke (WASM build + Playwright OPFS suite) to
+  the release validation workflow so browser regressions block releases.
+- Added a verified cross-binding feature coverage matrix to
+  `bindings/README.md` documenting which bindings expose the write queue,
+  watch/change streams, branch/snapshot workflows, and extension lifecycle
+  APIs.
+
+### Changed
+
+- Split the two largest engine files into thematic submodules with no
+  behavior change: `exec/mod.rs` (49,649 -> 14,036 lines) into
+  `bench_queries`, `codec`, `deferred`, `evaluate`, `grouped`, `indexes`,
+  `joins`, `manifest`, `paged_tables`, `runtime_eval`, `runtime_keys`,
+  `simple_queries`, and `table_data`; and `db.rs` (17,181 -> 10,483 lines)
+  into `db/sync_ops`, `db/prepared_fast_paths`, `db/pragmas`, `db/branch_ops`,
+  and `db/reactive_ops`. rust-baseline medium-scale timings before/after the
+  split are within noise.
+- Aligned `@decentdb/web` (`bindings/web`) to the workspace release version
+  and taught `scripts/bump_version.sh` to keep the web package and lockfile
+  versions in sync on future bumps.
+- Updated `Cargo.lock` to clear RUSTSEC advisories flagged by the new
+  supply-chain job: `rustls-webpki` 0.103.10 -> 0.103.13 (RUSTSEC-2026-0104),
+  `anyhow` 1.0.102 -> 1.0.104 (RUSTSEC-2026-0190), `crossbeam-epoch`
+  0.9.18 -> 0.9.20 (RUSTSEC-2026-0204), and `rand` 0.8.5 -> 0.8.7 /
+  0.9.2 -> 0.9.5 (RUSTSEC-2026-0097). Two dev-only `iai-callgrind`
+  transitive advisories (unmaintained `bincode`, `proc-macro-error2`) are
+  documented exceptions in `deny.toml`.
+- Renumbered the duplicate ADRs `0027-bulk-load-api-specification`,
+  `0035-sql-parser-libpg-query`, and `0036-integer-primary-key` to 0212,
+  0213, and 0214, updated all inbound references (including two pre-existing
+  broken link variants), and added `bindings/web`, `tests/bindings/c`, and
+  `tests/bindings/web` to the `AGENTS.md` and `bindings/README.md` inventory
+  docs.
+
+### Fixed
+
+- Fixed a memory-exhaustion vulnerability in row decoding found by the new
+  `record_decode` fuzz target: `Row::decode` sized its values vector from an
+  untrusted varint field count, so a 4-byte malformed input could force a
+  multi-gigabyte allocation (OOM). The decoder now rejects field counts that
+  exceed what the remaining input bytes can physically contain, and a
+  regression test covers the crafted input.
+
+### Removed
+
+- Stopped tracking the generated `bindings/python/decentdb.egg-info/`
+  packaging artifacts in git and added `*.egg-info/` to `.gitignore`.
+
 ## [2.17.0] - [2026-08-02]
 
 ### Added

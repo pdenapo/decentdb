@@ -95,6 +95,41 @@ jobs:
       - name: Run WAL corruption fuzz
         run: ./target/release/wal_fuzz
 
+  coverage-guided-fuzz:
+    name: Coverage-Guided Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # libFuzzer runs are time-boxed per target; the budget covers a cold
+    # instrumented engine build plus the fuzz windows below.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wal_recovery, record_decode]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run libFuzzer target
+        working-directory: fuzz
+        run: >-
+          cargo +nightly fuzz run ${{ matrix.target }}
+          -- -max_total_time=600 -rss_limit_mb=4096
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+
   python-leak-regressions:
     name: Python Leak Regressions
     runs-on: ubuntu-latest

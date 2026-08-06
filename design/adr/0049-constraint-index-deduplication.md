@@ -101,4 +101,4 @@ This avoids creating redundant indexes that differ only by name.
 ## References
 - [0006-foreign-key-index-creation.md](0006-foreign-key-index-creation.md)
 - [0036-catalog-constraints-index-metadata.md](0036-catalog-constraints-index-metadata.md)
-- [0036-integer-primary-key.md](0036-integer-primary-key.md)
+- [0214-integer-primary-key.md](0214-integer-primary-key.md)

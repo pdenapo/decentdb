@@ -48,5 +48,5 @@ Implement `WITH RECURSIVE` using **iterative fixpoint evaluation in the executor
 ### References
 
 - Non-recursive CTE ADR: `design/adr/0078-cte-non-recursive-scope-v0.md`
-- Parser ADR: `design/adr/0035-sql-parser-libpg-query.md`
+- Parser ADR: `design/adr/0213-sql-parser-libpg-query.md`
 - PostgreSQL WITH RECURSIVE docs: https://www.postgresql.org/docs/current/queries-with.html

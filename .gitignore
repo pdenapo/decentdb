@@ -111,3 +111,7 @@ bindings/dotnet/tests/DecentDB.Tests/TestResults/*
 bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests/TestResults/*
 
 benchmarks/rust-baseline/.tmp/*
+
+# Python packaging artifacts
+bindings/python/decentdb.egg-info/
+*.egg-info/

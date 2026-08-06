@@ -41,6 +41,33 @@ mod wal;
 mod wasm;
 mod write_queue;
 
+/// Internal entry points for coverage-guided fuzz targets (`fuzz/` crate).
+///
+/// Only available with the `fuzz-internals` feature; not part of the stable
+/// API surface. Every function here must tolerate arbitrary malformed input
+/// and return a typed error instead of panicking.
+#[cfg(feature = "fuzz-internals")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use crate::error::Result;
+    use crate::record::row::Row;
+
+    /// Decode a row from raw bytes, returning the column count on success.
+    pub fn row_decode(bytes: &[u8]) -> Result<usize> {
+        Row::decode(bytes).map(|row| row.values().len())
+    }
+
+    /// Decode the `INT64` value at `column_index` from raw row bytes.
+    pub fn row_decode_int64_at(bytes: &[u8], column_index: usize) -> Result<Option<i64>> {
+        Row::decode_int64_at(bytes, column_index)
+    }
+
+    /// Decode a varint-encoded `u64` from raw bytes.
+    pub fn decode_varint_u64(bytes: &[u8]) -> Result<(u64, usize)> {
+        crate::record::decode_varint_u64(bytes)
+    }
+}
+
 pub use crate::branch::{
     BranchDiffReport, BranchInfo, BranchLogEntry, BranchMergeChange, BranchMergeConflict,
     BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchRowDiff, BranchTableDiff,

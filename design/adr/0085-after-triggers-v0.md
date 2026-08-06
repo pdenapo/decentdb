@@ -59,4 +59,4 @@ Implement a constrained trigger surface for 0.x:
 ### References
 
 - Roadmap: `design/SQL_ENHANCEMENTS_PLAN.md` (Section 5.8)
-- Parser baseline: `design/adr/0035-libpg-query-parser-adoption.md`
+- Parser baseline: `design/adr/0213-sql-parser-libpg-query.md`

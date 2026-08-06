@@ -216,7 +216,7 @@ Use parser ADRs and current code as authoritative references.
 
 Primary reference:
 
-- `design/adr/0035-sql-parser-libpg-query.md`
+- `design/adr/0213-sql-parser-libpg-query.md`
 
 ### 6.2 Supported SQL subset (Compatibility Anchor)
 

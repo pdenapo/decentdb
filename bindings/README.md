@@ -28,10 +28,12 @@ engine:
 
 - `tests/bindings/python/`
 - `tests/bindings/dotnet/`
+- `tests/bindings/c/`
 - `tests/bindings/go/`
 - `tests/bindings/java/`
 - `tests/bindings/node/`
 - `tests/bindings/dart/`
+- `tests/bindings/web/` (Playwright browser suites; WASM/OPFS, not the C ABI)
 
 The following package trees live under `bindings/`:
 
@@ -46,10 +48,38 @@ The following package trees live under `bindings/`:
   extension
 - `bindings/node/`: low-level `decentdb/` package and `knex-decentdb/`
 - `bindings/dart/`: Dart package, native glue, scripts, and examples
+- `bindings/web/`: TypeScript + WASM/OPFS browser binding (`@decentdb/web`); a
+  separate wasm protocol stack rather than a C ABI wrapper
 
 All in-tree bindings consume the C ABI's semantic value tags for `ENUM`,
 `IPADDR`, `CIDR`, `DATE`, `TIME`, `TIMESTAMPTZ`, `INTERVAL`, and `MACADDR`;
 language-specific result shapes are documented in `docs/api/bindings-matrix.md`.
+
+## Feature coverage matrix
+
+Higher-level engine capabilities are not yet uniform across bindings. This
+matrix is the authoritative inventory (verified against the binding sources,
+not just package docs); keep it updated when a binding gains a surface.
+
+| Capability | Python | .NET | Go | Java | Node | Dart | Web (wasm) |
+|---|---|---|---|---|---|---|---|
+| Core C ABI: exec/query, prepared statements, transactions | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (separate wasm protocol, not the C ABI) |
+| Write queue (queued writes, metrics) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| Watch / change streams | ✓ | — | ✓ | — | — | — | — |
+| Branch, named snapshots, diff/restore | — | — | ✓ | — | — | ✓ | — (disabled by design; capability metadata reports `branchSnapshots=false`) |
+| Extension lifecycle JSON APIs | — | — | — | — | — | — | — |
+
+Notes:
+
+- Java's JNI shim maps all C ABI value tags (including `UUID`, `GEOMETRY`,
+  `GEOGRAPHY`, `ENUM`, `IPADDR`, `CIDR`, `DATE`, `TIME`, `TIMESTAMPTZ`,
+  `INTERVAL`, `MACADDR`) to JDBC type codes; its gaps are the higher-level
+  feature surfaces above, not value decoding.
+- The web binding is a separate TypeScript + WASM/OPFS protocol stack; C ABI
+  feature rows do not apply to it directly.
+- Extension lifecycle APIs (`ddb_extension_*_json`) are currently only
+  declared in the C ABI header and exercised from Rust/CLI; no binding wraps
+  them yet.
 
 Benchmark entry points:
 
@@ -76,3 +106,4 @@ The following language integration trees now live in-repo under `bindings/`:
 - `bindings/java/`
 - `bindings/node/`
 - `bindings/dart/`
+- `bindings/web/`

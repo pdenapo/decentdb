@@ -86,6 +86,15 @@ exists in the Rust repository today.
 
 For the Node packages, update both the manifest and the lockfile's top-level package version entries.
 
+### Web binding
+
+- `bindings/web/package.json`
+- `bindings/web/package-lock.json`
+
+The `@decentdb/web` package follows the workspace release version, like the
+other in-repo bindings; update the manifest and the lockfile's top-level
+package version entries (`scripts/bump_version.sh` handles both).
+
 ### Documentation
 
 - `docs/about/changelog.md`  
@@ -163,7 +172,7 @@ dependency in `knex-decentdb`) after the underlying package version changes.
 After a version bump, verify:
 
 - `VERSION` and `Cargo.toml` have the intended workspace version.
-- Python, Java, Dart, and Node package metadata all reflect the same DecentDB release version.
+- Python, Java, Dart, Node, and Web package metadata all reflect the same DecentDB release version.
 - `docs/about/changelog.md` explains the release and any important versioning context.
 - No stale old-version references remain in the release-facing files.
 - The NuGet workflow still matches the current tag format.
@@ -196,6 +205,8 @@ rg 'OLD_VERSION|vOLD_VERSION' \
   bindings/node/decentdb/package-lock.json \
   bindings/node/knex-decentdb/package.json \
   bindings/node/knex-decentdb/package-lock.json \
+  bindings/web/package.json \
+  bindings/web/package-lock.json \
   benchmarks/rust-baseline/Cargo.lock \
   docs/about/changelog.md \
   docs/user-guide/benchmarks.md \

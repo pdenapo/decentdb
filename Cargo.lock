@@ -109,9 +109,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arbitrary"
@@ -773,9 +773,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb"
-version = "2.17.0"
+version = "2.17.1"
 dependencies = [
  "base64 0.22.1",
  "chacha20",
@@ -850,7 +850,7 @@ dependencies = [
  "miniz_oxide",
  "mlua",
  "proptest",
- "rand 0.8.5",
+ "rand 0.8.7",
  "regex",
  "rusqlite",
  "serde",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-benchmark"
-version = "2.17.0"
+version = "2.17.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-cli"
-version = "2.17.0"
+version = "2.17.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-migrate"
-version = "2.17.0"
+version = "2.17.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "libpg_query_sys"
-version = "2.17.0"
+version = "2.17.1"
 dependencies = [
  "pg_query",
 ]
@@ -2318,7 +2318,7 @@ dependencies = [
  "bit-vec",
  "bitflags",
  "num-traits",
- "rand 0.9.2",
+ "rand 0.9.5",
  "rand_chacha 0.9.0",
  "rand_xorshift",
  "regex-syntax",
@@ -2434,7 +2434,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
- "rand 0.9.2",
+ "rand 0.9.5",
  "ring",
  "rustc-hash 2.1.1",
  "rustls",
@@ -2499,9 +2499,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.8.5"
+version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -2510,9 +2510,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.2"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
+checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -2748,7 +2748,7 @@ dependencies = [
  "borsh",
  "bytes",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.8.7",
  "rkyv",
  "serde",
  "serde_json",
@@ -2828,9 +2828,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.10"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "ring",
  "rustls-pki-types",

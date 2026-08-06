@@ -1436,7 +1436,7 @@ fn maybe_ordered_row_id_scan_plan(query: &Query, catalog: &CatalogState) -> Opti
 }
 
 #[derive(Clone, Copy)]
-struct TableBindingRef<'a> {
+pub(crate) struct TableBindingRef<'a> {
     name: &'a str,
     alias: &'a Option<String>,
 }
@@ -1454,12 +1454,12 @@ struct QualifiedColumnRef<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct SimpleSpatialJoinPredicate<'a> {
+pub(crate) struct SimpleSpatialJoinPredicate<'a> {
     left: QualifiedColumnRef<'a>,
     right: QualifiedColumnRef<'a>,
 }
 
-fn simple_spatial_join_predicate<'a>(
+pub(crate) fn simple_spatial_join_predicate<'a>(
     expr: &'a Expr,
     left_binding: TableBindingRef<'a>,
     right_binding: TableBindingRef<'a>,
