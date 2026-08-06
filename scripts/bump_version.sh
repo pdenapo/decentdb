@@ -275,6 +275,23 @@ if [[ -f "$knex_lock" ]]; then
   update "$knex_lock" "lockfile package versions"
 fi
 
+# --- Web (WASM/TypeScript) ---
+web_pkg="bindings/web/package.json"
+if [[ -f "$web_pkg" ]]; then
+  tmp=$(mktemp)
+  awk -v ver="$VERSION" '
+    !done && /"version":/ { sub(/"version": *"[^"]*"/, "\"version\": \"" ver "\""); done=1 }
+    { print }
+  ' "$web_pkg" > "$tmp" && mv "$tmp" "$web_pkg"
+  update "$web_pkg" "package version"
+fi
+
+web_lock="bindings/web/package-lock.json"
+if [[ -f "$web_lock" ]]; then
+  update_json_versions "$web_lock" ""
+  update "$web_lock" "lockfile package version"
+fi
+
 # --- Java JDBC driver ---
 java_gradle="bindings/java/driver/build.gradle"
 if [[ -f "$java_gradle" ]]; then

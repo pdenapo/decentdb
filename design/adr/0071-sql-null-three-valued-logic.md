@@ -58,5 +58,5 @@ This ADR defines the behavior for:
 ### References
 
 - SQL enhancements roadmap: `design/SQL_ENHANCEMENTS_PLAN.md` (Section 5.1, NULL semantics gate)
-- SQL parser ADR: `design/adr/0035-sql-parser-libpg-query.md`
+- SQL parser ADR: `design/adr/0213-sql-parser-libpg-query.md`
 - Repo workflow and ADR gating: `AGENTS.md`

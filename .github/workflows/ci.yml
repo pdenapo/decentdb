@@ -46,6 +46,42 @@ jobs:
       - name: Vendored Header Drift Check
         run: python3 scripts/check_vendored_headers.py
 
+  msrv:
+    if: github.event_name != 'push' || !endsWith(github.actor, '[bot]')
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust (MSRV)
+        # Keep in sync with rust-version in the workspace Cargo.toml.
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: MSRV Check
+        run: cargo check --workspace --all-targets
+
+  supply-chain:
+    if: github.event_name != 'push' || !endsWith(github.actor, '[bot]')
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check
+
   test:
     if: github.event_name != 'push' || !endsWith(github.actor, '[bot]')
     runs-on: ubuntu-latest

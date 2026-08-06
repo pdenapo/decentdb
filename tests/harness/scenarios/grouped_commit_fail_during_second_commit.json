@@ -1,0 +1,27 @@
+{
+  "name": "grouped_commit__fail_during_second_commit",
+  "page_size": 4096,
+  "ops": [
+    { "op": "create" },
+    {
+      "op": "install_failpoint",
+      "label": "wal.write_commit",
+      "action": "error",
+      "trigger_on": 2,
+      "value": 0
+    },
+    { "op": "begin" },
+    { "op": "write", "page_id": 3, "fill_byte": 11 },
+    { "op": "commit", "expect": "ok" },
+    { "op": "begin" },
+    { "op": "write", "page_id": 4, "fill_byte": 22 },
+    { "op": "commit", "expect": "error" },
+    { "op": "failpoint_log" },
+    { "op": "clear_failpoints" },
+    { "op": "begin" },
+    { "op": "write", "page_id": 5, "fill_byte": 33 },
+    { "op": "commit", "expect": "ok" },
+    { "op": "reopen" },
+    { "op": "inspect" }
+  ]
+}

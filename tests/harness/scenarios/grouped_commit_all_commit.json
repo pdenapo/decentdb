@@ -1,0 +1,19 @@
+{
+  "name": "grouped_commit__all_commit",
+  "page_size": 4096,
+  "ops": [
+    { "op": "create" },
+    { "op": "begin" },
+    { "op": "write", "page_id": 3, "fill_byte": 11 },
+    { "op": "commit", "expect": "ok" },
+    { "op": "begin" },
+    { "op": "write", "page_id": 4, "fill_byte": 22 },
+    { "op": "commit", "expect": "ok" },
+    { "op": "begin" },
+    { "op": "write", "page_id": 5, "fill_byte": 33 },
+    { "op": "commit", "expect": "ok" },
+    { "op": "failpoint_log" },
+    { "op": "reopen" },
+    { "op": "inspect" }
+  ]
+}

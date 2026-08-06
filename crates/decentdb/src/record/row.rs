@@ -661,6 +661,14 @@ impl Row {
         store: Option<&S>,
     ) -> Result<Self> {
         let (field_count, mut offset) = decode_varint_u64(bytes)?;
+        // Each field requires at least a tag byte and a payload-length byte,
+        // so a count larger than the remaining input cannot be valid. Reject
+        // it before sizing the allocation to avoid memory exhaustion on
+        // malformed input.
+        let max_possible_fields = bytes.len().saturating_sub(offset) / 2;
+        if field_count > max_possible_fields as u64 {
+            return Err(DbError::corruption("row field count exceeds input size"));
+        }
         let mut values = Vec::with_capacity(field_count as usize);
 
         for _ in 0..field_count {
@@ -1540,6 +1548,19 @@ mod tests {
         assert!(
             msg.contains("unknown row value tag") || msg.contains("truncated"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_oversized_field_count_without_huge_allocation() {
+        // Regression: a malformed varint field count must be rejected as
+        // corruption before sizing the values vector, not trigger an
+        // out-of-memory allocation (found by the record_decode fuzz target).
+        let encoded = vec![254_u8, 183, 183, 90];
+        let err = Row::decode(&encoded).expect_err("oversized field count should fail");
+        assert!(
+            err.to_string().contains("field count"),
+            "unexpected error: {err}"
         );
     }
 

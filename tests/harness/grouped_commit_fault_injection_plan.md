@@ -1,5 +1,7 @@
 # Grouped Commit Fault-Injection Test Plan
 
+**Status:** Implemented as harness scenarios (see "Scenario files" below).
+
 The plan below defines how to validate grouped-commit behavior now that the
 queue path emits explicit commit groups. The basic queue and metrics contract is
 covered by unit and binding smoke tests; failpoint-backed crash windows remain
@@ -16,9 +18,13 @@ the deeper harness expansion point.
 - Use failpoint-backed storage scenarios already used by `tests/harness`:
   - `wal.write_commit`
   - `wal.sync_metadata`
-  - `wal.sync_data`
+  - `wal.fsync` (the engine's WAL data-sync label; called `wal.sync_data` in
+    earlier drafts of this plan)
 - Capture reopen behavior with deterministic replay after each fault point.
 - Use a small, fixed row set and explicit commit markers.
+- The current harness drives explicit page-level transactions; queued write
+  submissions are represented by sequential commit groups hitting the same WAL
+  publish boundaries the queue path uses.
 
 ## Scenario matrix
 
@@ -56,6 +62,16 @@ the deeper harness expansion point.
   as committed.
 - If a scenario crashes after durability point, pre-planned committed rows are
   present after restart.
+
+## Scenario files
+
+The matrix above is implemented by these scenarios, wired into the pre-commit
+suite (`grouped-commit-fault-injection`) and the release validation workflow:
+
+- `scenarios/grouped_commit_all_commit.json`
+- `scenarios/grouped_commit_fail_during_second_commit.json`
+- `scenarios/grouped_commit_fail_sync_before_flush.json`
+- `scenarios/grouped_commit_crash_after_sync.json`
 
 ## Output artifacts
 

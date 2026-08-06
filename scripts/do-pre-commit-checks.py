@@ -576,6 +576,24 @@ def build_checks() -> list[Check]:
             cargo_bound=True,
         ),
         Check(
+            key="grouped-commit-fault-injection",
+            title="Grouped commit fault-injection harnesses",
+            cwd=REPO_ROOT,
+            command=(
+                f"{python_exec} tests/harness/runner.py "
+                "tests/harness/scenarios/grouped_commit_all_commit.json && "
+                f"{python_exec} tests/harness/runner.py "
+                "tests/harness/scenarios/grouped_commit_fail_during_second_commit.json && "
+                f"{python_exec} tests/harness/runner.py "
+                "tests/harness/scenarios/grouped_commit_fail_sync_before_flush.json && "
+                f"{python_exec} tests/harness/runner.py "
+                "tests/harness/scenarios/grouped_commit_crash_after_sync.json"
+            ),
+            env={},
+            stage=5,
+            cargo_bound=True,
+        ),
+        Check(
             key="rust-benchmark-phase1-native",
             title="Rust benchmark phase 1 direct scenarios",
             cwd=REPO_ROOT,

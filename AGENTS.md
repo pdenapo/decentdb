@@ -28,8 +28,10 @@ DecentDB is a Rust-native embedded relational database. The goal is a world-clas
 | `crates/decentdb-migrate/` | On-disk format migration parser |
 | `crates/decentdb-benchmark/` | Rust-native benchmark runner |
 | `crates/libpg_query_sys/` | C SQL parser wrapper (`pg_query` dep) |
-| `bindings/{dotnet,python,go,java,node,dart}/` | Language bindings |
-| `tests/bindings/` | Smoke tests for all language bindings |
+| `fuzz/` | cargo-fuzz crate (independent workspace) with libFuzzer targets for WAL recovery and record decode; engine shims behind the `fuzz-internals` feature |
+| `bindings/{dotnet,python,go,java,node,dart}/` | Language bindings (thin wrappers over the C ABI) |
+| `bindings/web/` | Web binding (TypeScript + WASM/OPFS; separate wasm protocol stack, not the C ABI) |
+| `tests/bindings/` | Smoke tests for all language bindings, including `c/` (C ABI smoke) and `web/` (Playwright browser suites) |
 | `tests/harness/` | Python test harness (runner + scenarios + datasets) |
 | `include/decentdb.h` | Stable C ABI header |
 | `scripts/` | Repo automation (benchmark charts, pre-commit checks, etc.) |

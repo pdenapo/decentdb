@@ -1,4 +1,4 @@
-# 36. Integer Primary Key Optimization
+# ADR 0214: Integer Primary Key Optimization
 
 Date: 2026-01-31
 

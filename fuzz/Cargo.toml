@@ -1,0 +1,32 @@
+[package]
+name = "decentdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Independent workspace so this crate is not pulled into the main build.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+decentdb = { path = "../crates/decentdb", default-features = false, features = [
+    "fuzz-internals",
+] }
+
+[[bin]]
+name = "wal_recovery"
+path = "fuzz_targets/wal_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_decode"
+path = "fuzz_targets/record_decode.rs"
+test = false
+doc = false
+bench = false

@@ -50,5 +50,5 @@ Implement `WITH` for **non-recursive CTEs** in `SELECT` statements with the foll
 ### References
 
 - Roadmap: `design/SQL_ENHANCEMENTS_PLAN.md` (Section 5.3)
-- Parser ADR: `design/adr/0035-sql-parser-libpg_query.md`
+- Parser ADR: `design/adr/0213-sql-parser-libpg-query.md`
 - View semantics ADR: `design/adr/0070-views-catalog-and-semantics.md`

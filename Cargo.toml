@@ -12,8 +12,9 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "2.17.0"
+version = "2.17.1"
 edition = "2021"
+rust-version = "1.88"
 authors = ["Steven Hildreth"]
 license = "Apache-2.0"
 repository = "https://github.com/sphildreth/decentdb"

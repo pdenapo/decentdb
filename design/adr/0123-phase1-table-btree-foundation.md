@@ -61,5 +61,5 @@ Rejected. That would leave signed rowid ordering, row encoding, and cursor decod
 - `design/adr/0120-core-storage-engine-btree.md`
 - `design/adr/0035-btree-page-layout-v2.md`
 - `design/adr/0030-record-format.md`
-- `design/adr/0036-integer-primary-key.md`
+- `design/adr/0214-integer-primary-key.md`
 - `crates/decentdb/src/btree/`

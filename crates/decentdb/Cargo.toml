@@ -2,12 +2,14 @@
 name = "decentdb"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [features]
 default = ["lua-extensions"]
 bench-internals = []
+fuzz-internals = []
 lua-extensions = ["dep:mlua"]
 
 [dependencies]

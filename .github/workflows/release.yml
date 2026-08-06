@@ -114,6 +114,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -174,6 +175,13 @@ jobs:
       - name: Short Crash Harness
         run: python tests/harness/runner.py tests/harness/scenarios/short_crash.json
 
+      - name: Grouped Commit Fault-Injection Harnesses
+        run: |
+          python tests/harness/runner.py tests/harness/scenarios/grouped_commit_all_commit.json
+          python tests/harness/runner.py tests/harness/scenarios/grouped_commit_fail_during_second_commit.json
+          python tests/harness/runner.py tests/harness/scenarios/grouped_commit_fail_sync_before_flush.json
+          python tests/harness/runner.py tests/harness/scenarios/grouped_commit_crash_after_sync.json
+
       - name: Build cdylib
         run: cargo build -p decentdb
 
@@ -204,6 +212,23 @@ jobs:
           dart pub get
           dart run smoke.dart
           cd ../../..
+
+      - name: Web Binding Smoke (WASM + browser OPFS)
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.114 --locked
+          cd bindings/web
+          npm ci
+          npm run build
+          cd ../..
+          cargo build -p decentdb --target wasm32-unknown-unknown --release
+          wasm-bindgen target/wasm32-unknown-unknown/release/decentdb.wasm \
+            --target web \
+            --out-dir bindings/web/dist \
+            --out-name decentdb_wasm
+          cd bindings/web
+          npm run browser:install:ci
+          npm run browser:smoke:ci
+          cd ../..
 
       - name: Storage Soak Harness
         run: python tests/harness/runner.py tests/harness/scenarios/soak_storage.json

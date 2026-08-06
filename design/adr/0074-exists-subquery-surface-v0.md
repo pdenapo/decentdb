@@ -50,4 +50,4 @@ Add initial SQL subquery support only for `EXISTS (subquery)` with strict limits
 ### References
 
 - SQL enhancements roadmap: `design/SQL_ENHANCEMENTS_PLAN.md` (EXISTS + subquery open question)
-- Parser ADR: `design/adr/0035-sql-parser-libpg-query.md`
+- Parser ADR: `design/adr/0213-sql-parser-libpg-query.md`

@@ -113,7 +113,7 @@ than references because its entries are computed rather than allocated.
 
 ## References
 
-- `design/adr/0036-integer-primary-key.md`
+- `design/adr/0214-integer-primary-key.md`
 - `design/adr/0092-integer-pk-auto-increment.md`
 - `design/adr/0184-default-fast-planner-and-runtime-contract.md`
 - `design/adr/0200-resident-table-delete-tombstones-and-format-14.md`
