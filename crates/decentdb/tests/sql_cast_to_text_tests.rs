@@ -48,9 +48,7 @@ fn cast_timestamp_to_text() {
         &db,
         "SELECT CAST(CAST('2024-03-15 14:30:00' AS TIMESTAMP) AS TEXT)",
     );
-    // Si implementas format_datetime:
     assert_eq!(s, "2024-03-15 14:30:00");
-    // Si dejas micros crudos, cambia la assert al número esperado.
 }
 
 #[test]
