@@ -2599,7 +2599,11 @@ mod tests {
             .begin_reader(92, 777)
             .expect("register child reader");
         drop(admission);
-        std::fs::write(registered_path, reader.slot.to_string())
+        // The parent treats the registration path's existence as a complete value.
+        let pending_registration_path = registered_path.with_extension("pending");
+        std::fs::write(&pending_registration_path, reader.slot.to_string())
+            .expect("stage child registration");
+        std::fs::rename(pending_registration_path, registered_path)
             .expect("publish child registration");
         wait_for_test_path(&release_path, "parent reader release");
         drop(reader);
