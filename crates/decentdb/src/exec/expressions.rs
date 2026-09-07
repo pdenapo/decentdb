@@ -3128,7 +3128,7 @@ pub(super) fn format_time(datetime: DateTime<Utc>) -> String {
 }
 
 pub(super) fn format_datetime(datetime: DateTime<Utc>) -> String {
-    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+    datetime.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
 }
 
 pub(super) fn parse_uuid_text(value: &str) -> Result<[u8; 16]> {

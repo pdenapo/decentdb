@@ -52,6 +52,17 @@ fn cast_timestamp_to_text() {
 }
 
 #[test]
+fn cast_timestamp_to_text_with_microseconds() {
+    let db = mem_db();
+    let s = text(
+        &db,
+        "SELECT CAST(CAST('2024-03-15 14:30:00.123456' AS TIMESTAMP) AS TEXT);",
+    );
+    assert_eq!(s, "2024-03-15 14:30:00.123456");
+}
+
+
+#[test]
 fn cast_basic_types_to_text_still_work() {
     let db = mem_db();
     assert_eq!(text(&db, "SELECT CAST(42 AS TEXT)"), "42");
