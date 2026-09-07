@@ -522,7 +522,7 @@ pub(crate) fn parse_interval(input: &str) -> Result<(i32, i32, i64)> {
     let mut months: i32 = 0;
     let mut days: i32 = 0;
     let mut micros: i64 = 0;
-    for pair in tokens.chunks_exact(2) {
+    for pair in tokens.as_chunks::<2>().0 {
         let amount = pair[0];
         let unit = normalize_interval_unit(pair[1]);
         match unit.as_str() {

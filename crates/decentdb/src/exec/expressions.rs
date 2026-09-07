@@ -3128,7 +3128,7 @@ pub(super) fn format_time(datetime: DateTime<Utc>) -> String {
 }
 
 pub(super) fn format_datetime(datetime: DateTime<Utc>) -> String {
-    datetime.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
+    datetime.format("%Y-%m-%d %H:%M:%S%.f").to_string()
 }
 
 pub(super) fn parse_uuid_text(value: &str) -> Result<[u8; 16]> {
@@ -3150,7 +3150,7 @@ pub(super) fn parse_uuid_text(value: &str) -> Result<[u8; 16]> {
         return Err(DbError::sql("UUID_PARSE expects canonical UUID text"));
     }
     let mut uuid = [0u8; 16];
-    for (index, chunk) in compact.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in compact.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let text = std::str::from_utf8(chunk)
             .map_err(|_| DbError::sql("UUID_PARSE expects canonical UUID text"))?;
         uuid[index] = u8::from_str_radix(text, 16)
@@ -3786,7 +3786,7 @@ pub(super) fn eval_json_object(values: Vec<Value>) -> Result<Value> {
         ));
     }
     let mut object = BTreeMap::new();
-    for pair in values.chunks_exact(2) {
+    for pair in values.as_chunks::<2>().0 {
         let key = match &pair[0] {
             Value::Text(value) => value.clone(),
             Value::Null => return Err(DbError::sql("json_object keys cannot be NULL")),
@@ -4379,7 +4379,7 @@ pub(super) fn value_to_text(value: &Value) -> Result<String> {
         )),
         Value::TimestampMicros(micros) => {
             let dt = datetime_from_epoch_micros("CAST", *micros)?;
-            Ok(format_datetime(dt))  // "2024-03-15 14:30:00"
+            Ok(format_datetime(dt))
         }
         Value::Enum {
             enum_type_id,

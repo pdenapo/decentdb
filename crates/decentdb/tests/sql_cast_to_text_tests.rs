@@ -56,11 +56,59 @@ fn cast_timestamp_to_text_with_microseconds() {
     let db = mem_db();
     let s = text(
         &db,
-        "SELECT CAST(CAST('2024-03-15 14:30:00.123456' AS TIMESTAMP) AS TEXT);",
+        "SELECT CAST(CAST('2024-03-15 14:30:00.123456' AS TIMESTAMP) AS TEXT)",
     );
     assert_eq!(s, "2024-03-15 14:30:00.123456");
 }
 
+#[test]
+fn timestamp_text_round_trip_preserves_microseconds() {
+    let db = mem_db();
+    let result = exec(
+        &db,
+        "SELECT
+            CAST('2024-03-15 14:30:00.123456' AS TIMESTAMP),
+            CAST(
+                CAST(CAST('2024-03-15 14:30:00.123456' AS TIMESTAMP) AS TEXT)
+                AS TIMESTAMP
+            )",
+    );
+    let values = result.rows()[0].values();
+    assert_eq!(values[0], values[1]);
+}
+
+#[test]
+fn timestamp_string_functions_preserve_microseconds() {
+    let db = mem_db();
+    assert_eq!(
+        text(
+            &db,
+            "SELECT CONCAT('at=', CAST('2024-03-15 14:30:00.123456' AS TIMESTAMP))",
+        ),
+        "at=2024-03-15 14:30:00.123456"
+    );
+    assert_eq!(
+        text(
+            &db,
+            "SELECT CONCAT_WS('|', 'at', CAST('2024-03-15 14:30:00.123456' AS TIMESTAMP))",
+        ),
+        "at|2024-03-15 14:30:00.123456"
+    );
+
+    exec(&db, "CREATE TABLE timestamp_values(value TIMESTAMP)");
+    exec(
+        &db,
+        "INSERT INTO timestamp_values VALUES ('2024-03-15 14:30:00.123456')",
+    );
+    assert_eq!(
+        text(&db, "SELECT STRING_AGG(value, ',') FROM timestamp_values"),
+        "2024-03-15 14:30:00.123456"
+    );
+    assert_eq!(
+        text(&db, "SELECT GROUP_CONCAT(value, ',') FROM timestamp_values"),
+        "2024-03-15 14:30:00.123456"
+    );
+}
 
 #[test]
 fn cast_basic_types_to_text_still_work() {

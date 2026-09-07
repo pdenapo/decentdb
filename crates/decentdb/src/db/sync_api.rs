@@ -1076,7 +1076,7 @@ pub(super) fn parse_uuid_text(input: &str) -> Result<[u8; 16]> {
         )));
     }
     let mut bytes = [0u8; 16];
-    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(chunk)
             .map_err(|error| DbError::sql(format!("invalid UUID record: {error}")))?;
         bytes[index] = u8::from_str_radix(pair, 16)
@@ -1098,7 +1098,7 @@ pub(super) fn parse_json_blob(input: &str) -> Result<Vec<u8>> {
         return Err(DbError::sql("blob JSON text must have even length"));
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.as_bytes().chunks_exact(2) {
+    for chunk in hex.as_bytes().as_chunks::<2>().0 {
         let pair = std::str::from_utf8(chunk)
             .map_err(|error| DbError::sql(format!("invalid blob hex record: {error}")))?;
         bytes.push(

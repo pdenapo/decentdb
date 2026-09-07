@@ -1302,8 +1302,7 @@ fn hex_to_bytes(input: &str) -> Result<Vec<u8>> {
         return Err(anyhow!("hex blob must have an even number of characters"));
     }
     let mut bytes = Vec::with_capacity(input.len() / 2);
-    let chars = input.as_bytes().chunks_exact(2);
-    for pair in chars {
+    for pair in input.as_bytes().as_chunks::<2>().0 {
         let byte = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
         bytes.push(byte);
     }
