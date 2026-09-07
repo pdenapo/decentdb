@@ -1604,7 +1604,7 @@ fn normalize_binary_string_literal(raw: &str) -> Result<Value> {
         return Err(unsupported("invalid hex BLOB literal length"));
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.as_bytes().chunks_exact(2) {
+    for chunk in hex.as_bytes().as_chunks::<2>().0 {
         let pair =
             std::str::from_utf8(chunk).map_err(|_| unsupported("invalid hex BLOB literal"))?;
         bytes.push(

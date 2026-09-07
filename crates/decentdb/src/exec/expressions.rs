@@ -3128,7 +3128,7 @@ pub(super) fn format_time(datetime: DateTime<Utc>) -> String {
 }
 
 pub(super) fn format_datetime(datetime: DateTime<Utc>) -> String {
-    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+    datetime.format("%Y-%m-%d %H:%M:%S%.f").to_string()
 }
 
 pub(super) fn parse_uuid_text(value: &str) -> Result<[u8; 16]> {
@@ -3150,7 +3150,7 @@ pub(super) fn parse_uuid_text(value: &str) -> Result<[u8; 16]> {
         return Err(DbError::sql("UUID_PARSE expects canonical UUID text"));
     }
     let mut uuid = [0u8; 16];
-    for (index, chunk) in compact.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in compact.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let text = std::str::from_utf8(chunk)
             .map_err(|_| DbError::sql("UUID_PARSE expects canonical UUID text"))?;
         uuid[index] = u8::from_str_radix(text, 16)
@@ -3786,7 +3786,7 @@ pub(super) fn eval_json_object(values: Vec<Value>) -> Result<Value> {
         ));
     }
     let mut object = BTreeMap::new();
-    for pair in values.chunks_exact(2) {
+    for pair in values.as_chunks::<2>().0 {
         let key = match &pair[0] {
             Value::Text(value) => value.clone(),
             Value::Null => return Err(DbError::sql("json_object keys cannot be NULL")),
@@ -4377,7 +4377,10 @@ pub(super) fn value_to_text(value: &Value) -> Result<String> {
             value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
             value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15]
         )),
-        Value::TimestampMicros(value) => Ok(value.to_string()),
+        Value::TimestampMicros(micros) => {
+            let dt = datetime_from_epoch_micros("CAST", *micros)?;
+            Ok(format_datetime(dt))
+        }
         Value::Enum {
             enum_type_id,
             label_id,
@@ -4429,32 +4432,10 @@ pub(super) fn cast_value(value: Value, target_type: crate::catalog::ColumnType) 
                 .map_err(|_| DbError::sql("invalid FLOAT64 cast")),
             other => Err(DbError::sql(format!("cannot cast {other:?} to FLOAT64"))),
         },
-        crate::catalog::ColumnType::Text => Ok(Value::Text(match value {
-            Value::Text(value) => value,
-            Value::Int64(value) => value.to_string(),
-            Value::Float64(value) => value.to_string(),
-            Value::Bool(value) => value.to_string(),
-            Value::Enum {
-                enum_type_id,
-                label_id,
-            } => format!("{enum_type_id}:{label_id}"),
-            Value::IpAddr { family, addr } => format_ip_addr(family, &addr)?,
-            Value::Cidr {
-                family,
-                prefix_len,
-                network,
-            } => format_cidr(family, prefix_len, &network)?,
-            Value::MacAddr { len, bytes } => format_mac_addr(len, &bytes)?,
-            Value::DateDays(days) => format_date_days(days),
-            Value::TimeMicros(micros) => format_time_micros(micros)?,
-            Value::TimestampTzMicros(micros) => format_timestamp_tz_micros(micros),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            } => format_interval(months, days, micros),
-            other => return Err(DbError::sql(format!("cannot cast {other:?} to TEXT"))),
-        })),
+        crate::catalog::ColumnType::Text => match value {
+            Value::Text(value) => Ok(Value::Text(value)),
+            other => Ok(Value::Text(value_to_text(&other)?)),
+        },
         crate::catalog::ColumnType::Bool => match value {
             Value::Bool(value) => Ok(Value::Bool(value)),
             Value::Text(value) => match value.to_ascii_lowercase().as_str() {

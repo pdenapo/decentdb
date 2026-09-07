@@ -123,6 +123,10 @@ Date and time value stored natively as microseconds since the Unix epoch.
 Accepts ISO 8601 string literals on INSERT; values are read back as formatted strings
 (`YYYY-MM-DD HH:MM:SS[.ffffff]`).
 
+Converting a TIMESTAMP to text, including through `CAST`, `CONCAT`,
+`CONCAT_WS`, `STRING_AGG`, or `GROUP_CONCAT`, preserves nonzero fractional
+seconds through the stored microsecond precision.
+
 `TIMESTAMP`, `TIMESTAMP WITHOUT TIME ZONE`, and `DATETIME` map to the native
 TIMESTAMP type.
 

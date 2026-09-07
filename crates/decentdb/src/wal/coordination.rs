@@ -1132,7 +1132,7 @@ impl ProcessCoordinator {
         const SLOT_BYTES: usize = READER_SLOT_COUNT as usize * READER_SLOT_LEN as usize;
         let encoded = encode_reader_slot(empty_reader_slot_record());
         let mut bytes = [0_u8; SLOT_BYTES];
-        for chunk in bytes.chunks_exact_mut(READER_SLOT_LEN as usize) {
+        for chunk in bytes.as_chunks_mut::<{ READER_SLOT_LEN as usize }>().0 {
             chunk.copy_from_slice(&encoded);
         }
         write_all_at(self.inner.file.as_ref(), HEADER_LEN, &bytes)

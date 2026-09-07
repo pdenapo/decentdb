@@ -1401,7 +1401,7 @@ fn parse_hex_option(value: &str, key: &str) -> Result<Vec<u8>> {
         )));
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
-    for chunk in value.as_bytes().chunks_exact(2) {
+    for chunk in value.as_bytes().as_chunks::<2>().0 {
         let pair = std::str::from_utf8(chunk)
             .map_err(|_| DbError::sql(format!("invalid hex value for option {key}")))?;
         bytes.push(
