@@ -4432,7 +4432,10 @@ pub(super) fn cast_value(value: Value, target_type: crate::catalog::ColumnType) 
                 .map_err(|_| DbError::sql("invalid FLOAT64 cast")),
             other => Err(DbError::sql(format!("cannot cast {other:?} to FLOAT64"))),
         },
-        crate::catalog::ColumnType::Text => Ok(Value::Text(value_to_text(&value)?)),
+        crate::catalog::ColumnType::Text => match value {
+            Value::Text(value) => Ok(Value::Text(value)),
+            other => Ok(Value::Text(value_to_text(&other)?)),
+        },
         crate::catalog::ColumnType::Bool => match value {
             Value::Bool(value) => Ok(Value::Bool(value)),
             Value::Text(value) => match value.to_ascii_lowercase().as_str() {
