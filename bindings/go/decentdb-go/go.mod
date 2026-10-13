@@ -1,4 +1,4 @@
-module github.com/sphildreth/decentdb-go
+module github.com/sphildreth/decentdb/bindings/go/decentdb-go
 
 go 1.25.5
 

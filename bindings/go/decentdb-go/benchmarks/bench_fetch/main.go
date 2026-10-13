@@ -14,7 +14,7 @@ import (
 	"sort"
 	"time"
 
-	_ "github.com/sphildreth/decentdb-go"
+	_ "github.com/sphildreth/decentdb/bindings/go/decentdb-go"
 	_ "modernc.org/sqlite"
 )
 
