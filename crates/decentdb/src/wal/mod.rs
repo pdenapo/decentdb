@@ -1306,13 +1306,49 @@ mod tests {
     }
 
     fn consume_atomic_failure(counter: &AtomicUsize) -> bool {
-        counter
-            .fetch_update(
+        // Use compare_exchange_weak to support the Rust 1.88 MSRV without the
+        // fetch_update API deprecated by newer toolchains.
+        let mut remaining = counter.load(AtomicOrdering::Acquire);
+        while let Some(next) = remaining.checked_sub(1) {
+            match counter.compare_exchange_weak(
+                remaining,
+                next,
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
+            ) {
+                Ok(_) => return true,
+                Err(actual) => remaining = actual,
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn atomic_failure_counter_is_consumed_exactly_once_per_failure() {
+        let counter = AtomicUsize::new(1024);
+        let barrier = std::sync::Barrier::new(8);
+        let consumed = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let mut consumed = 0;
+                        while consume_atomic_failure(&counter) {
+                            consumed += 1;
+                        }
+                        consumed
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().expect("failure counter thread"))
+                .sum::<usize>()
+        });
+
+        assert_eq!(consumed, 1024);
+        assert_eq!(counter.load(AtomicOrdering::Acquire), 0);
+        assert!(!consume_atomic_failure(&counter));
     }
 
     #[test]
