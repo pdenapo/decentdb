@@ -42,7 +42,7 @@ pub fn stringify_value(value: &Value) -> String {
             }
         }
         Value::Uuid(value) => hex_encode(value),
-        Value::TimestampMicros(value) => value.to_string(),
+        Value::TimestampMicros(value) => format_timestamp_micros(*value, ' '),
         Value::Enum {
             enum_type_id,
             label_id,
@@ -56,7 +56,7 @@ pub fn stringify_value(value: &Value) -> String {
         Value::MacAddr { len, bytes } => format_mac_addr(*len, bytes),
         Value::DateDays(days) => format_date_days(*days),
         Value::TimeMicros(micros) => format_time_micros(*micros),
-        Value::TimestampTzMicros(micros) => format!("{}Z", format_timestamp_micros(*micros, 'T')),
+        Value::TimestampTzMicros(micros) => format!("{}+00", format_timestamp_micros(*micros, ' ')),
         Value::Interval {
             months,
             days,

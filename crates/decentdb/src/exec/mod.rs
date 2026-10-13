@@ -22,7 +22,9 @@ mod dml_unit_tests;
 mod runtime_unit_tests;
 
 pub(crate) mod cte;
+mod decimal;
 mod expressions;
+mod type_of;
 
 pub(crate) mod bench_queries;
 pub(crate) mod codec;

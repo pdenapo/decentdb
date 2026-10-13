@@ -79,6 +79,24 @@ int main(void) {
 
   check(ddb_db_open_or_create(":memory:", &db), "open_or_create");
   check(ddb_db_execute(db,
+                      "SELECT CAST('0.1' AS NUMERIC) + CAST('0.2' AS NUMERIC),"
+                      "TO_TIMESTAMP(1711929600123456 / 1000000.0),"
+                      "PG_TYPEOF(TO_TIMESTAMP(0))",
+                      NULL, 0, &result),
+        "decimal arithmetic and timestamp types");
+  ddb_value_t numeric_value;
+  check(ddb_result_value_copy(result, 0, 0, &numeric_value), "copy decimal result");
+  expect_tag(&numeric_value, DDB_VALUE_DECIMAL, "decimal arithmetic result");
+  expect_i64_eq(numeric_value.decimal_scaled, 3, "decimal coefficient");
+  expect_u8_eq(numeric_value.decimal_scale, 1, "decimal scale");
+  check(ddb_value_dispose(&numeric_value), "dispose decimal result");
+  check(ddb_result_value_copy(result, 0, 1, &numeric_value), "copy epoch result");
+  expect_tag(&numeric_value, DDB_VALUE_TIMESTAMPTZ_MICROS, "epoch result");
+  expect_i64_eq(numeric_value.timestamptz_micros, 1711929600123456LL,
+                "epoch microseconds");
+  check(ddb_value_dispose(&numeric_value), "dispose epoch result");
+  check(ddb_result_free(&result), "free numeric compatibility result");
+  check(ddb_db_execute(db,
                        "CREATE TABLE smoke (id INT64 PRIMARY KEY, name TEXT)",
                        NULL, 0, &result),
         "create");

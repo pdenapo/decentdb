@@ -502,6 +502,15 @@ pub(super) fn eval_function(
     if name.eq_ignore_ascii_case("bm25") {
         return eval_bm25(runtime, args, dataset, row, params, ctes, excluded);
     }
+    if matches!(name, "pg_typeof" | "pg_catalog.pg_typeof") {
+        if args.len() != 1 {
+            return Err(DbError::sql("PG_TYPEOF expects 1 argument"));
+        }
+        let value = runtime.eval_expr(&args[0], dataset, row, params, ctes, excluded)?;
+        return Ok(Value::Text(
+            super::type_of::type_name(runtime, &args[0], &value, dataset, params).to_string(),
+        ));
+    }
 
     let values = args
         .iter()
@@ -2640,16 +2649,42 @@ pub(super) fn eval_to_timestamp(values: Vec<Value>) -> Result<Value> {
     }
     match (&values[0], values.get(1)) {
         (Value::Null, _) => Ok(Value::Null),
-        (Value::Int64(epoch), None) => Ok(Value::TimestampMicros(
+        (Value::Int64(epoch), None) => Ok(Value::TimestampTzMicros(
             epoch
                 .checked_mul(1_000_000)
                 .ok_or_else(|| DbError::sql("TO_TIMESTAMP epoch is out of range"))?,
         )),
-        (Value::Float64(epoch), None) => Ok(Value::TimestampMicros((epoch * 1_000_000.0) as i64)),
-        (Value::Text(text), None) => Ok(Value::TimestampMicros(
+        (Value::Float64(epoch), None) => {
+            let micros = (epoch * 1_000_000.0).round();
+            if !micros.is_finite() || micros < i64::MIN as f64 || micros >= -(i64::MIN as f64) {
+                return Err(DbError::sql("TO_TIMESTAMP epoch is out of range"));
+            }
+            Ok(Value::TimestampTzMicros(micros as i64))
+        }
+        (Value::Decimal { scaled, scale }, None) => {
+            let micros = if *scale <= 6 {
+                i128::from(*scaled) * 10_i128.pow(u32::from(6 - *scale))
+            } else if let Some(divisor) = 10_i128.checked_pow(u32::from(*scale - 6)) {
+                let scaled = i128::from(*scaled);
+                let quotient = scaled / divisor;
+                let remainder = scaled % divisor;
+                quotient
+                    + if remainder.unsigned_abs() * 2 >= divisor as u128 {
+                        scaled.signum()
+                    } else {
+                        0
+                    }
+            } else {
+                0
+            };
+            Ok(Value::TimestampTzMicros(i64::try_from(micros).map_err(
+                |_| DbError::sql("TO_TIMESTAMP epoch is out of range"),
+            )?))
+        }
+        (Value::Text(text), None) => Ok(Value::TimestampTzMicros(
             parse_datetime_text("TO_TIMESTAMP", text)?.timestamp_micros(),
         )),
-        (Value::Text(text), Some(Value::Text(format))) => Ok(Value::TimestampMicros(
+        (Value::Text(text), Some(Value::Text(format))) => Ok(Value::TimestampTzMicros(
             parse_to_timestamp_with_format(text, format)?.timestamp_micros(),
         )),
         (_, Some(Value::Null)) => Ok(Value::Null),
@@ -4813,6 +4848,32 @@ pub(super) fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Val
         return Ok(result);
     }
     match (left, right) {
+        (
+            Value::Decimal {
+                scaled: left,
+                scale: left_scale,
+            },
+            Value::Decimal {
+                scaled: right,
+                scale: right_scale,
+            },
+        ) => super::decimal::arithmetic(op, (left, left_scale), (right, right_scale)),
+        (Value::Decimal { scaled, scale }, Value::Int64(right)) => {
+            super::decimal::arithmetic(op, (scaled, scale), (right, 0))
+        }
+        (Value::Int64(left), Value::Decimal { scaled, scale }) => {
+            super::decimal::arithmetic(op, (left, 0), (scaled, scale))
+        }
+        (Value::Decimal { scaled, scale }, Value::Float64(right)) => arithmetic(
+            op,
+            Value::Float64(decimal_to_f64(scaled, scale)),
+            Value::Float64(right),
+        ),
+        (Value::Float64(left), Value::Decimal { scaled, scale }) => arithmetic(
+            op,
+            Value::Float64(left),
+            Value::Float64(decimal_to_f64(scaled, scale)),
+        ),
         (Value::Int64(left), Value::Int64(right)) => {
             if matches!(op, BinaryOp::Div | BinaryOp::Mod) && right == 0 {
                 return Ok(Value::Null);

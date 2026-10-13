@@ -396,6 +396,13 @@ pub(crate) fn rewrite_simple_grouped_output_expr(
             )?),
             collation: collation.clone(),
         }),
+        // This optimization substitutes aggregates with untyped synthetic
+        // columns. Keep the original expressions for SQL type inspection.
+        Expr::Function { name, .. }
+            if matches!(name.as_str(), "pg_typeof" | "pg_catalog.pg_typeof") =>
+        {
+            None
+        }
         Expr::Function { name, args } => Some(Expr::Function {
             name: name.clone(),
             args: args
@@ -12516,6 +12523,11 @@ impl EngineRuntime {
                 ),
                 negated: *negated,
             },
+            Expr::Function { name, .. }
+                if matches!(name.as_str(), "pg_typeof" | "pg_catalog.pg_typeof") =>
+            {
+                return Ok(None)
+            }
             Expr::Function { name, args } => Expr::Function {
                 name: name.clone(),
                 args: {

@@ -16,6 +16,30 @@ import (
 	"time"
 )
 
+func TestDecimalArithmeticAndTimestampTypeInspection(t *testing.T) {
+	db, err := sql.Open("decentdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var amount interface{}
+	var timestamp time.Time
+	var typeName string
+	err = db.QueryRow("SELECT CAST('0.1' AS NUMERIC) + CAST('0.2' AS NUMERIC), TO_TIMESTAMP(1711929600123456 / 1000000.0), PG_TYPEOF(TO_TIMESTAMP(0))").Scan(&amount, &timestamp, &typeName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if amount != (Decimal{Unscaled: 3, Scale: 1}) {
+		t.Fatalf("expected exact decimal 0.3, got %#v", amount)
+	}
+	if !timestamp.Equal(time.UnixMicro(1711929600123456).UTC()) {
+		t.Fatalf("unexpected timestamp %v", timestamp)
+	}
+	if typeName != "timestamp with time zone" {
+		t.Fatalf("unexpected timestamp type %q", typeName)
+	}
+}
+
 func TestDriver(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "decentdb-test-*")
 	if err != nil {

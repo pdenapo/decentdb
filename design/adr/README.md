@@ -2,6 +2,8 @@
 
 This directory contains the historical and active ADRs for DecentDB.
 
+- **0215-decimal-arithmetic-and-sql-type-inspection.md**: Defines checked decimal arithmetic, timestamp return/display semantics, PG_TYPEOF type names, and instrumentation-aware performance validation.
+
 > **Note on historical context:** Some earlier ADRs (0001 through 0117) reference
 > older file paths or module names. The *architectural decisions* (for example
 > WAL formats, B-Tree layouts, and SQL semantics) remain valid and binding for

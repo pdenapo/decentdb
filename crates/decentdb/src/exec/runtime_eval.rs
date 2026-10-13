@@ -2282,6 +2282,12 @@ impl EngineRuntime {
                     UnaryOp::Negate => match value {
                         Value::Int64(value) => Ok(Value::Int64(-value)),
                         Value::Float64(value) => Ok(Value::Float64(-value)),
+                        Value::Decimal { scaled, scale } => Ok(Value::Decimal {
+                            scaled: scaled
+                                .checked_neg()
+                                .ok_or_else(|| DbError::sql("DECIMAL arithmetic overflow"))?,
+                            scale,
+                        }),
                         Value::Null => Ok(Value::Null),
                         other => Err(DbError::sql(format!("cannot negate {other:?}"))),
                     },
@@ -2428,6 +2434,15 @@ impl EngineRuntime {
                     .map(|arg| self.eval_group_expr(arg, dataset, group_row_indexes, params, ctes))
                     .collect::<Result<Vec<_>>>()?;
                 match name.as_str() {
+                    "pg_typeof" | "pg_catalog.pg_typeof" => {
+                        if args.len() != 1 {
+                            return Err(DbError::sql("PG_TYPEOF expects 1 argument"));
+                        }
+                        Ok(Value::Text(
+                            super::type_of::type_name(self, &args[0], &values[0], dataset, params)
+                                .to_string(),
+                        ))
+                    }
                     "coalesce" => Ok(values
                         .into_iter()
                         .find(|value| !matches!(value, Value::Null))
@@ -2568,6 +2583,12 @@ impl EngineRuntime {
                     UnaryOp::Negate => match value {
                         Value::Int64(value) => Ok(Value::Int64(-value)),
                         Value::Float64(value) => Ok(Value::Float64(-value)),
+                        Value::Decimal { scaled, scale } => Ok(Value::Decimal {
+                            scaled: scaled
+                                .checked_neg()
+                                .ok_or_else(|| DbError::sql("DECIMAL arithmetic overflow"))?,
+                            scale,
+                        }),
                         Value::Null => Ok(Value::Null),
                         other => Err(DbError::sql(format!("cannot negate {other:?}"))),
                     },

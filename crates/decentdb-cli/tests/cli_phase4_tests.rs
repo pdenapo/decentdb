@@ -50,6 +50,30 @@ fn run_result(args: &[&str]) -> (i32, String, String) {
 }
 
 #[test]
+fn timestamp_queries_render_dates_in_exec_and_repl() {
+    let sql = "SELECT TO_TIMESTAMP(1711929600123456 / 1000000.0), CAST('2024-04-01 00:00:00.123456' AS TIMESTAMP), PG_TYPEOF(TO_TIMESTAMP(0))";
+    for format in ["table", "json", "csv"] {
+        let output = run(&["exec", "--db", ":memory:", "--sql", sql, "--format", format]);
+        assert!(output.contains("2024-04-01 00:00:00.123456+00"), "{output}");
+        assert!(output.contains("timestamp with time zone"), "{output}");
+        assert!(!output.contains("1711929600123456"), "{output}");
+    }
+    let mut child = Command::new(bin())
+        .args(["repl", "--db", ":memory:"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{sql};\n.quit").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("2024-04-01 00:00:00.123456+00"));
+}
+
+#[test]
 fn exec_and_schema_introspection_commands_work() {
     let dir = temp_dir();
     let db = dir.join("app.ddb");

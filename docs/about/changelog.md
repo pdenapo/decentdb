@@ -5,6 +5,24 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added checked DECIMAL/NUMERIC arithmetic and unary negation, including mixed
+  integer operands, scale alignment, and rounded division (#67).
+- Added `PG_TYPEOF` SQL type-name inspection, including typed NULL casts and
+  nullable catalog columns (#65).
+
+### Fixed
+
+- `TO_TIMESTAMP` now returns TIMESTAMPTZ, preserves epoch microseconds, and
+  rejects non-finite/out-of-range input. CLI and REPL timestamps render readable
+  dates rather than raw microseconds, completing the timestamp follow-up in #62.
+- Indexed-seek performance tests retain correctness and plan validation under
+  coverage/sanitizers while enforcing timing budgets on uninstrumented runs,
+  fixing Coverage Nightly run 38355054274.
+
 ## [2.17.2] - [2026-09-07]
 
 ### Fixed

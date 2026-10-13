@@ -96,6 +96,22 @@ Suitable for financial calculations where exactness is required.
 
 Range: Precision up to 18 digits (constrained by int64 backing storage).
 
+`DECIMAL`/`NUMERIC` supports checked `+`, `-`, `*`, `/`, `%`, and unary negation.
+Addition and subtraction align runtime scales, multiplication adds scales, and
+results normalize trailing zeros. Division uses the larger operand scale with
+at least six fractional digits, rounding ties away from zero. Overflow returns
+a SQL error; division and remainder by zero return NULL, like other numeric
+operators. Integer/decimal arithmetic remains exact; a `FLOAT64` operand
+promotes the operation to floating point.
+
+Fractional SQL literals retain `FLOAT64` semantics. Use explicit decimal casts
+for exact arithmetic, preferably from text when preserving all input digits:
+
+```sql
+SELECT CAST('0.1' AS NUMERIC) + CAST('0.2' AS NUMERIC) = CAST('0.3' AS NUMERIC);
+-- true
+```
+
 ```sql
 CREATE TABLE example (
     balance DECIMAL(10,2),    -- 10 total digits, 2 decimal places

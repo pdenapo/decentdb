@@ -3772,9 +3772,9 @@ fn extended_datetime_functions_to_timestamp_and_age() {
     assert_eq!(
         result.rows()[0].values(),
         &[
-            Value::TimestampMicros(1_710_505_800_000_000),
-            Value::TimestampMicros(1_710_513_000_000_000),
-            Value::TimestampMicros(1_710_460_800_000_000),
+            Value::TimestampTzMicros(1_710_505_800_000_000),
+            Value::TimestampTzMicros(1_710_513_000_000_000),
+            Value::TimestampTzMicros(1_710_460_800_000_000),
             Value::Text("1 days 00:00:00".to_string()),
         ]
     );
