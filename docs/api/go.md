@@ -50,7 +50,7 @@ display string.
 ## Use the Go driver from an application
 
 ```bash
-go get github.com/sphildreth/decentdb-go
+go get github.com/sphildreth/decentdb/bindings/go/decentdb-go
 ```
 
 ## Minimal `database/sql` usage
@@ -58,7 +58,7 @@ go get github.com/sphildreth/decentdb-go
 ```go
 import (
     "database/sql"
-    _ "github.com/sphildreth/decentdb-go"
+    _ "github.com/sphildreth/decentdb/bindings/go/decentdb-go"
 )
 
 db, err := sql.Open("decentdb", "file:/tmp/app.ddb")
@@ -148,7 +148,7 @@ ver := decentdb.EngineVersion()    // e.g. "2.0.0"
 The `DB` type provides DecentDB-specific operations beyond `database/sql`:
 
 ```go
-import "github.com/sphildreth/decentdb-go"
+import "github.com/sphildreth/decentdb/bindings/go/decentdb-go"
 
 db, err := decentdb.OpenDirect("/tmp/app.ddb")
 if err != nil { log.Fatal(err) }
@@ -185,8 +185,8 @@ import (
     "fmt"
     "log"
 
-    _ "github.com/sphildreth/decentdb-go"
-    decentdb "github.com/sphildreth/decentdb-go"
+    _ "github.com/sphildreth/decentdb/bindings/go/decentdb-go"
+    decentdb "github.com/sphildreth/decentdb/bindings/go/decentdb-go"
 )
 
 func main() {
