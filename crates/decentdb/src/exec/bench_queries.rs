@@ -4847,6 +4847,12 @@ impl EngineRuntime {
         let Some(right_column_index) = schema_column_index(right_schema, right_ref.column) else {
             return Ok(None);
         };
+        if !timestamp_key_types_match(
+            previous_schema.columns[previous_column_index].column_type,
+            right_schema.columns[right_column_index].column_type,
+        ) {
+            return Ok(None);
+        }
         if crate::exec::dml::row_id_alias_column_name(right_schema)
             .is_some_and(|column| identifiers_equal(column, right_ref.column))
         {

@@ -1,17 +1,16 @@
 //! SQL type names for PG_TYPEOF, including declared types of NULL expressions.
 
-use super::{ColumnType, Dataset, EngineRuntime};
+use super::{ColumnType, Dataset};
 use crate::record::value::Value;
 use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
 
 pub(super) fn type_name(
-    runtime: &EngineRuntime,
     expr: &Expr,
     value: &Value,
     dataset: &Dataset,
     params: &[Value],
 ) -> &'static str {
-    let column_type = value_type(value).or_else(|| declared_type(runtime, expr, dataset, params));
+    let column_type = value_type(value).or_else(|| declared_type(expr, dataset, params));
     match column_type {
         None => "unknown",
         Some(ColumnType::Int64) => "bigint",
@@ -59,8 +58,7 @@ fn value_type(value: &Value) -> Option<ColumnType> {
     })
 }
 
-fn declared_type(
-    runtime: &EngineRuntime,
+pub(super) fn declared_type(
     expr: &Expr,
     dataset: &Dataset,
     params: &[Value],
@@ -81,19 +79,12 @@ fn declared_type(
                             .is_some_and(|name| crate::catalog::identifiers_equal(name, table))
                     })
             })
-            .and_then(|binding| runtime.table_schema(binding.source_table.as_deref()?))
-            .and_then(|table| {
-                table
-                    .columns
-                    .iter()
-                    .find(|schema| crate::catalog::identifiers_equal(&schema.name, column))
-            })
-            .map(|schema| schema.column_type),
+            .and_then(|binding| binding.column_type),
         Expr::Unary {
             op: UnaryOp::Not, ..
         } => Some(ColumnType::Bool),
         Expr::Unary { expr, .. } | Expr::Collate { expr, .. } => {
-            declared_type(runtime, expr, dataset, params)
+            declared_type(expr, dataset, params)
         }
         Expr::Binary { left, op, right } => {
             if matches!(op, BinaryOp::Concat | BinaryOp::JsonExtractText) {
@@ -111,8 +102,26 @@ fn declared_type(
             ) {
                 return Some(ColumnType::Bool);
             }
-            let left = declared_type(runtime, left, dataset, params);
-            let right = declared_type(runtime, right, dataset, params);
+            let left = declared_type(left, dataset, params);
+            let right = declared_type(right, dataset, params);
+            if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+                use ColumnType::{Date, Int64, Interval, Text, Timestamp, TimestampTz};
+                match (op, left, right) {
+                    (_, Some(kind @ (Timestamp | TimestampTz)), Some(Int64 | Interval | Text))
+                    | (
+                        BinaryOp::Add,
+                        Some(Int64 | Interval | Text),
+                        Some(kind @ (Timestamp | TimestampTz)),
+                    ) => {
+                        return Some(kind);
+                    }
+                    (_, Some(Date), Some(Interval))
+                    | (BinaryOp::Add, Some(Interval), Some(Date))
+                    | (_, Some(Text), Some(Int64 | Text))
+                    | (BinaryOp::Add, Some(Int64), Some(Text)) => return Some(Timestamp),
+                    _ => {}
+                }
+            }
             if left == Some(ColumnType::Float64) || right == Some(ColumnType::Float64) {
                 Some(ColumnType::Float64)
             } else if left == Some(ColumnType::Decimal) || right == Some(ColumnType::Decimal) {
@@ -125,10 +134,11 @@ fn declared_type(
             "pg_typeof" | "lower" | "upper" | "trim" | "ltrim" | "rtrim" | "concat"
             | "concat_ws" | "substr" | "substring" | "version" => Some(ColumnType::Text),
             "to_timestamp" | "now" | "current_timestamp" => Some(ColumnType::TimestampTz),
+            "interval" => Some(ColumnType::Interval),
             "length" | "char_length" | "octet_length" => Some(ColumnType::Int64),
             "coalesce" | "nullif" | "greatest" | "least" | "abs" => args
                 .iter()
-                .find_map(|arg| declared_type(runtime, arg, dataset, params)),
+                .find_map(|arg| declared_type(arg, dataset, params)),
             _ => None,
         },
         Expr::Aggregate { name, args, .. } => match name.as_str() {
@@ -136,10 +146,10 @@ fn declared_type(
             "avg" | "total" => Some(ColumnType::Float64),
             "min" | "max" => args
                 .first()
-                .and_then(|arg| declared_type(runtime, arg, dataset, params)),
+                .and_then(|arg| declared_type(arg, dataset, params)),
             "sum" => args
                 .first()
-                .and_then(|arg| declared_type(runtime, arg, dataset, params))
+                .and_then(|arg| declared_type(arg, dataset, params))
                 .map(|column_type| {
                     if column_type == ColumnType::Decimal {
                         ColumnType::Float64
@@ -155,11 +165,11 @@ fn declared_type(
             ..
         } => branches
             .iter()
-            .find_map(|(_, result)| declared_type(runtime, result, dataset, params))
+            .find_map(|(_, result)| declared_type(result, dataset, params))
             .or_else(|| {
                 else_expr
                     .as_deref()
-                    .and_then(|expr| declared_type(runtime, expr, dataset, params))
+                    .and_then(|expr| declared_type(expr, dataset, params))
             }),
         Expr::IsNull { .. }
         | Expr::Between { .. }

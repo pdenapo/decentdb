@@ -289,6 +289,7 @@ impl EngineRuntime {
                     Some(plan.table_name.to_string()),
                     c.name.clone(),
                 )
+                .with_type(c.column_type)
             })
             .collect();
 

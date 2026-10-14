@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::catalog::ColumnType;
 use crate::record::value::Value;
 use smallvec::SmallVec;
 
@@ -120,6 +121,8 @@ impl QueryResult {
 pub(crate) struct ColumnBinding {
     pub(crate) table: Option<String>,
     pub(crate) source_table: Option<String>,
+    /// The resolved source type, retained even when the row value is NULL.
+    pub(crate) column_type: Option<ColumnType>,
     pub(crate) name: String,
     pub(crate) hidden: bool,
 }
@@ -178,6 +181,7 @@ impl ColumnBinding {
     pub(crate) fn visible(table: Option<String>, name: String) -> Self {
         Self {
             source_table: table.clone(),
+            column_type: None,
             table,
             name,
             hidden: false,
@@ -193,6 +197,7 @@ impl ColumnBinding {
         Self {
             table,
             source_table,
+            column_type: None,
             name,
             hidden: false,
         }
@@ -207,9 +212,16 @@ impl ColumnBinding {
         Self {
             table,
             source_table,
+            column_type: None,
             name,
             hidden: true,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_type(mut self, column_type: ColumnType) -> Self {
+        self.column_type = Some(column_type);
+        self
     }
 
     #[must_use]
@@ -217,6 +229,7 @@ impl ColumnBinding {
         Self {
             table: self.table.clone(),
             source_table: self.source_table.clone(),
+            column_type: self.column_type,
             name: self.name.clone(),
             hidden: false,
         }

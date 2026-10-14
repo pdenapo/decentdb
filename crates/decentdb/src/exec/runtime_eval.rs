@@ -326,12 +326,16 @@ impl EngineRuntime {
         let mut columns = Vec::new();
         for (index, item) in items.iter().enumerate() {
             match item {
-                SelectItem::Expr { expr, alias } => columns.push(ColumnBinding::visible(
-                    None,
-                    alias
-                        .clone()
-                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                )),
+                SelectItem::Expr { expr, alias } => {
+                    let mut binding = ColumnBinding::visible(
+                        None,
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                    );
+                    binding.column_type = super::type_of::declared_type(expr, dataset, params);
+                    columns.push(binding);
+                }
                 SelectItem::Wildcard => columns.extend(
                     dataset
                         .columns
@@ -1803,12 +1807,16 @@ impl EngineRuntime {
             .iter()
             .enumerate()
             .map(|(index, item)| match item {
-                SelectItem::Expr { expr, alias } => ColumnBinding::visible(
-                    None,
-                    alias
-                        .clone()
-                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                ),
+                SelectItem::Expr { expr, alias } => {
+                    let mut binding = ColumnBinding::visible(
+                        None,
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                    );
+                    binding.column_type = super::type_of::declared_type(expr, &dataset, params);
+                    binding
+                }
                 SelectItem::Wildcard => ColumnBinding::visible(None, format!("col{}", index + 1)),
                 SelectItem::QualifiedWildcard(_) => {
                     ColumnBinding::visible(None, format!("col{}", index + 1))
@@ -2439,7 +2447,7 @@ impl EngineRuntime {
                             return Err(DbError::sql("PG_TYPEOF expects 1 argument"));
                         }
                         Ok(Value::Text(
-                            super::type_of::type_name(self, &args[0], &values[0], dataset, params)
+                            super::type_of::type_name(&args[0], &values[0], dataset, params)
                                 .to_string(),
                         ))
                     }

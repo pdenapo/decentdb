@@ -682,6 +682,7 @@ impl EngineRuntime {
                     Some(plan.left_name.to_string()),
                     c.name.clone(),
                 )
+                .with_type(c.column_type)
             })
             .collect();
         let right_columns: Vec<ColumnBinding> = right_table
@@ -693,6 +694,7 @@ impl EngineRuntime {
                     Some(plan.right_name.to_string()),
                     c.name.clone(),
                 )
+                .with_type(c.column_type)
             })
             .collect();
 
@@ -1257,6 +1259,9 @@ impl EngineRuntime {
             }) {
                 let value =
                     self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
+                if !timestamp_lookup_matches_schema(table, column_name, &value) {
+                    return Ok(None);
+                }
                 if let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) {
                     let row_ids = keys.row_ids_for_value_set(&value)?;
                     if let Some(ref tracing) = self.tracing {
@@ -1955,6 +1960,9 @@ impl EngineRuntime {
         };
 
         let value = self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
+        if !timestamp_lookup_matches_schema(table, column_name, &value) {
+            return Ok(None);
+        }
         let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
             return Ok(None);
         };
@@ -2016,6 +2024,13 @@ impl EngineRuntime {
                     let join_position = plan.probe_join_columns.iter().position(|join_column| {
                         identifiers_equal(join_column, index_column_name)
                     })?;
+                    let probe_column_index = schema_column_index(probe_table, index_column_name)?;
+                    if !timestamp_key_types_match(
+                        filtered_table.columns[filtered_join_indexes[join_position]].column_type,
+                        probe_table.columns[probe_column_index].column_type,
+                    ) {
+                        return None;
+                    }
                     ordered_filtered_join_indexes.push(filtered_join_indexes[join_position]);
                 }
                 Some((index, ordered_filtered_join_indexes))
@@ -2091,6 +2106,7 @@ impl EngineRuntime {
                     Some(plan.probe_table.name.to_string()),
                     column.name.clone(),
                 )
+                .with_type(column.column_type)
             })
             .collect::<Vec<_>>();
         let mut columns = if plan.filtered_on_left {
@@ -2120,7 +2136,13 @@ impl EngineRuntime {
                 continue;
             }
             if let Some(probe_hash_rows) = probe_hash_rows.as_ref() {
-                let join_key = Row::new(join_values.iter().cloned().cloned().collect()).encode()?;
+                let join_key = Row::new(
+                    join_values
+                        .iter()
+                        .map(|value| equality_key_value(value))
+                        .collect(),
+                )
+                .encode()?;
                 let Some(matching_probe_rows) = probe_hash_rows.get(&join_key) else {
                     continue;
                 };
@@ -2306,6 +2328,18 @@ impl EngineRuntime {
                     let join_position = right_join_columns.iter().position(|join_column| {
                         identifiers_equal(join_column, index_column_name)
                     })?;
+                    let right_column_index = schema_column_index(right_table, index_column_name)?;
+                    let left_column_index = left_join_indexes[join_position];
+                    if matches!(
+                        right_table.columns[right_column_index].column_type,
+                        ColumnType::Timestamp | ColumnType::TimestampTz
+                    ) && left.rows.iter().any(|row| {
+                        row.get(left_column_index).is_some_and(|value| {
+                            !timestamp_lookup_matches_schema(right_table, index_column_name, value)
+                        })
+                    }) {
+                        return None;
+                    }
                     ordered_left_join_indexes.push(left_join_indexes[join_position]);
                 }
                 Some((index, ordered_left_join_indexes))
@@ -2381,6 +2415,7 @@ impl EngineRuntime {
                 Some(right_name.clone()),
                 column.name.clone(),
             )
+            .with_type(column.column_type)
         }));
         let right_column_count = right_table.columns.len();
         let is_left_outer = matches!(kind, JoinKind::Left | JoinKind::Full);
@@ -2410,7 +2445,13 @@ impl EngineRuntime {
             }
             let rows_before = rows.len();
             if let Some(right_hash_rows) = right_hash_rows.as_ref() {
-                let join_key = Row::new(join_values.iter().cloned().cloned().collect()).encode()?;
+                let join_key = Row::new(
+                    join_values
+                        .iter()
+                        .map(|value| equality_key_value(value))
+                        .collect(),
+                )
+                .encode()?;
                 if let Some(matching_rows) = right_hash_rows.get(&join_key) {
                     for (row_id, right_values) in matching_rows {
                         if let Some(matched_right_row_ids) = matched_right_row_ids.as_mut() {

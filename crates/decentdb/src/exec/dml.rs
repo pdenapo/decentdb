@@ -995,6 +995,9 @@ impl EngineRuntime {
         if filter_table.is_some_and(|name| !identifiers_equal(name, &table.name)) {
             return Ok(None);
         }
+        if !prepared_timestamp_lookup_matches_schema(table, column_name, value_expr) {
+            return Ok(None);
+        }
 
         let lookup = if row_id_alias_column_name(table)
             .is_some_and(|name| identifiers_equal(name, column_name))
@@ -1420,6 +1423,9 @@ impl EngineRuntime {
                 return Ok(None);
             };
             if filter_table.is_some_and(|name| !identifiers_equal(name, &table.name)) {
+                return Ok(None);
+            }
+            if !prepared_timestamp_lookup_matches_schema(&table, column_name, value_expr) {
                 return Ok(None);
             }
             let Some(value_source) = compile_prepared_simple_value_source(value_expr) else {
@@ -5083,6 +5089,7 @@ impl EngineRuntime {
                 .iter()
                 .map(|column| {
                     ColumnBinding::visible(Some(table_name.to_string()), column.name.clone())
+                        .with_type(column.column_type)
                 })
                 .collect(),
             rendered_rows.iter().map(|row| row.values.clone()).collect(),
@@ -5139,6 +5146,7 @@ impl EngineRuntime {
                 .iter()
                 .map(|column| {
                     ColumnBinding::visible(Some("excluded".to_string()), column.name.clone())
+                        .with_type(column.column_type)
                 })
                 .collect(),
             vec![excluded_values.to_vec()],
@@ -7990,6 +7998,9 @@ fn indexed_row_ids_for_filter(
     if runtime.visible_table_is_temporary(table_ref) {
         return Ok(None);
     }
+    if !super::timestamp_lookup_matches_schema(table, column_name, &value) {
+        return Ok(None);
+    }
 
     let Some(index) = runtime.catalog.indexes.values().find(|index| {
         identifiers_equal(&index.table_name, &table.name)
@@ -8818,6 +8829,21 @@ fn compile_prepared_simple_value_source(expr: &Expr) -> Option<PreparedSimpleVal
         }
         _ => None,
     }
+}
+
+fn prepared_timestamp_lookup_matches_schema(
+    table: &TableSchema,
+    column: &str,
+    expr: &Expr,
+) -> bool {
+    let Some(index) = super::schema_column_index(table, column) else {
+        return false;
+    };
+    let column_type = table.columns[index].column_type;
+    // A parameter's timestamp tag is unknown when compiling a prepared plan.
+    // Use the generic path unless its type is known to match the persisted key.
+    !matches!(column_type, ColumnType::Timestamp | ColumnType::TimestampTz)
+        || super::type_of::declared_type(expr, &Dataset::empty(), &[]) == Some(column_type)
 }
 
 pub(crate) fn resolve_prepared_simple_value(

@@ -1097,6 +1097,17 @@ impl EngineRuntime {
                 let previous_is_rowid_alias =
                     rowid_alias_column_index(table_schemas[previous_table_index])
                         == Some(previous_column_index);
+                let Some(current_column_index) =
+                    schema_column_index(table_schemas[current_table_index], current_ref.column)
+                else {
+                    return Ok(None);
+                };
+                if !timestamp_key_types_match(
+                    table_schemas[previous_table_index].columns[previous_column_index].column_type,
+                    table_schemas[current_table_index].columns[current_column_index].column_type,
+                ) {
+                    return Ok(None);
+                }
                 let Some(current_index) = self
                     .simple_btree_index_for_table_column(current_binding.name, current_ref.column)
                 else {

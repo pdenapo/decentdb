@@ -28,10 +28,19 @@ storage, and C ABI representation under ADR 0160.
   and text/format overloads. Epoch conversion preserves microseconds and rejects
   non-finite or out-of-range input. CLI timestamps render readable dates;
   TIMESTAMPTZ output explicitly identifies UTC.
+  Series generation and existing integer/text/INTERVAL arithmetic preserve
+  TIMESTAMPTZ values. Mixed TIMESTAMP/TIMESTAMPTZ comparisons and series interpret
+  TIMESTAMP microseconds as UTC, consistent with existing explicit casts.
+  Transient equality keys use UTC microseconds for both timestamp variants, so
+  hash joins, DISTINCT, and GROUP BY agree with comparisons. Encoded index seeks
+  require matching timestamp tags and otherwise use the generic execution path;
+  persisted row and index encoding remain unchanged.
 - PG_TYPEOF returns TEXT containing the SQL type name. It preserves declared
   types for casts and catalog columns, including NULL values; untyped NULL is
   `unknown`. This is a documented PostgreSQL compatibility subset, without
   introducing PostgreSQL OIDs or a REGTYPE storage type.
+  Column bindings retain resolved type metadata rather than resolving a table
+  name again; explicit main-table references remain correct under temp shadowing.
 - Coverage and sanitizer instrumentation retain indexed-seek correctness and
   plan assertions but do not enforce ordinary wall-clock performance budgets.
   Uninstrumented builds retain the performance gates.

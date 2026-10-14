@@ -170,6 +170,7 @@ pub(crate) fn simple_join_projection_eval_bindings(
             Some(left_table_name.to_string()),
             column.name.clone(),
         )
+        .with_type(column.column_type)
     }));
     bindings.extend(right_schema.columns.iter().map(|column| {
         ColumnBinding::visible_source(
@@ -177,6 +178,7 @@ pub(crate) fn simple_join_projection_eval_bindings(
             Some(right_table_name.to_string()),
             column.name.clone(),
         )
+        .with_type(column.column_type)
     }));
     bindings
 }
@@ -572,9 +574,11 @@ pub(crate) fn simple_fast_compare_values(
         (Value::Int64(left), Value::Int64(right)) => Some(left.cmp(right)),
         (Value::Float64(left), Value::Float64(right)) => Some(left.total_cmp(right)),
         (Value::DateDays(left), Value::DateDays(right)) => Some(left.cmp(right)),
-        (Value::TimestampMicros(left), Value::TimestampMicros(right)) => Some(left.cmp(right)),
+        (
+            Value::TimestampMicros(left) | Value::TimestampTzMicros(left),
+            Value::TimestampMicros(right) | Value::TimestampTzMicros(right),
+        ) => Some(left.cmp(right)),
         (Value::TimeMicros(left), Value::TimeMicros(right)) => Some(left.cmp(right)),
-        (Value::TimestampTzMicros(left), Value::TimestampTzMicros(right)) => Some(left.cmp(right)),
         _ => None,
     }
 }
@@ -892,6 +896,30 @@ pub(crate) fn simple_value_matches_column_type(column_type: ColumnType, value: &
     )
 }
 
+pub(crate) fn timestamp_key_types_match(left: ColumnType, right: ColumnType) -> bool {
+    !matches!(
+        (left, right),
+        (ColumnType::Timestamp, ColumnType::TimestampTz)
+            | (ColumnType::TimestampTz, ColumnType::Timestamp)
+    )
+}
+
+pub(crate) fn timestamp_lookup_matches_schema(
+    table: &TableSchema,
+    column: &str,
+    value: &Value,
+) -> bool {
+    let Some(index) = schema_column_index(table, column) else {
+        return false;
+    };
+    let value_type = match value {
+        Value::TimestampMicros(_) => ColumnType::Timestamp,
+        Value::TimestampTzMicros(_) => ColumnType::TimestampTz,
+        _ => return true,
+    };
+    timestamp_key_types_match(table.columns[index].column_type, value_type)
+}
+
 pub(crate) fn simple_range_bound_matches(
     candidate: &Value,
     lower_bound: Option<&SimpleRangeBoundValue>,
@@ -1027,7 +1055,7 @@ pub(crate) fn simple_indexed_join_constraint_equalities<'a>(
     left_schema: &'a TableSchema,
     right_schema: &'a TableSchema,
 ) -> Option<Vec<(QualifiedColumnRef<'a>, QualifiedColumnRef<'a>)>> {
-    match constraint {
+    let equalities = match constraint {
         JoinConstraint::On(on) => simple_join_equalities(on),
         JoinConstraint::Using(columns) if !columns.is_empty() => {
             let mut equalities = Vec::with_capacity(columns.len());
@@ -1066,7 +1094,19 @@ pub(crate) fn simple_indexed_join_constraint_equalities<'a>(
             }
             Some(equalities)
         }
+    }?;
+    let (left_columns, right_columns) = orient_join_equalities(&equalities, left, right)?;
+    for (left_column, right_column) in left_columns.iter().zip(&right_columns) {
+        let left_index = schema_column_index(left_schema, left_column)?;
+        let right_index = schema_column_index(right_schema, right_column)?;
+        if !timestamp_key_types_match(
+            left_schema.columns[left_index].column_type,
+            right_schema.columns[right_index].column_type,
+        ) {
+            return None;
+        }
     }
+    Some(equalities)
 }
 
 pub(crate) fn simple_indexed_join_using_columns(
@@ -2253,7 +2293,7 @@ pub(crate) fn simple_join_key_from_indexes(
     {
         return Ok(None);
     }
-    Row::new(join_values.iter().cloned().cloned().collect())
+    Row::new(join_values.into_iter().map(equality_key_value).collect())
         .encode()
         .map(Some)
 }
@@ -2931,6 +2971,7 @@ impl EngineRuntime {
             .iter()
             .map(|column| {
                 ColumnBinding::visible(Some(binding_name.to_string()), column.name.clone())
+                    .with_type(column.column_type)
             })
             .collect::<Vec<_>>();
 
@@ -3620,6 +3661,7 @@ impl EngineRuntime {
             .iter()
             .map(|column| {
                 ColumnBinding::visible(Some(binding_name.to_string()), column.name.clone())
+                    .with_type(column.column_type)
             })
             .collect::<Vec<_>>();
 
@@ -5162,6 +5204,9 @@ impl EngineRuntime {
                 &BTreeMap::new(),
                 None,
             )?;
+            if !timestamp_lookup_matches_schema(source_schema, filter_column, &filter_value) {
+                return Ok(None);
+            }
             if crate::exec::dml::row_id_alias_column_name(source_schema)
                 .is_some_and(|name| identifiers_equal(name, filter_column))
             {
@@ -5219,6 +5264,13 @@ impl EngineRuntime {
                     let join_position = probe_join_columns.iter().position(|join_column| {
                         identifiers_equal(join_column, index_column_name)
                     })?;
+                    let probe_column_index = schema_column_index(probe_schema, index_column_name)?;
+                    if !timestamp_key_types_match(
+                        source_schema.columns[source_join_indexes[join_position]].column_type,
+                        probe_schema.columns[probe_column_index].column_type,
+                    ) {
+                        return None;
+                    }
                     ordered_source_join_indexes.push(source_join_indexes[join_position]);
                 }
                 Some((index, ordered_source_join_indexes))
@@ -5577,7 +5629,13 @@ impl EngineRuntime {
             return Ok(early_stop_limit.is_some_and(|limit| rows.len() >= limit));
         }
 
-        let join_key = Row::new(join_values.iter().cloned().cloned().collect()).encode()?;
+        let join_key = Row::new(
+            join_values
+                .iter()
+                .map(|value| equality_key_value(value))
+                .collect(),
+        )
+        .encode()?;
         let probe_row_ids = if let Some(keys) = probe_keys {
             if join_values.len() == 1 {
                 keys.row_ids_for_value_set(join_values[0])?
@@ -7768,6 +7826,9 @@ impl EngineRuntime {
         )?;
         if matches!(value, Value::Null) {
             return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        }
+        if !timestamp_lookup_matches_schema(table_schema, filter_column, &value) {
+            return Ok(None);
         }
 
         let mut rows = Vec::new();
@@ -11704,15 +11765,19 @@ impl EngineRuntime {
         };
 
         let mut lookup_values = Vec::with_capacity(ordered_lookup_terms.len());
-        for (_, _, value_expr) in &ordered_lookup_terms {
-            lookup_values.push(self.eval_expr(
+        for (_, column, value_expr) in &ordered_lookup_terms {
+            let value = self.eval_expr(
                 value_expr,
                 &Dataset::empty(),
                 &[],
                 params,
                 &BTreeMap::new(),
                 None,
-            )?);
+            )?;
+            if !timestamp_lookup_matches_schema(table_schema, column, &value) {
+                return Ok(None);
+            }
+            lookup_values.push(value);
         }
         let filter_column = ordered_lookup_terms[0].1;
         let lookup_value = lookup_values

@@ -6580,7 +6580,10 @@ pub(super) fn table_row_dataset(table: &TableSchema, row: &[Value], table_name: 
         table
             .columns
             .iter()
-            .map(|column| ColumnBinding::visible(Some(table_name.to_string()), column.name.clone()))
+            .map(|column| {
+                ColumnBinding::visible(Some(table_name.to_string()), column.name.clone())
+                    .with_type(column.column_type)
+            })
             .collect(),
         vec![row.to_vec()],
     )
@@ -6596,6 +6599,7 @@ fn table_bindings_with_hidden_row_id(table: &TableSchema, table_name: &str) -> V
                 Some(table.name.clone()),
                 column.name.clone(),
             )
+            .with_type(column.column_type)
         })
         .collect::<Vec<_>>();
     columns.push(ColumnBinding::hidden_source(
@@ -9768,7 +9772,10 @@ fn table_output_columns(table: &TableSchema, alias: &Option<String>) -> Vec<Colu
     table
         .columns
         .iter()
-        .map(|column| ColumnBinding::visible(Some(table_name.clone()), column.name.clone()))
+        .map(|column| {
+            ColumnBinding::visible(Some(table_name.clone()), column.name.clone())
+                .with_type(column.column_type)
+        })
         .collect()
 }
 
@@ -10106,6 +10113,7 @@ fn indexed_join_table_eval_columns(
                 Some(schema.name.clone()),
                 column.name.clone(),
             )
+            .with_type(column.column_type)
         }));
     }
     Some(columns)
@@ -13126,12 +13134,14 @@ fn try_project_simple_select_items(
                     return Ok(None);
                 };
                 projection_plan.push(source_index);
-                output_columns.push(ColumnBinding::visible(
+                let mut binding = ColumnBinding::visible(
                     None,
                     alias
                         .clone()
                         .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                ));
+                );
+                binding.column_type = dataset.columns[source_index].column_type;
+                output_columns.push(binding);
             }
             SelectItem::Wildcard => {
                 for (source_index, binding) in dataset.columns.iter().enumerate() {

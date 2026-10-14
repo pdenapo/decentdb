@@ -77,8 +77,11 @@ index names return an empty result set for the table-valued helpers.
 
 `generate_series(start, stop [, step])` returns one visible column named
 `value`. It supports inclusive integer series with an optional integer step,
-timestamp series with an explicit `INTERVAL`, and date series with an explicit
+`TIMESTAMP` and `TIMESTAMPTZ` series with an explicit `INTERVAL`, and date series with an explicit
 whole-day `INTERVAL`.
+
+When either timestamp endpoint is `TIMESTAMPTZ`, the series retains that type
+and interprets any `TIMESTAMP` endpoint as UTC, consistent with explicit casts.
 
 ```sql
 SELECT value FROM generate_series(1, 5);
