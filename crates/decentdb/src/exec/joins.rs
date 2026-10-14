@@ -89,7 +89,9 @@ pub(crate) fn join_output_columns(
     let mut columns =
         Vec::with_capacity(using_columns.len() + left.columns.len() + right.columns.len());
     for column in using_columns {
-        columns.push(ColumnBinding::visible(None, column.name.clone()));
+        let mut binding = ColumnBinding::visible(None, column.name.clone());
+        binding.column_type = column.column_type;
+        columns.push(binding);
     }
     for (index, binding) in left.columns.iter().enumerate() {
         let mut binding = binding.clone();

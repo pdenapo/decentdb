@@ -357,6 +357,35 @@ fn pg_typeof_uses_resolved_schema_for_null_columns() {
 }
 
 #[test]
+fn pg_typeof_preserves_types_for_full_join_using_nulls_and_catalog_nulls() {
+    let db = db();
+    db.execute("CREATE TABLE left_keys (key NUMERIC)").unwrap();
+    db.execute("CREATE TABLE right_keys (key NUMERIC)").unwrap();
+    db.execute("INSERT INTO left_keys VALUES (NULL)").unwrap();
+    db.execute("INSERT INTO right_keys VALUES (NULL)").unwrap();
+    let result = db
+        .execute(
+            "SELECT PG_TYPEOF(key) FROM (SELECT key FROM left_keys) AS l FULL JOIN (SELECT key FROM right_keys) AS r USING (key)",
+        )
+        .unwrap();
+    assert_eq!(result.rows().len(), 2);
+    assert!(result
+        .rows()
+        .iter()
+        .all(|row| row.values() == [Value::Text("numeric".into())]));
+
+    db.execute("CREATE TABLE catalog_type_probe (amount NUMERIC)")
+        .unwrap();
+    assert_eq!(
+        values(
+            &db,
+            "SELECT PG_TYPEOF(column_default) FROM information_schema.columns WHERE table_name = 'catalog_type_probe' AND column_name = 'amount'"
+        ),
+        vec![Value::Text("text".into())]
+    );
+}
+
+#[test]
 fn mixed_timestamps_use_the_same_sql_equality_keys() {
     let db = db();
     db.execute("CREATE TABLE stamps (id INT, stamp TIMESTAMP)")

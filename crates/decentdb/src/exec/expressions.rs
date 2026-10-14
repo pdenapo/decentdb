@@ -3490,7 +3490,53 @@ pub(super) fn one_text_arg(function_name: &str, values: Vec<Value>) -> Result<St
 pub(super) fn visible_columns(table_name: &str, names: &[&str]) -> Vec<ColumnBinding> {
     names
         .iter()
-        .map(|name| ColumnBinding::visible(Some(table_name.to_string()), (*name).to_string()))
+        .map(|name| {
+            let column_type = match *name {
+                "cid" | "seq" | "seqno" | "rootpage" | "pk" | "hidden" | "unique" | "partial"
+                | "ordinal_position" | "id" | "notnull" | "desc" | "ncol" | "wr" | "strict" => {
+                    Some(ColumnType::Int64)
+                }
+                "key" if !identifiers_equal(table_name, "sys_audit_context") => {
+                    Some(ColumnType::Int64)
+                }
+                "value" => None,
+                "catalog_name"
+                | "schema_name"
+                | "schema_owner"
+                | "default_character_set_catalog"
+                | "default_character_set_schema"
+                | "default_character_set_name"
+                | "table_catalog"
+                | "table_schema"
+                | "table_name"
+                | "table_type"
+                | "column_name"
+                | "column_default"
+                | "is_nullable"
+                | "data_type"
+                | "type"
+                | "name"
+                | "tbl_name"
+                | "sql"
+                | "dflt_value"
+                | "origin"
+                | "coll"
+                | "table"
+                | "from"
+                | "to"
+                | "on_update"
+                | "on_delete"
+                | "match"
+                | "schema"
+                | "file" => Some(ColumnType::Text),
+                "key" => Some(ColumnType::Text),
+                _ => None,
+            };
+            let mut binding =
+                ColumnBinding::visible(Some(table_name.to_string()), (*name).to_string());
+            binding.column_type = column_type;
+            binding
+        })
         .collect()
 }
 

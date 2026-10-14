@@ -5,10 +5,11 @@
 
 ## Context
 
-Issues #67, #62, and #65 expose missing decimal arithmetic, raw timestamp CLI
-output, and missing SQL type inspection. ADRs 0072 and 0091 already require
-checked fixed-point arithmetic. TIMESTAMPTZ already has a distinct runtime,
-storage, and C ABI representation under ADR 0160.
+Issues #67, #62, and #65 cover decimal arithmetic, DECIMAL/NUMERIC-to-TEXT
+casting, and SQL type inspection, respectively. Separate follow-up work addresses
+timestamp behavior and coverage instrumentation. ADRs 0072 and 0091 already
+require checked fixed-point arithmetic. TIMESTAMPTZ already has a distinct
+runtime, storage, and C ABI representation under ADR 0160.
 
 ## Decision
 

@@ -13488,6 +13488,7 @@ pub(crate) struct JoinUsingColumn {
     name: String,
     left_index: usize,
     right_index: usize,
+    column_type: Option<ColumnType>,
 }
 
 pub(crate) struct JoinEvalContext<'a> {
@@ -13566,6 +13567,9 @@ fn resolve_join_using_columns(
                     name: left.columns[left_index].name.clone(),
                     left_index,
                     right_index,
+                    column_type: left.columns[left_index]
+                        .column_type
+                        .or(right.columns[right_index].column_type),
                 });
                 seen.push(column.clone());
             }
@@ -13585,6 +13589,9 @@ fn resolve_join_using_columns(
                     name: left.columns[left_index].name.clone(),
                     left_index,
                     right_index,
+                    column_type: left.columns[left_index]
+                        .column_type
+                        .or(right.columns[right_index].column_type),
                 });
             }
             Ok(pairs)
@@ -13619,6 +13626,9 @@ fn resolve_join_using_columns_for_schemas(
                     name: left_columns[left_idx].name.clone(),
                     left_index: left_idx,
                     right_index: right_idx,
+                    column_type: left_columns[left_idx]
+                        .column_type
+                        .or(right_columns[right_idx].column_type),
                 });
             }
             Ok(result)
@@ -13642,6 +13652,9 @@ fn resolve_join_using_columns_for_schemas(
                         name: left_columns[left_idx].name.clone(),
                         left_index: left_idx,
                         right_index: right_idx,
+                        column_type: left_columns[left_idx]
+                            .column_type
+                            .or(right_columns[right_idx].column_type),
                     });
                 }
             }

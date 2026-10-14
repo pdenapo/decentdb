@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `TO_TIMESTAMP` now returns TIMESTAMPTZ, preserves epoch microseconds, and
   rejects non-finite/out-of-range input. CLI and REPL timestamps render readable
-  dates rather than raw microseconds, completing the timestamp follow-up in #62.
+  dates rather than raw microseconds.
 - Indexed-seek performance tests retain correctness and plan validation under
   coverage/sanitizers while enforcing timing budgets on uninstrumented runs,
   fixing Coverage Nightly run 38355054274.
@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values. Timestamp text conversion now preserves nonzero fractional seconds
   through microsecond precision across casts, `CONCAT`, `CONCAT_WS`,
   `STRING_AGG`, and `GROUP_CONCAT`, while retaining the ownership-preserving
-  path for values that are already text.
+  path for values that are already text (#62).
 
 ## [2.17.1] - [2026-08-06]
 
