@@ -283,7 +283,14 @@ impl EngineRuntime {
         let columns: Vec<ColumnBinding> = table
             .columns
             .iter()
-            .map(|c| ColumnBinding::visible(Some(binding_name.to_string()), c.name.clone()))
+            .map(|c| {
+                ColumnBinding::visible_source(
+                    Some(binding_name.to_string()),
+                    Some(plan.table_name.to_string()),
+                    c.name.clone(),
+                )
+                .with_type(c.column_type)
+            })
             .collect();
 
         let empty_dataset = Dataset::with_rows(columns.clone(), Vec::new());

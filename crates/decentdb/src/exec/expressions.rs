@@ -502,6 +502,15 @@ pub(super) fn eval_function(
     if name.eq_ignore_ascii_case("bm25") {
         return eval_bm25(runtime, args, dataset, row, params, ctes, excluded);
     }
+    if matches!(name, "pg_typeof" | "pg_catalog.pg_typeof") {
+        if args.len() != 1 {
+            return Err(DbError::sql("PG_TYPEOF expects 1 argument"));
+        }
+        let value = runtime.eval_expr(&args[0], dataset, row, params, ctes, excluded)?;
+        return Ok(Value::Text(
+            super::type_of::type_name(&args[0], &value, dataset, params).to_string(),
+        ));
+    }
 
     let values = args
         .iter()
@@ -2640,16 +2649,42 @@ pub(super) fn eval_to_timestamp(values: Vec<Value>) -> Result<Value> {
     }
     match (&values[0], values.get(1)) {
         (Value::Null, _) => Ok(Value::Null),
-        (Value::Int64(epoch), None) => Ok(Value::TimestampMicros(
+        (Value::Int64(epoch), None) => Ok(Value::TimestampTzMicros(
             epoch
                 .checked_mul(1_000_000)
                 .ok_or_else(|| DbError::sql("TO_TIMESTAMP epoch is out of range"))?,
         )),
-        (Value::Float64(epoch), None) => Ok(Value::TimestampMicros((epoch * 1_000_000.0) as i64)),
-        (Value::Text(text), None) => Ok(Value::TimestampMicros(
+        (Value::Float64(epoch), None) => {
+            let micros = (epoch * 1_000_000.0).round();
+            if !micros.is_finite() || micros < i64::MIN as f64 || micros >= -(i64::MIN as f64) {
+                return Err(DbError::sql("TO_TIMESTAMP epoch is out of range"));
+            }
+            Ok(Value::TimestampTzMicros(micros as i64))
+        }
+        (Value::Decimal { scaled, scale }, None) => {
+            let micros = if *scale <= 6 {
+                i128::from(*scaled) * 10_i128.pow(u32::from(6 - *scale))
+            } else if let Some(divisor) = 10_i128.checked_pow(u32::from(*scale - 6)) {
+                let scaled = i128::from(*scaled);
+                let quotient = scaled / divisor;
+                let remainder = scaled % divisor;
+                quotient
+                    + if remainder.unsigned_abs() * 2 >= divisor as u128 {
+                        scaled.signum()
+                    } else {
+                        0
+                    }
+            } else {
+                0
+            };
+            Ok(Value::TimestampTzMicros(i64::try_from(micros).map_err(
+                |_| DbError::sql("TO_TIMESTAMP epoch is out of range"),
+            )?))
+        }
+        (Value::Text(text), None) => Ok(Value::TimestampTzMicros(
             parse_datetime_text("TO_TIMESTAMP", text)?.timestamp_micros(),
         )),
-        (Value::Text(text), Some(Value::Text(format))) => Ok(Value::TimestampMicros(
+        (Value::Text(text), Some(Value::Text(format))) => Ok(Value::TimestampTzMicros(
             parse_to_timestamp_with_format(text, format)?.timestamp_micros(),
         )),
         (_, Some(Value::Null)) => Ok(Value::Null),
@@ -3287,7 +3322,26 @@ pub(super) fn generate_series_rows(values: &[Value]) -> Result<Vec<Value>> {
                 days,
                 micros,
             },
-        ] => generate_timestamp_series_rows(*start, *stop, *months, *days, *micros),
+        ] => generate_timestamp_series_rows(*start, *stop, *months, *days, *micros, false),
+        [
+            Value::TimestampTzMicros(start),
+            Value::TimestampTzMicros(stop),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ] => generate_timestamp_series_rows(*start, *stop, *months, *days, *micros, true),
+        [
+            Value::TimestampMicros(start),
+            Value::TimestampTzMicros(stop),
+            Value::Interval { months, days, micros },
+        ]
+        | [
+            Value::TimestampTzMicros(start),
+            Value::TimestampMicros(stop),
+            Value::Interval { months, days, micros },
+        ] => generate_timestamp_series_rows(*start, *stop, *months, *days, *micros, true),
         [
             Value::DateDays(start),
             Value::DateDays(stop),
@@ -3298,11 +3352,12 @@ pub(super) fn generate_series_rows(values: &[Value]) -> Result<Vec<Value>> {
             },
         ] => generate_date_series_rows(*start, *stop, *months, *days, *micros),
         [Value::TimestampMicros(_), Value::TimestampMicros(_)]
+        | [Value::TimestampTzMicros(_), Value::TimestampTzMicros(_)]
         | [Value::DateDays(_), Value::DateDays(_)] => Err(DbError::sql(
             "temporal generate_series requires an INTERVAL step argument",
         )),
         _ => Err(DbError::sql(
-            "generate_series supports INT64 start/stop[/step], TIMESTAMP start/stop/INTERVAL step, and DATE start/stop/INTERVAL step",
+            "generate_series supports INT64 start/stop[/step], TIMESTAMP or TIMESTAMPTZ start/stop/INTERVAL step, and DATE start/stop/INTERVAL step",
         )),
     }
 }
@@ -3336,6 +3391,7 @@ pub(super) fn generate_timestamp_series_rows(
     months: i32,
     days: i32,
     micros: i64,
+    with_timezone: bool,
 ) -> Result<Vec<Value>> {
     let first_next = apply_interval_to_timestamp_micros(start, months, days, micros, true)?;
     let direction = first_next.cmp(&start);
@@ -3351,7 +3407,12 @@ pub(super) fn generate_timestamp_series_rows(
     let mut rows = Vec::new();
     let mut current = start;
     loop {
-        push_generate_series_value(&mut rows, Value::TimestampMicros(current))?;
+        let value = if with_timezone {
+            Value::TimestampTzMicros(current)
+        } else {
+            Value::TimestampMicros(current)
+        };
+        push_generate_series_value(&mut rows, value)?;
         let next = apply_interval_to_timestamp_micros(current, months, days, micros, true)?;
         if next == current {
             return Err(DbError::sql("generate_series step cannot be zero"));
@@ -3429,7 +3490,53 @@ pub(super) fn one_text_arg(function_name: &str, values: Vec<Value>) -> Result<St
 pub(super) fn visible_columns(table_name: &str, names: &[&str]) -> Vec<ColumnBinding> {
     names
         .iter()
-        .map(|name| ColumnBinding::visible(Some(table_name.to_string()), (*name).to_string()))
+        .map(|name| {
+            let column_type = match *name {
+                "cid" | "seq" | "seqno" | "rootpage" | "pk" | "hidden" | "unique" | "partial"
+                | "ordinal_position" | "id" | "notnull" | "desc" | "ncol" | "wr" | "strict" => {
+                    Some(ColumnType::Int64)
+                }
+                "key" if !identifiers_equal(table_name, "sys_audit_context") => {
+                    Some(ColumnType::Int64)
+                }
+                "value" => None,
+                "catalog_name"
+                | "schema_name"
+                | "schema_owner"
+                | "default_character_set_catalog"
+                | "default_character_set_schema"
+                | "default_character_set_name"
+                | "table_catalog"
+                | "table_schema"
+                | "table_name"
+                | "table_type"
+                | "column_name"
+                | "column_default"
+                | "is_nullable"
+                | "data_type"
+                | "type"
+                | "name"
+                | "tbl_name"
+                | "sql"
+                | "dflt_value"
+                | "origin"
+                | "coll"
+                | "table"
+                | "from"
+                | "to"
+                | "on_update"
+                | "on_delete"
+                | "match"
+                | "schema"
+                | "file" => Some(ColumnType::Text),
+                "key" => Some(ColumnType::Text),
+                _ => None,
+            };
+            let mut binding =
+                ColumnBinding::visible(Some(table_name.to_string()), (*name).to_string());
+            binding.column_type = column_type;
+            binding
+        })
         .collect()
 }
 
@@ -4813,6 +4920,32 @@ pub(super) fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Val
         return Ok(result);
     }
     match (left, right) {
+        (
+            Value::Decimal {
+                scaled: left,
+                scale: left_scale,
+            },
+            Value::Decimal {
+                scaled: right,
+                scale: right_scale,
+            },
+        ) => super::decimal::arithmetic(op, (left, left_scale), (right, right_scale)),
+        (Value::Decimal { scaled, scale }, Value::Int64(right)) => {
+            super::decimal::arithmetic(op, (scaled, scale), (right, 0))
+        }
+        (Value::Int64(left), Value::Decimal { scaled, scale }) => {
+            super::decimal::arithmetic(op, (left, 0), (scaled, scale))
+        }
+        (Value::Decimal { scaled, scale }, Value::Float64(right)) => arithmetic(
+            op,
+            Value::Float64(decimal_to_f64(scaled, scale)),
+            Value::Float64(right),
+        ),
+        (Value::Float64(left), Value::Decimal { scaled, scale }) => arithmetic(
+            op,
+            Value::Float64(left),
+            Value::Float64(decimal_to_f64(scaled, scale)),
+        ),
         (Value::Int64(left), Value::Int64(right)) => {
             if matches!(op, BinaryOp::Div | BinaryOp::Mod) && right == 0 {
                 return Ok(Value::Null);
@@ -4864,6 +4997,17 @@ pub(super) fn timestamp_interval_arithmetic(
     left: &Value,
     right: &Value,
 ) -> Result<Option<Value>> {
+    // Reuse the TIMESTAMP operator routes, preserving the UTC-aware value tag.
+    // This also keeps legacy integer and text interval operands composable with
+    // TO_TIMESTAMP, which returns TIMESTAMPTZ.
+    if let Value::TimestampTzMicros(timestamp) = left {
+        return timestamp_interval_arithmetic(op, &Value::TimestampMicros(*timestamp), right)
+            .map(|value| value.map(timestamp_with_timezone));
+    }
+    if let Value::TimestampTzMicros(timestamp) = right {
+        return timestamp_interval_arithmetic(op, left, &Value::TimestampMicros(*timestamp))
+            .map(|value| value.map(timestamp_with_timezone));
+    }
     match (op, left, right) {
         (BinaryOp::Add, Value::TimestampMicros(timestamp), Value::Int64(interval_micros)) => {
             Ok(Some(Value::TimestampMicros(apply_interval_micros(
@@ -4938,39 +5082,6 @@ pub(super) fn timestamp_interval_arithmetic(
             },
             Value::TimestampMicros(timestamp),
         ) => Ok(Some(Value::TimestampMicros(
-            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
-        ))),
-        (
-            BinaryOp::Add,
-            Value::TimestampTzMicros(timestamp),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ) => Ok(Some(Value::TimestampTzMicros(
-            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
-        ))),
-        (
-            BinaryOp::Sub,
-            Value::TimestampTzMicros(timestamp),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ) => Ok(Some(Value::TimestampTzMicros(
-            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, false)?,
-        ))),
-        (
-            BinaryOp::Add,
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-            Value::TimestampTzMicros(timestamp),
-        ) => Ok(Some(Value::TimestampTzMicros(
             apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
         ))),
         (
@@ -5067,6 +5178,13 @@ pub(super) fn timestamp_interval_arithmetic(
             )))
         }
         _ => Ok(None),
+    }
+}
+
+fn timestamp_with_timezone(value: Value) -> Value {
+    match value {
+        Value::TimestampMicros(micros) => Value::TimestampTzMicros(micros),
+        other => other,
     }
 }
 
@@ -5429,8 +5547,10 @@ pub(super) fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Or
         (Value::Text(left), Value::Text(right)) => Ok(left.cmp(right)),
         (Value::Blob(left), Value::Blob(right)) => Ok(left.cmp(right)),
         (Value::Uuid(left), Value::Uuid(right)) => Ok(left.cmp(right)),
-        (Value::TimestampMicros(left), Value::TimestampMicros(right)) => Ok(left.cmp(right)),
-        (Value::TimestampTzMicros(left), Value::TimestampTzMicros(right)) => Ok(left.cmp(right)),
+        (
+            Value::TimestampMicros(left) | Value::TimestampTzMicros(left),
+            Value::TimestampMicros(right) | Value::TimestampTzMicros(right),
+        ) => Ok(left.cmp(right)),
         (Value::DateDays(left), Value::DateDays(right)) => Ok(left.cmp(right)),
         (Value::TimeMicros(left), Value::TimeMicros(right)) => Ok(left.cmp(right)),
         (
@@ -5724,7 +5844,16 @@ pub(super) fn like_match_chars(input: &[char], pattern: &[char], escape: Option<
 }
 
 pub(super) fn row_identity(row: &[Value]) -> Result<Vec<u8>> {
-    Row::new(row.to_vec()).encode()
+    Row::new(row.iter().map(equality_key_value).collect()).encode()
+}
+
+pub(super) fn equality_key_value(value: &Value) -> Value {
+    match value {
+        // SQL compares both timestamp variants by UTC microseconds. Transient
+        // equality keys must agree; persisted values retain their original tag.
+        Value::TimestampTzMicros(micros) => Value::TimestampMicros(*micros),
+        other => other.clone(),
+    }
 }
 
 pub(super) fn deduplicate_rows_stable(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {

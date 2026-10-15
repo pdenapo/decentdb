@@ -326,12 +326,16 @@ impl EngineRuntime {
         let mut columns = Vec::new();
         for (index, item) in items.iter().enumerate() {
             match item {
-                SelectItem::Expr { expr, alias } => columns.push(ColumnBinding::visible(
-                    None,
-                    alias
-                        .clone()
-                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                )),
+                SelectItem::Expr { expr, alias } => {
+                    let mut binding = ColumnBinding::visible(
+                        None,
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                    );
+                    binding.column_type = super::type_of::declared_type(expr, dataset, params);
+                    columns.push(binding);
+                }
                 SelectItem::Wildcard => columns.extend(
                     dataset
                         .columns
@@ -1803,12 +1807,16 @@ impl EngineRuntime {
             .iter()
             .enumerate()
             .map(|(index, item)| match item {
-                SelectItem::Expr { expr, alias } => ColumnBinding::visible(
-                    None,
-                    alias
-                        .clone()
-                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                ),
+                SelectItem::Expr { expr, alias } => {
+                    let mut binding = ColumnBinding::visible(
+                        None,
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                    );
+                    binding.column_type = super::type_of::declared_type(expr, &dataset, params);
+                    binding
+                }
                 SelectItem::Wildcard => ColumnBinding::visible(None, format!("col{}", index + 1)),
                 SelectItem::QualifiedWildcard(_) => {
                     ColumnBinding::visible(None, format!("col{}", index + 1))
@@ -2282,6 +2290,12 @@ impl EngineRuntime {
                     UnaryOp::Negate => match value {
                         Value::Int64(value) => Ok(Value::Int64(-value)),
                         Value::Float64(value) => Ok(Value::Float64(-value)),
+                        Value::Decimal { scaled, scale } => Ok(Value::Decimal {
+                            scaled: scaled
+                                .checked_neg()
+                                .ok_or_else(|| DbError::sql("DECIMAL arithmetic overflow"))?,
+                            scale,
+                        }),
                         Value::Null => Ok(Value::Null),
                         other => Err(DbError::sql(format!("cannot negate {other:?}"))),
                     },
@@ -2428,6 +2442,15 @@ impl EngineRuntime {
                     .map(|arg| self.eval_group_expr(arg, dataset, group_row_indexes, params, ctes))
                     .collect::<Result<Vec<_>>>()?;
                 match name.as_str() {
+                    "pg_typeof" | "pg_catalog.pg_typeof" => {
+                        if args.len() != 1 {
+                            return Err(DbError::sql("PG_TYPEOF expects 1 argument"));
+                        }
+                        Ok(Value::Text(
+                            super::type_of::type_name(&args[0], &values[0], dataset, params)
+                                .to_string(),
+                        ))
+                    }
                     "coalesce" => Ok(values
                         .into_iter()
                         .find(|value| !matches!(value, Value::Null))
@@ -2568,6 +2591,12 @@ impl EngineRuntime {
                     UnaryOp::Negate => match value {
                         Value::Int64(value) => Ok(Value::Int64(-value)),
                         Value::Float64(value) => Ok(Value::Float64(-value)),
+                        Value::Decimal { scaled, scale } => Ok(Value::Decimal {
+                            scaled: scaled
+                                .checked_neg()
+                                .ok_or_else(|| DbError::sql("DECIMAL arithmetic overflow"))?,
+                            scale,
+                        }),
                         Value::Null => Ok(Value::Null),
                         other => Err(DbError::sql(format!("cannot negate {other:?}"))),
                     },

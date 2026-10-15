@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::catalog::ColumnType;
 use crate::record::compression::CompressionMode;
 use crate::search::TrigramQueryResult;
 use crate::sql::ast::{Expr, FromItem};
@@ -3602,8 +3603,8 @@ fn composite_indexed_join_without_filter_uses_indexed_join_path() {
     assert_eq!(
         result.columns,
         vec![
-            ColumnBinding::visible(None, "id".to_string()),
-            ColumnBinding::visible(None, "note".to_string()),
+            ColumnBinding::visible(None, "id".to_string()).with_type(ColumnType::Int64),
+            ColumnBinding::visible(None, "note".to_string()).with_type(ColumnType::Text),
         ]
     );
     assert_eq!(result.rows.len(), 2);
@@ -3760,8 +3761,8 @@ fn composite_indexed_join_with_filter_uses_indexed_join_path() {
     assert_eq!(
         result.columns,
         vec![
-            ColumnBinding::visible(None, "id".to_string()),
-            ColumnBinding::visible(None, "note".to_string()),
+            ColumnBinding::visible(None, "id".to_string()).with_type(ColumnType::Int64),
+            ColumnBinding::visible(None, "note".to_string()).with_type(ColumnType::Text),
         ]
     );
     assert_eq!(result.rows.len(), 1);
@@ -3826,8 +3827,8 @@ fn composite_hashed_join_with_filter_uses_join_path() {
     assert_eq!(
         result.columns,
         vec![
-            ColumnBinding::visible(None, "id".to_string()),
-            ColumnBinding::visible(None, "note".to_string()),
+            ColumnBinding::visible(None, "id".to_string()).with_type(ColumnType::Int64),
+            ColumnBinding::visible(None, "note".to_string()).with_type(ColumnType::Text),
         ]
     );
     assert_eq!(result.rows.len(), 1);

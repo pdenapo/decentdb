@@ -1457,6 +1457,7 @@ const BUILTIN_FUNCTIONS: &[(&str, &str)] = &[
     ("sum", "aggregate"),
     ("tan", "scalar"),
     ("to_timestamp", "scalar"),
+    ("pg_typeof", "scalar"),
     ("total", "aggregate"),
     ("trim", "scalar"),
     ("upper", "scalar"),

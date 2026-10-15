@@ -7,7 +7,33 @@ use decentdb::benchmark::{
     intersect_sorted_postings, reset_wal_delta_materialize_counters,
     take_wal_delta_materialize_counters, trigram_tokens, BtreeFixture, WalDeltaMaterializeFixture,
 };
-use decentdb::Value;
+use decentdb::{Db, DbConfig, Value};
+
+fn bench_scalar_arithmetic(c: &mut Criterion) {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open arithmetic fixture");
+    let mut group = c.benchmark_group("scalar_arithmetic");
+    for (name, sql) in [
+        ("integer", "SELECT 125 + 75"),
+        (
+            "float",
+            "SELECT CAST(1.25 AS FLOAT64) + CAST(0.75 AS FLOAT64)",
+        ),
+        (
+            "decimal",
+            "SELECT CAST('1.25' AS NUMERIC) + CAST('0.75' AS NUMERIC)",
+        ),
+        (
+            "decimal_division",
+            "SELECT CAST('1.25' AS NUMERIC) / CAST('0.75' AS NUMERIC)",
+        ),
+    ] {
+        let stmt = db.prepare(sql).expect("prepare arithmetic");
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(stmt.execute(&[]).expect("execute arithmetic")))
+        });
+    }
+    group.finish();
+}
 
 fn bench_wal_frame_encode_decode(c: &mut Criterion) {
     let page_size = default_page_size();
@@ -197,6 +223,7 @@ fn bench_trigram_kernels(c: &mut Criterion) {
 
 criterion_group!(
     micro_hot_paths,
+    bench_scalar_arithmetic,
     bench_wal_frame_encode_decode,
     bench_wal_append_path,
     bench_wal_delta_materialize,

@@ -166,10 +166,9 @@ impl EngineRuntime {
         let mut columns = Vec::with_capacity(width);
         if let Some(first_row) = rows.first() {
             for (index, expr) in first_row.iter().enumerate() {
-                columns.push(ColumnBinding::visible(
-                    None,
-                    infer_expr_name(expr, index + 1),
-                ));
+                let mut binding = ColumnBinding::visible(None, infer_expr_name(expr, index + 1));
+                binding.column_type = super::type_of::declared_type(expr, scope_dataset, params);
+                columns.push(binding);
             }
         }
 
@@ -871,6 +870,7 @@ impl EngineRuntime {
                     Some(table.name.clone()),
                     column.name.clone(),
                 )
+                .with_type(column.column_type)
             })
             .collect::<Vec<_>>();
         if include_hidden_row_id {
@@ -907,6 +907,7 @@ impl EngineRuntime {
                     Some(table.name.clone()),
                     column.name.clone(),
                 )
+                .with_type(column.column_type)
             })
             .collect::<Vec<_>>();
         let mut dataset = Dataset::with_rows(columns, rows);

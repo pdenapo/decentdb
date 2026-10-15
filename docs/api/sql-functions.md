@@ -10,6 +10,24 @@ DecentDB exposes a narrow read-only compatibility layer for SQLite and
 PostgreSQL-adjacent tooling. These are virtual SQL surfaces, not persistent
 catalog tables.
 
+### SQL type inspection
+
+`PG_TYPEOF(expression)` (also `pg_catalog.pg_typeof`) returns a `TEXT` SQL type
+name, including `bigint`, `double precision`, `numeric`, `text`, `boolean`,
+`timestamp without time zone`, and `timestamp with time zone`.
+
+```sql
+SELECT PG_TYPEOF(CAST(NULL AS NUMERIC)); -- numeric
+SELECT PG_TYPEOF(TO_TIMESTAMP(1711929600123456 / 1000000.0));
+-- timestamp with time zone
+```
+
+Casts and catalog columns retain their declared types even when the value is
+NULL. Untyped NULL, and NULL expressions whose type cannot be inferred, report
+`unknown`. This function returns type names, not PostgreSQL `regtype` OIDs.
+DecentDB integer values use the `bigint` name because integers are 64-bit.
+ENUM values report `enum`; the function does not expose a PostgreSQL type catalog.
+
 ### SQLite compatibility catalog views
 
 ```sql
@@ -59,8 +77,11 @@ index names return an empty result set for the table-valued helpers.
 
 `generate_series(start, stop [, step])` returns one visible column named
 `value`. It supports inclusive integer series with an optional integer step,
-timestamp series with an explicit `INTERVAL`, and date series with an explicit
+`TIMESTAMP` and `TIMESTAMPTZ` series with an explicit `INTERVAL`, and date series with an explicit
 whole-day `INTERVAL`.
+
+When either timestamp endpoint is `TIMESTAMPTZ`, the series retains that type
+and interprets any `TIMESTAMP` endpoint as UTC, consistent with explicit casts.
 
 ```sql
 SELECT value FROM generate_series(1, 5);
@@ -936,6 +957,11 @@ Behavior notes:
 
 - `DATE_TRUNC` supports: microsecond, millisecond, second, minute, hour, day, week, month, quarter, year, decade, century, millennium.
 - `TO_TIMESTAMP(text, format)` currently supports formats: `YYYY-MM-DD HH24:MI:SS`, `YYYY-MM-DD`, and `DD/MM/YYYY`.
+- `TO_TIMESTAMP` returns `TIMESTAMPTZ` in UTC for numeric epoch and text/format
+  inputs. Epoch seconds may be `INT64`, `FLOAT64`, or `DECIMAL`; fractions are
+  rounded to microseconds. Non-finite or out-of-range epochs return a SQL error.
+  CLI and REPL output renders timestamps as readable dates, with `+00` for UTC
+  timezone-aware values.
 - `AGE` returns a textual interval (for example, `"1 days 00:00:00"`).
 - `INTERVAL` literal parsing supports integer `year/month/week/day/hour/minute/second` units in amount-unit pairs.
 - Timestamp interval arithmetic supports `timestamp +/- INTERVAL '...'` and date/timestamp text on the left side.

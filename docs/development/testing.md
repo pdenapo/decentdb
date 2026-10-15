@@ -46,6 +46,12 @@ rustdoc/API docs, MkDocs, and browser WASM OPFS smoke coverage.
 
 ## Focused Rust test commands
 
+The indexed-seek regression suites retain result and query-plan assertions
+under LLVM coverage and sanitizer instrumentation. Wall-clock performance gates
+apply only to uninstrumented runs: `LLVM_PROFILE_FILE` identifies coverage
+instrumentation and `DECENTDB_SANITIZER` identifies sanitizer runs. Run those
+tests normally as well when validating query performance.
+
 Engine library/unit tests:
 
 ```bash

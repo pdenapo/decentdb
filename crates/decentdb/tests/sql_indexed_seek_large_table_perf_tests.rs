@@ -26,7 +26,10 @@ fn large_table_config() -> DbConfig {
 }
 
 fn strict_wall_clock_regression_assertions_enabled() -> bool {
+    // Instrumented runs retain query correctness checks, but cannot measure
+    // representative wall-clock query performance.
     std::env::var_os("DECENTDB_SANITIZER").is_none()
+        && std::env::var_os("LLVM_PROFILE_FILE").is_none()
 }
 
 /// Regression test for DDB-002/DDB-003: indexed equality on a 1M row checkpointed
