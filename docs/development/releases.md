@@ -6,19 +6,35 @@ binding matrix.
 ## Triggering the GitHub release workflow
 
 The GitHub release workflow in `.github/workflows/release.yml` auto-starts when
-a version tag is pushed to the repository:
+a GitHub Release is **published** (`release: types: [published]`). Creating or
+pushing a version tag alone does not start the release workflows.
 
-```bash
-git push origin vX.Y.Z
-```
+For a normal release:
 
-That workflow currently listens to `push` events for `v*` tags. Creating a tag
-or publishing a release from the GitHub UI does not reliably go through that
-same event path, so if a tag is created server-side you may need to use
-`workflow_dispatch` to run the release pipeline manually.
+1. Update the version and changelog following
+   [`design/VERSIONING_GUIDE.md`](https://github.com/sphildreth/decentdb/blob/main/design/VERSIONING_GUIDE.md),
+   complete validation, and merge the release changes into `main`.
+2. Create a GitHub Release with a `vX.Y.Z` tag targeting the intended merged
+   commit. GitHub can create the tag when the release is published, or the tag
+   can already exist. Add the release notes from `docs/about/changelog.md`.
+3. Publish the release. Saving a draft does not trigger the builds.
+4. Monitor the release workflows. `Release (GitHub)` runs full validation,
+   builds the native/CLI, Dart native, JDBC, and DBeaver packages, and attaches
+   the completed packages to the published release. Assets arrive after the
+   workflow succeeds.
 
-The primary NuGet workflow in `.github/workflows/nuget.yml` supports both the
-normal tag-triggered publish path and a manual `workflow_dispatch` path.
+Publishing also starts the NuGet and Mobile Native Artifacts workflows.
+NuGet builds and publishes the .NET packages using `NUGET_API_KEY`; mobile
+builds are uploaded as workflow artifacts. These workflows run independently
+of the GitHub release workflow's validation and artifact builds.
+
+For manual recovery, `release.yml` supports `workflow_dispatch`. To build all
+assets and create/update a release, run it against the existing version tag
+with `build_platform=all`, `run_validation=true`, and `create_release=true`.
+The default `create_release=false` leaves the builds as workflow artifacts.
+
+The primary NuGet workflow in `.github/workflows/nuget.yml` supports the
+published-release trigger and a manual `workflow_dispatch` path.
 
 For manual recovery or validation of an existing tag, start `nuget.yml` from
 `main`, with:

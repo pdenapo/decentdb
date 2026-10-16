@@ -711,6 +711,171 @@ fn simple_grouped_numeric_distinct_uses_fast_path() {
 }
 
 #[test]
+fn distinct_numeric_aggregates_promote_from_all_input_types() {
+    for sql in [
+        "WITH v(n) AS (VALUES (CAST('1' AS NUMERIC)), (CAST(1 AS FLOAT64))) \
+         SELECT SUM(DISTINCT n), AVG(DISTINCT n) FROM v",
+        "WITH v(n) AS (VALUES (CAST(1 AS FLOAT64)), (CAST('1' AS NUMERIC))) \
+         SELECT SUM(DISTINCT n), AVG(DISTINCT n) FROM v",
+    ] {
+        let mut runtime = EngineRuntime::empty(1);
+        let result = execute_query(&mut runtime, sql, &[]);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Float64(1.0), Value::Float64(1.0)]
+        );
+    }
+}
+
+#[test]
+fn rolling_decimal_window_average_preserves_precision_and_type() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, rating NUMERIC NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, rating) VALUES \
+             (1, 9007199254.740993), (2, 9007199254.740995)",
+    );
+
+    let result = execute_query(
+        &mut runtime,
+        "SELECT id, rating, \
+                 AVG(rating) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS rolling \
+             FROM movies ORDER BY id",
+        &[],
+    );
+
+    assert_eq!(
+        result.rows()[0].values()[2],
+        Value::Decimal {
+            scaled: 9_007_199_254_740_993,
+            scale: 6
+        }
+    );
+    assert_eq!(
+        result.rows()[1].values()[2],
+        Value::Decimal {
+            scaled: 9_007_199_254_740_994,
+            scale: 6
+        }
+    );
+}
+
+#[test]
+fn decimal_indexed_left_join_aggregates_match_unindexed_results() {
+    fn run(indexed: bool) -> Vec<Vec<Value>> {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(&mut runtime, "CREATE TABLE p (id INT64 PRIMARY KEY)");
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE c (id INT64 PRIMARY KEY, parent_id INT64, amount NUMERIC)",
+        );
+        if indexed {
+            execute_sql(&mut runtime, "CREATE INDEX c_parent_idx ON c (parent_id)");
+        }
+        execute_sql(&mut runtime, "INSERT INTO p (id) VALUES (1), (2)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO c (id, parent_id, amount) VALUES \
+                 (1, 1, 9007199254.740993), (2, 1, 9007199254.740995)",
+        );
+
+        let result = execute_query(
+            &mut runtime,
+            "SELECT p.id, SUM(c.amount) AS total, AVG(c.amount) AS average \
+                 FROM p LEFT JOIN c ON c.parent_id = p.id \
+                 GROUP BY p.id ORDER BY p.id",
+            &[],
+        );
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect()
+    }
+
+    let unindexed = run(false);
+    let indexed = run(true);
+    assert_eq!(indexed, unindexed);
+    assert!(matches!(indexed[0][1], Value::Decimal { .. }));
+    assert!(matches!(indexed[0][2], Value::Decimal { .. }));
+}
+
+#[test]
+fn indexed_decimal_probes_coerce_text_values_and_casts() {
+    for indexed in [false, true] {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE amounts (id INT64 PRIMARY KEY, amount NUMERIC NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO amounts (id, amount) VALUES (1, 0.01), (2, 0.02)",
+        );
+        if indexed {
+            execute_sql(
+                &mut runtime,
+                "CREATE INDEX amounts_amount_idx ON amounts (amount)",
+            );
+        }
+
+        let casted = execute_query(
+            &mut runtime,
+            "SELECT id FROM amounts WHERE amount = CAST('0.01' AS TEXT)",
+            &[],
+        );
+        assert_eq!(casted.rows()[0].values(), &[Value::Int64(1)]);
+
+        let parameter = execute_query(
+            &mut runtime,
+            "SELECT id FROM amounts WHERE amount = $1",
+            &[Value::Text("0.01".to_string())],
+        );
+        assert_eq!(parameter.rows()[0].values(), &[Value::Int64(1)]);
+    }
+}
+
+#[test]
+fn upsert_conflict_update_resolves_default_from_target_column() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, n INT64 DEFAULT 42)",
+    );
+    execute_sql(&mut runtime, "INSERT INTO t (id, n) VALUES (1, 7)");
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO t (id, n) VALUES (1, 99) \
+             ON CONFLICT (id) DO UPDATE SET n = DEFAULT",
+    );
+
+    let result = execute_query(&mut runtime, "SELECT n FROM t WHERE id = 1", &[]);
+    assert_eq!(result.rows()[0].values(), &[Value::Int64(42)]);
+}
+
+#[test]
+fn update_target_alias_remains_visible_inside_from_source_subquery() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE balances (id INT64 PRIMARY KEY, n INT64)",
+    );
+    execute_sql(&mut runtime, "INSERT INTO balances (id, n) VALUES (1, 1)");
+    execute_sql(
+        &mut runtime,
+        "UPDATE balances AS target SET n = \
+             (SELECT target.n FROM (SELECT target.n + 1 AS n) AS target)",
+    );
+
+    let result = execute_query(&mut runtime, "SELECT n FROM balances WHERE id = 1", &[]);
+    assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
+}
+
+#[test]
 fn simple_grouped_wrapped_count_multi_order_by_uses_fast_path() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -6528,6 +6693,13 @@ fn execute_sql(runtime: &mut EngineRuntime, sql: &str) {
     runtime
         .execute_statement(&statement, &[], PAGE_SIZE)
         .expect("execute SQL");
+}
+
+fn execute_query(runtime: &mut EngineRuntime, sql: &str, params: &[Value]) -> QueryResult {
+    let statement = parse_sql_statement(sql).expect("parse query");
+    runtime
+        .execute_statement(&statement, params, PAGE_SIZE)
+        .expect("execute query")
 }
 
 fn indexed_join_grouped_count_runtime(child_counts: &[i64]) -> EngineRuntime {

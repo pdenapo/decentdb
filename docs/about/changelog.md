@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.18.0] - [2026-10-15]
+
+This minor release adds native Bun ORM support and PostgreSQL-compatible SQL
+capabilities.
+
 ### Added
 
+- Added a full Go Bun ORM example using the standard PostgreSQL dialect,
+  model-generated schema/CRUD, relations, migrations, soft deletes, exact
+  decimal reports, and persistence checks.
+- Added native DML target aliases, column-context `DEFAULT`, single-integer-PK
+  SERIAL/BIGSERIAL declarations, validated JSON/JSONB declarations and casts,
+  PostgreSQL hex BYTEA input, and Go Decimal Scanner/Valuer support.
 - Added checked DECIMAL/NUMERIC arithmetic and unary negation, including mixed
   integer operands, scale alignment, and rounded division (#67).
 - Added `PG_TYPEOF` SQL type-name inspection, including typed NULL casts and
@@ -16,6 +27,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Updated `rustls` to 0.23.46 in the workspace and benchmark lockfiles to
+  address RUSTSEC-2026-0346 through RUSTSEC-2026-0349, and updated the benchmark's
+  `anyhow` to address RUSTSEC-2026-0190.
+- Added workspace and standalone benchmark supply-chain checks to CI and to
+  fast and paranoid pre-commit validation. Declared the benchmark's existing
+  Apache-2.0 license in its package metadata; install `cargo-deny` to run the
+  checks locally.
+- Updated .NET benchmark SQLite dependencies to Microsoft.Data.Sqlite 10.0.13,
+  removing the vulnerable native SQLite package reported during restore/build.
+- Cache-boundedness tests explicitly verify their expected performance warnings
+  and close Python connections deterministically.
+- Removed native-only bootstrap/coordination code from WASM builds, eliminating
+  platform warnings. Replaced the old Callgrind dev dependency with Gungraun
+  0.20.0 to remove the future compiler warning and obsolete advisory exceptions.
+- Pre-commit checks use the configured environment without login-shell prompt
+  initialization and discover installed JDKs with JNI headers.
+- Rustdoc builds preserve the engine's API documentation by excluding the CLI
+  binary's duplicate documentation target and fixing a malformed benchmark
+  path in rustdoc.
+- Decimal comparisons distinguish fractional leading zeros, quoted ORM numeric
+  literals use exact column context in arithmetic and indexed/prepared filters,
+  and decimal SUM/AVG retain exact numeric results. Transient equality keys
+  normalize decimal scales for DISTINCT, grouping, and joins.
+- Invalid omitted column defaults now propagate errors rather than silently
+  becoming NULL.
 - `TO_TIMESTAMP` now returns TIMESTAMPTZ, preserves epoch microseconds, and
   rejects non-finite/out-of-range input. CLI and REPL timestamps render readable
   dates rather than raw microseconds.

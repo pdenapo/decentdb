@@ -80,7 +80,9 @@ jobs:
           tool: cargo-deny
 
       - name: cargo deny check
-        run: cargo deny check
+        run: |
+          cargo deny check
+          cargo deny --manifest-path benchmarks/rust-baseline/Cargo.toml check
 
   test:
     if: github.event_name != 'push' || !endsWith(github.actor, '[bot]')

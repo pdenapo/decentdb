@@ -869,35 +869,11 @@ impl EngineRuntime {
 
         for (ordinal, row_index) in sorted.iter().enumerate() {
             let start = ordinal.saturating_sub(preceding);
-            let mut total_float = 0_f64;
-            let mut count = 0_i64;
+            let mut state = NumericAggregateState::default();
             for value in &ordered_values[start..=ordinal] {
-                match value {
-                    Value::Null => {}
-                    Value::Int64(value) => {
-                        total_float += *value as f64;
-                        count += 1;
-                    }
-                    Value::Float64(value) => {
-                        total_float += *value;
-                        count += 1;
-                    }
-                    Value::Decimal { scaled, scale } => {
-                        total_float += (*scaled as f64) / 10_f64.powi(i32::from(*scale));
-                        count += 1;
-                    }
-                    other => {
-                        return Err(DbError::sql(format!(
-                            "numeric aggregate does not support {other:?}"
-                        )))
-                    }
-                }
+                state.add(value)?;
             }
-            results[*row_index] = if count == 0 {
-                Value::Null
-            } else {
-                Value::Float64(total_float / count as f64)
-            };
+            results[*row_index] = state.value(NumericAgg::Avg)?;
         }
         Ok(())
     }
@@ -2303,13 +2279,14 @@ impl EngineRuntime {
             }
             Expr::Binary { left, op, right } => {
                 let collation = expr_collation(left).or_else(|| expr_collation(right));
-                eval_binary_with_collation(
-                    Some(self),
+                let (left_value, right_value) = coerce_binary_literals(
                     op,
+                    left,
+                    right,
                     self.eval_group_expr(left, dataset, group_row_indexes, params, ctes)?,
                     self.eval_group_expr(right, dataset, group_row_indexes, params, ctes)?,
-                    collation,
-                )
+                )?;
+                eval_binary_with_collation(Some(self), op, left_value, right_value, collation)
             }
             Expr::Between {
                 expr,
@@ -2573,6 +2550,9 @@ impl EngineRuntime {
         excluded: Option<&Dataset>,
     ) -> Result<Value> {
         match expr {
+            Expr::Default => Err(DbError::sql(
+                "DEFAULT requires an INSERT or UPDATE column context",
+            )),
             Expr::Literal(value) => Ok(value.clone()),
             Expr::Column { table, column } => {
                 self.resolve_column(dataset, row, table.as_deref(), column, excluded)
@@ -2604,9 +2584,11 @@ impl EngineRuntime {
             }
             Expr::Binary { left, op, right } => {
                 let collation = expr_collation(left).or_else(|| expr_collation(right));
-                let left = self.eval_expr(left, dataset, row, params, ctes, excluded)?;
-                let right = self.eval_expr(right, dataset, row, params, ctes, excluded)?;
-                eval_binary_with_collation(Some(self), op, left, right, collation)
+                let left_value = self.eval_expr(left, dataset, row, params, ctes, excluded)?;
+                let right_value = self.eval_expr(right, dataset, row, params, ctes, excluded)?;
+                let (left_value, right_value) =
+                    coerce_binary_literals(op, left, right, left_value, right_value)?;
+                eval_binary_with_collation(Some(self), op, left_value, right_value, collation)
             }
             Expr::Between {
                 expr,

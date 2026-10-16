@@ -15073,6 +15073,25 @@ fn describe_query_contract_infers_select_parameters_and_result_columns() {
 }
 
 #[test]
+fn describe_query_contract_infers_decimal_aggregate_types_including_windows() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute("CREATE TABLE amounts (amount NUMERIC)")
+        .expect("create table");
+
+    let contract = db
+        .describe_query_contract(
+            "SELECT SUM(amount), AVG(amount), \
+                    SUM(amount) OVER (), AVG(amount) OVER () FROM amounts",
+        )
+        .expect("describe aggregate query");
+
+    assert_eq!(contract.result_columns.len(), 4);
+    for column in &contract.result_columns {
+        assert_eq!(column.type_name.as_deref(), Some("DECIMAL"));
+    }
+}
+
+#[test]
 fn describe_query_contract_infers_insert_returning_contracts() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
     db.execute(
