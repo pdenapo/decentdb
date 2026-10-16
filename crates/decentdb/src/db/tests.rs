@@ -20351,11 +20351,7 @@ impl BootstrapSyncTestVfs {
         if !self
             .state
             .inject_wal_acquire_race
-            .load(AtomicOrdering::Acquire)
-            || self
-                .state
-                .wal_race_injected
-                .swap(true, AtomicOrdering::AcqRel)
+            .swap(false, AtomicOrdering::AcqRel)
         {
             return Ok(());
         }
@@ -20365,6 +20361,11 @@ impl BootstrapSyncTestVfs {
             crate::vfs::OpenMode::CreateNew,
             crate::vfs::FileKind::Wal,
         )?);
+        // Publish completion only after the competing WAL exists. Observing an
+        // attempted CreateNew does not establish that the injection finished.
+        self.state
+            .wal_race_injected
+            .store(true, AtomicOrdering::Release);
         Ok(())
     }
 }
@@ -20686,14 +20687,14 @@ fn wal_created_at_fresh_acquisition_waits_for_bootstrap_sync_before_recovery() -
 
     state.wait_until_sync_enters();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while state.wal_create_new_calls.load(AtomicOrdering::Acquire) == 0 {
+    while !state.wal_race_injected.load(AtomicOrdering::Acquire) {
         assert!(
             Instant::now() < deadline,
-            "fresh WAL acquisition did not attempt atomic CreateNew"
+            "fresh WAL acquisition did not complete the competing WAL injection"
         );
         thread::yield_now();
     }
-    assert!(state.wal_race_injected.load(AtomicOrdering::Acquire));
+    assert_eq!(state.wal_create_new_calls.load(AtomicOrdering::Acquire), 1);
     assert_eq!(
         state
             .wal_recovery_opens_during_sync

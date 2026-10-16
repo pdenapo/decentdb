@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Initialized the C smoke test's copied numeric value before use and synchronized
+  the bootstrap WAL race test on completed injection, fixing memory-safety
+  nightly failures. C and Python Valgrind probes now share narrow exceptions for
+  known Rust process-lifetime thread and coordination registry allocations while
+  continuing to fail on other definite and possible leaks.
+
 ## [2.18.0] - [2026-10-15]
 
 This minor release adds native Bun ORM support and PostgreSQL-compatible SQL

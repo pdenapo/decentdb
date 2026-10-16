@@ -112,6 +112,26 @@ Binding smoke/validation programs live under `tests/bindings/`:
 See `tests/bindings/README.md` for the shared expectation that the Rust `cdylib`
 has been built first.
 
+## Memory-safety nightly
+
+`.github/workflows/memory-safety-nightly.yml` runs Rust address/leak sanitizers,
+Miri, fuzzing, C/Python Memcheck probes, and binding lifecycle tests. Reproduce
+the C and Python probe commands from that workflow after building the debug
+native library.
+
+Both Memcheck jobs load `.github/valgrind/rust.supp`. Its exceptions cover only
+possible leaks at the known Rust bootstrap thread-state and static coordination
+registry allocation sites. Those process-lifetime allocations can be reached
+through interior pointers; reader reservations and file descriptors still close
+normally, while registry capacity is retained for reuse. The Python probe also
+loads `.github/valgrind/python.supp` for interpreter allocations.
+
+Keep `--errors-for-leak-kinds=definite,possible` and `--error-exitcode=1` enabled.
+When changing suppressions, compare reports from short and long connection
+churn runs to check that retained state stays bounded, and confirm that a probe
+with a deliberate unsuppressed leak still exits with an error. Do not suppress
+an entire library or all possible leaks.
+
 ## Package-local binding suites
 
 Several language integrations also keep package-local tests under `bindings/`.

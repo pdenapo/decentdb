@@ -1,0 +1,46 @@
+# Rust process-lifetime state reached through interior pointers can be classified
+# as "possibly lost" by Memcheck. Keep these exceptions limited to the known
+# allocation sites and to possible leaks: definite leaks and memory-access
+# errors must still fail both C and Python probes.
+#
+# Wildcards cover Rust symbol hashes and both legacy and v0 name mangling.
+
+# std::thread::scope initializes the calling thread's cached Thread/Arc when
+# fresh-file bootstrap sync first runs. The main thread retains it until exit.
+{
+   rust_bootstrap_current_thread
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   ...
+   fun:*std*thread*current*init_current*
+   ...
+   fun:*decentdb*db*open_fresh_with_bootstrap_sync*
+}
+
+# The static GATES map retains capacity and the final path/Weak allocation.
+# Dead entries are pruned on the next open; the Weak does not retain a live
+# coordinator or its file descriptor. Arc/HashMap interior pointers account for
+# the map, path, and weak control block being reported as possible leaks.
+{
+   rust_process_admission_gate_registry
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   ...
+   fun:*decentdb*wal*coordination*local_admission_gate*
+}
+
+# The static ACTIVE HashSet releases reader reservations but retains table
+# capacity for reuse. Match the hash-table allocation, not arbitrary allocations
+# made while acquiring a reader slot.
+{
+   rust_process_reader_slot_registry_capacity
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   ...
+   fun:*hashbrown*RawTable*
+   ...
+   fun:*decentdb*wal*coordination*LocalReaderSlotReservation*try_acquire*
+}
