@@ -235,6 +235,7 @@ jobs:
             --track-origins=yes \
             --num-callers=20 \
             --error-exitcode=1 \
+            --suppressions=.github/valgrind/rust.supp \
             ./.tmp/memory-safety/c-smoke \
             2>&1 | tee .tmp/memory-safety/valgrind-c-smoke.log
           valgrind \
@@ -245,6 +246,7 @@ jobs:
             --track-origins=yes \
             --num-callers=20 \
             --error-exitcode=1 \
+            --suppressions=.github/valgrind/rust.supp \
             ./.tmp/memory-safety/c-memory-churn /tmp/decentdb-memory-churn.ddb 200 \
             2>&1 | tee .tmp/memory-safety/valgrind-c-memory-churn.log
 
@@ -309,6 +311,7 @@ jobs:
             --track-origins=yes \
             --num-callers=20 \
             --error-exitcode=1 \
+            --suppressions=.github/valgrind/rust.supp \
             --suppressions=.github/valgrind/python.supp \
             python -m pytest \
               bindings/python/tests/test_valgrind_memcheck.py \

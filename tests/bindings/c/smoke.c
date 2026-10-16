@@ -85,6 +85,7 @@ int main(void) {
                       NULL, 0, &result),
         "decimal arithmetic and timestamp types");
   ddb_value_t numeric_value;
+  check(ddb_value_init(&numeric_value), "init copied numeric value");
   check(ddb_result_value_copy(result, 0, 0, &numeric_value), "copy decimal result");
   expect_tag(&numeric_value, DDB_VALUE_DECIMAL, "decimal arithmetic result");
   expect_i64_eq(numeric_value.decimal_scaled, 3, "decimal coefficient");
