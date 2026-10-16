@@ -250,6 +250,20 @@ impl EngineRuntime {
         let Some(plan) = self.analyze_left_join_aggregate_query(query, params)? else {
             return Ok(None);
         };
+        let Some(child_schema) = self.table_schema(plan.child_table_name) else {
+            return Ok(None);
+        };
+        if plan.aggregate_kinds.iter().any(|kind| match kind {
+            IndexedJoinAggregateKind::Sum(index) | IndexedJoinAggregateKind::Avg(index) => {
+                child_schema
+                    .columns
+                    .get(*index)
+                    .is_some_and(|column| column.column_type == ColumnType::Decimal)
+            }
+            _ => false,
+        }) {
+            return Ok(None);
+        }
         let Some(parent_source) = self.visible_table_row_source(plan.parent_table_name) else {
             return Ok(None);
         };

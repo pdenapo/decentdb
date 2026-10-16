@@ -5204,14 +5204,18 @@ impl EngineRuntime {
                     table.name, assignment.column_name
                 )));
             }
-            let value = self.eval_expr(
-                &assignment.expr,
-                &dataset,
-                &current_eval_values,
-                params,
-                &std::collections::BTreeMap::new(),
-                Some(&excluded),
-            )?;
+            let value = if matches!(assignment.expr, Expr::Default) {
+                self.default_value_for_column(&table.columns[column_index], params)?
+            } else {
+                self.eval_expr(
+                    &assignment.expr,
+                    &dataset,
+                    &current_eval_values,
+                    params,
+                    &std::collections::BTreeMap::new(),
+                    Some(&excluded),
+                )?
+            };
             next_values[column_index] =
                 super::constraints::coerce_column_value(&table.columns[column_index], value)?;
         }

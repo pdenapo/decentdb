@@ -1185,9 +1185,16 @@ fn normalize_alter_table_command(command: &protobuf::AlterTableCmd) -> Result<Al
                 .as_deref()
                 .ok_or_else(|| unsupported("ALTER TABLE ADD COLUMN is missing a definition"))?;
             match node_kind(definition)? {
-                NodeEnum::ColumnDef(column) => Ok(AlterTableAction::AddColumn(
-                    normalize_column_definition(column, true)?,
-                )),
+                NodeEnum::ColumnDef(column) => {
+                    if is_serial_type(column.type_name.as_ref())? {
+                        return Err(unsupported(
+                            "SERIAL is not supported by ALTER TABLE ADD COLUMN",
+                        ));
+                    }
+                    Ok(AlterTableAction::AddColumn(normalize_column_definition(
+                        column, true,
+                    )?))
+                }
                 _ => Err(unsupported("unsupported ALTER TABLE ADD COLUMN definition")),
             }
         }
@@ -1200,16 +1207,30 @@ fn normalize_alter_table_command(command: &protobuf::AlterTableCmd) -> Result<Al
                 .as_deref()
                 .ok_or_else(|| unsupported("ALTER TABLE ALTER COLUMN TYPE is missing a type"))?;
             match node_kind(type_node)? {
-                NodeEnum::TypeName(type_name) => Ok(AlterTableAction::AlterColumnType {
-                    column_name: command.name.clone(),
-                    new_type: normalize_type_name(type_name)?,
-                }),
-                NodeEnum::ColumnDef(column) => {
+                NodeEnum::TypeName(type_name) => {
+                    if is_json_type(type_name)? {
+                        return Err(unsupported(
+                            "ALTER COLUMN TYPE to JSON/JSONB is not supported",
+                        ));
+                    }
                     Ok(AlterTableAction::AlterColumnType {
                         column_name: command.name.clone(),
-                        new_type: normalize_type_name(column.type_name.as_ref().ok_or_else(
-                            || unsupported("ALTER COLUMN TYPE is missing its type"),
-                        )?)?,
+                        new_type: normalize_type_name(type_name)?,
+                    })
+                }
+                NodeEnum::ColumnDef(column) => {
+                    let type_name = column
+                        .type_name
+                        .as_ref()
+                        .ok_or_else(|| unsupported("ALTER COLUMN TYPE is missing its type"))?;
+                    if is_json_type(type_name)? {
+                        return Err(unsupported(
+                            "ALTER COLUMN TYPE to JSON/JSONB is not supported",
+                        ));
+                    }
+                    Ok(AlterTableAction::AlterColumnType {
+                        column_name: command.name.clone(),
+                        new_type: normalize_type_name(type_name)?,
                     })
                 }
                 _ => Err(unsupported("unsupported ALTER TABLE type specification")),
@@ -4334,6 +4355,16 @@ mod tests {
                 AlterTableAction::AlterColumnType { .. }
             ));
         }
+    }
+
+    #[test]
+    fn alter_table_add_column_rejects_serial() {
+        assert!(norm_err("ALTER TABLE t ADD COLUMN seq SERIAL").contains("SERIAL"));
+    }
+
+    #[test]
+    fn alter_table_alter_column_type_rejects_json() {
+        assert!(norm_err("ALTER TABLE t ALTER COLUMN body TYPE JSONB").contains("JSON/JSONB"));
     }
 
     #[test]

@@ -57,7 +57,16 @@ pub(super) struct NumericAggregateState {
 }
 
 impl NumericAggregateState {
+    fn observe_type(&mut self, value: &Value) {
+        match value {
+            Value::Float64(_) => self.saw_float = true,
+            Value::Decimal { .. } => self.saw_decimal = true,
+            _ => {}
+        }
+    }
+
     pub(super) fn add(&mut self, value: &Value) -> Result<()> {
+        self.observe_type(value);
         let exact_value = match value {
             Value::Null => return Ok(()),
             Value::Int64(value) => {
@@ -66,12 +75,10 @@ impl NumericAggregateState {
             }
             Value::Decimal { scaled, scale } => {
                 self.total_float += decimal_to_f64(*scaled, *scale);
-                self.saw_decimal = true;
                 Some((*scaled, *scale))
             }
             Value::Float64(value) => {
                 self.total_float += *value;
-                self.saw_float = true;
                 None
             }
             other => {
@@ -139,6 +146,7 @@ pub(super) fn aggregate_numeric(
         let value = ctx.eval_row(row, expr)?;
         if distinct {
             if !matches!(value, Value::Null) {
+                state.observe_type(&value);
                 values.push(value);
             }
         } else {

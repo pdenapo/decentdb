@@ -908,10 +908,10 @@ pub(crate) fn timestamp_key_types_match(left: ColumnType, right: ColumnType) -> 
 pub(crate) fn coerce_lookup_literal(
     table: &TableSchema,
     column: &str,
-    expr: &Expr,
+    _expr: &Expr,
     value: Value,
 ) -> Result<Value> {
-    if !matches!(expr, Expr::Literal(Value::Text(_))) {
+    if !matches!(value, Value::Text(_)) {
         return Ok(value);
     }
     let index = schema_column_index(table, column)

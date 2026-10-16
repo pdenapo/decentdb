@@ -189,6 +189,9 @@ impl TargetAlias<'_> {
         match body {
             QueryBody::Select(select) => {
                 if select.from.iter().any(|item| self.binding_shadows(item)) {
+                    for item in &mut select.from {
+                        self.resolve_from_queries(item);
+                    }
                     return;
                 }
                 self.protect_target_binding(select);
@@ -305,6 +308,17 @@ impl TargetAlias<'_> {
                 }
             }
             FromItem::Table { .. } => {}
+        }
+    }
+
+    fn resolve_from_queries(&self, item: &mut FromItem) {
+        match item {
+            FromItem::Subquery { query, .. } => self.query(query),
+            FromItem::Join { left, right, .. } => {
+                self.resolve_from_queries(left);
+                self.resolve_from_queries(right);
+            }
+            FromItem::Table { .. } | FromItem::Function { .. } => {}
         }
     }
 }

@@ -2858,6 +2858,9 @@ impl EngineRuntime {
         let Some(rating_index) = schema_column_index(schema, "rating") else {
             return Ok(None);
         };
+        if schema.columns[rating_index].column_type == ColumnType::Decimal {
+            return Ok(None);
+        }
         if select.projection.len() != 3
             || !showdown_window_projection_column_matches(
                 &select.projection[0],

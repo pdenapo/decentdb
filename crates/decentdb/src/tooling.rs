@@ -918,8 +918,8 @@ fn infer_expr_type(
         | Expr::IsNull { .. }
         | Expr::Exists(_) => Some(DescribedType::scalar(ColumnType::Bool, false)),
         Expr::Function { name, args } => infer_function_type(name, args, scope, diagnostics),
-        Expr::Aggregate { name, .. } | Expr::WindowFunction { name, .. } => {
-            infer_aggregate_type(name)
+        Expr::Aggregate { name, args, .. } | Expr::WindowFunction { name, args, .. } => {
+            infer_aggregate_type(name, args, scope, diagnostics)
         }
         Expr::RowNumber { .. } => Some(DescribedType::scalar(ColumnType::Int64, false)),
         Expr::Case {
@@ -995,13 +995,31 @@ fn infer_function_type(
     }
 }
 
-fn infer_aggregate_type(name: &str) -> Option<DescribedType> {
+fn infer_aggregate_type(
+    name: &str,
+    args: &[Expr],
+    scope: &QueryScope,
+    diagnostics: &mut Vec<String>,
+) -> Option<DescribedType> {
     match name.to_ascii_lowercase().as_str() {
         "count" | "row_number" | "rank" | "dense_rank" => {
             Some(DescribedType::scalar(ColumnType::Int64, false))
         }
-        "sum" | "avg" | "min" | "max" | "median" | "percentile_cont" | "percentile_disc" => {
+        "total" | "median" | "percentile_cont" | "percentile_disc" => {
             Some(DescribedType::scalar(ColumnType::Float64, true))
+        }
+        "sum" | "avg" | "min" | "max" => {
+            let argument_type = args
+                .first()
+                .and_then(|expr| infer_expr_type(expr, scope, diagnostics))?;
+            let column_type = if name.eq_ignore_ascii_case("avg")
+                && argument_type.column_type != ColumnType::Decimal
+            {
+                ColumnType::Float64
+            } else {
+                argument_type.column_type
+            };
+            Some(DescribedType::scalar(column_type, true))
         }
         "string_agg" => Some(DescribedType::scalar(ColumnType::Text, true)),
         _ => None,

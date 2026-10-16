@@ -869,35 +869,11 @@ impl EngineRuntime {
 
         for (ordinal, row_index) in sorted.iter().enumerate() {
             let start = ordinal.saturating_sub(preceding);
-            let mut total_float = 0_f64;
-            let mut count = 0_i64;
+            let mut state = NumericAggregateState::default();
             for value in &ordered_values[start..=ordinal] {
-                match value {
-                    Value::Null => {}
-                    Value::Int64(value) => {
-                        total_float += *value as f64;
-                        count += 1;
-                    }
-                    Value::Float64(value) => {
-                        total_float += *value;
-                        count += 1;
-                    }
-                    Value::Decimal { scaled, scale } => {
-                        total_float += (*scaled as f64) / 10_f64.powi(i32::from(*scale));
-                        count += 1;
-                    }
-                    other => {
-                        return Err(DbError::sql(format!(
-                            "numeric aggregate does not support {other:?}"
-                        )))
-                    }
-                }
+                state.add(value)?;
             }
-            results[*row_index] = if count == 0 {
-                Value::Null
-            } else {
-                Value::Float64(total_float / count as f64)
-            };
+            results[*row_index] = state.value(NumericAgg::Avg)?;
         }
         Ok(())
     }
