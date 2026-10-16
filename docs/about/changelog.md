@@ -27,6 +27,13 @@ capabilities.
 
 ### Fixed
 
+- Updated `rustls` to 0.23.46 in the workspace and benchmark lockfiles to
+  address RUSTSEC-2026-0346 through RUSTSEC-2026-0349, and updated the benchmark's
+  `anyhow` to address RUSTSEC-2026-0190.
+- Added workspace and standalone benchmark supply-chain checks to CI and to
+  fast and paranoid pre-commit validation. Declared the benchmark's existing
+  Apache-2.0 license in its package metadata; install `cargo-deny` to run the
+  checks locally.
 - Updated .NET benchmark SQLite dependencies to Microsoft.Data.Sqlite 10.0.13,
   removing the vulnerable native SQLite package reported during restore/build.
 - Cache-boundedness tests explicitly verify their expected performance warnings

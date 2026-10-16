@@ -31,12 +31,24 @@ cargo lint
 
 ## Release-oriented pre-commit validation
 
+Install the supply-chain checker used by CI before running the pre-commit suite:
+
+```bash
+cargo install cargo-deny --locked
+```
+
 The staged pre-commit runner has two modes:
 
 ```bash
 python scripts/do-pre-commit-checks.py --mode fast
 python scripts/do-pre-commit-checks.py --mode paranoid
 ```
+
+Both modes run `cargo deny check` against `deny.toml` for the main workspace
+and the standalone Rust baseline benchmark, checking security advisories,
+licenses, dependency bans, and dependency sources. A missing
+`cargo-deny` installation fails the check. Run this check on its own with
+`python scripts/do-pre-commit-checks.py --only rust-supply-chain`.
 
 Use `paranoid` before release candidates. It runs the normal Rust and binding
 matrix, then adds release metadata/version checks, structured diagnostic

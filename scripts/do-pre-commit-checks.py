@@ -325,6 +325,19 @@ def build_checks() -> list[Check]:
             cargo_bound=True,
         ),
         Check(
+            key="rust-supply-chain",
+            title="Rust supply-chain checks",
+            cwd=REPO_ROOT,
+            command=(
+                "cargo deny check && "
+                "cargo deny --manifest-path benchmarks/rust-baseline/Cargo.toml check"
+            ),
+            env={},
+            stage=0,
+            modes=("fast", "paranoid"),
+            cargo_bound=True,
+        ),
+        Check(
             key="cargo-metadata",
             title="Cargo metadata parse",
             cwd=REPO_ROOT,
